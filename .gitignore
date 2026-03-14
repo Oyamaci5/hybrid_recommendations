@@ -1,11 +1,12 @@
 # Ignore everything except data and results directories
-/*
-!/.gitignore
-!/data/
-!/results/
+
+.gitignore
+data/
+results/
 
 # Explicitly ignore .cursor directory
 .cursor/
+*.txt
 
 # Python cache files
 __pycache__/
