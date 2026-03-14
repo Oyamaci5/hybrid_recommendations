@@ -1,0 +1,33 @@
+# Ignore everything except data and results directories
+/*
+!/.gitignore
+!/data/
+!/results/
+
+# Explicitly ignore .cursor directory
+.cursor/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Environment files
+.env
+.env.local
+venv/
+env/
+
+# IDE and editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*.swn
+*.code-workspace
+
+# OS files
+.DS_Store
+.DS_Store?
+Thumbs.db
