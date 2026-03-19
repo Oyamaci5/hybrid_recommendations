@@ -3,7 +3,7 @@
 .gitignore
 data/
 results/
-
+google_apps_script/
 # Explicitly ignore .cursor directory
 .cursor/
 *.txt
