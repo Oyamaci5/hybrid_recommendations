@@ -23,6 +23,8 @@ detect_gray_sheep = _mod.detect_gray_sheep
 make_fitness_function = _mod.make_fitness_function
 pearson_distance_batch = _mod.pearson_distance_batch
 _compute_metrics = _mod._compute_metrics
+get_all_algorithms_v3 = _mod.get_all_algorithms_v3
+get_special_params = _mod.get_special_params
 
 __all__ = [
     "load_movielens",
@@ -32,4 +34,6 @@ __all__ = [
     "make_fitness_function",
     "pearson_distance_batch",
     "_compute_metrics",
+    "get_all_algorithms_v3",
+    "get_special_params",
 ]
