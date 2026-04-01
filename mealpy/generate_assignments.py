@@ -27,12 +27,16 @@ Kullanım:
     python generate_assignments.py --lof --k 70               # LOF + K=70
     python generate_assignments.py --k-100k 70 --k-1m 120     # ayrı K
     python generate_assignments.py --lof --n-neighbors 15 --contamination 0.1
+    python generate_assignments.py --jobs 4              # algoritmaları paralel süreçte
 """
 
 import argparse
 import os
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor
+from typing import Optional
+
 import numpy as np
 import pandas as pd
 
@@ -75,6 +79,17 @@ ALGO_CONFIG = [
     ('H1_HHO+HGS', 'HHO.OriginalHHO', 'HGS.OriginalHGS'),
     ('H4_MFO+HHO', 'MFO.OriginalMFO', 'HHO.OriginalHHO'),
 ]
+
+
+def _resolve_pool_workers(requested: Optional[int], n_tasks: int) -> int:
+    if n_tasks <= 0:
+        return 1
+    cpu = os.cpu_count() or 1
+    if requested is None or requested <= 0:
+        cap = cpu
+    else:
+        cap = requested
+    return max(1, min(cap, n_tasks))
 
 
 # ============================================================
@@ -227,7 +242,20 @@ def run_hybrid(g_info, l_info, matrix, K, init, g_epoch, l_epoch, pop_size):
 
     sp_l    = get_special_params(l_info['full_name'], l_epoch, pop_size)
     l_model = l_info['class'](**(sp_l or {'epoch': l_epoch, 'pop_size': pop_size}))
-    local_start = [best_g_sol.copy() for _ in range(pop_size)]
+    rng = np.random.default_rng(seed=42)
+    lb  = np.array(problem["bounds"].lb)
+    ub  = np.array(problem["bounds"].ub)
+    search_range = ub - lb           # [0, 5] → range=5
+    noise_scale  = 0.02 * search_range   # çözüm uzayının %2'si
+
+    local_start = []
+    for i in range(pop_size):
+        if i == 0:
+            local_start.append(best_g_sol.copy())   # en iyi nokta korunsun
+        else:
+            noise = rng.normal(0, noise_scale)
+            noisy = np.clip(best_g_sol + noise, lb, ub)
+            local_start.append(noisy)
     try:
         l_model.solve(problem, starting_solutions=local_start)
     except TypeError:
@@ -294,38 +322,48 @@ def save_assignment(assignments, gray_mask, best_sol, best_fit,
 # TEK ALGORİTMA ÇALIŞTIR
 # ============================================================
 
-def run_one(label, g_name, l_name, matrix, K, seed, save_dir, algo_map,
-            use_lof=False, lof_n_neighbors=LOF_N_NEIGHBORS,
-            lof_contamination=LOF_CONTAMINATION):
-    """
-    Bir algoritma için assignment üret ve kaydet.
-
-    use_lof=True  → LOF tabanlı gray sheep (adaptif)
-    use_lof=False → Sabit 80. percentile (~%20)
-    """
+def _run_one_core(
+    label,
+    g_name,
+    l_name,
+    matrix,
+    K,
+    seed,
+    save_dir,
+    algo_map,
+    use_lof,
+    lof_n_neighbors,
+    lof_contamination,
+    baseline_epoch,
+    global_epoch,
+    local_epoch,
+    pop_size,
+):
+    """Ortak gövde: algo_map ana süreçte veya worker’da bir kez oluşturulur."""
     mode_str = 'LOF' if use_lof else 'percentile'
     print(f"\n  [{label}] başlıyor (gray sheep: {mode_str})...")
     t0   = time.time()
-    init = mkmeans_plus_plus_init(matrix, K=K, n_solutions=50, seed=seed)
+    #init = mkmeans_plus_plus_init(matrix, K=K, n_solutions=50, seed=seed)
+    init = _multi_start_init(matrix, K=K, pop_size=POP_SIZE, seed=seed, n_restarts=10)
 
     if l_name is None:
         best_sol, best_fit = run_single(
-            algo_map[g_name], matrix, K, init, BASELINE_EPOCH, POP_SIZE
+            algo_map[g_name], matrix, K, init, baseline_epoch, pop_size
         )
     else:
         best_sol, best_fit = run_hybrid(
             algo_map[g_name], algo_map[l_name],
-            matrix, K, init, GLOBAL_EPOCH, LOCAL_EPOCH, POP_SIZE
+            matrix, K, init, global_epoch, local_epoch, pop_size
         )
 
     _, assignments = compute_wcss_fast(matrix, best_sol, K)
 
     if use_lof:
         print(f"    LOF hesaplanıyor (n_neighbors={lof_n_neighbors})...")
-        gs_info    = detect_gray_sheep_lof(
+        gs_info   = detect_gray_sheep_lof(
             matrix, assignments, lof_n_neighbors, lof_contamination
         )
-        gray_mask  = gs_info['gray_sheep_mask']
+        gray_mask = gs_info['gray_sheep_mask']
         extra_data = {
             'lof_scores': gs_info['lof_scores'],
             'threshold' : gs_info['threshold'],
@@ -338,6 +376,75 @@ def run_one(label, g_name, l_name, matrix, K, seed, save_dir, algo_map,
     save_assignment(assignments, gray_mask, best_sol, best_fit,
                     save_dir, extra_data)
     print(f"  [{label}] tamamlandı — {time.time()-t0:.1f}s")
+
+
+def _mp_run_assignment_job(job):
+    """
+    Windows spawn için modül düzeyinde worker — mealpy sınıflarını pickle etmemek
+    için algo_map alt-süreçte get_all_algorithms_v3() ile kurulur.
+    """
+    (
+        label,
+        g_name,
+        l_name,
+        matrix,
+        K,
+        seed,
+        save_dir,
+        use_lof,
+        lof_n_neighbors,
+        lof_contamination,
+        baseline_epoch,
+        global_epoch,
+        local_epoch,
+        pop_size,
+    ) = job
+    algo_map = {a['full_name']: a for a in get_all_algorithms_v3()}
+    _run_one_core(
+        label,
+        g_name,
+        l_name,
+        matrix,
+        K,
+        seed,
+        save_dir,
+        algo_map,
+        use_lof,
+        lof_n_neighbors,
+        lof_contamination,
+        baseline_epoch,
+        global_epoch,
+        local_epoch,
+        pop_size,
+    )
+
+
+def run_one(label, g_name, l_name, matrix, K, seed, save_dir, algo_map,
+            use_lof=False, lof_n_neighbors=LOF_N_NEIGHBORS,
+            lof_contamination=LOF_CONTAMINATION):
+    """
+    Bir algoritma için assignment üret ve kaydet.
+
+    use_lof=True  → LOF tabanlı gray sheep (adaptif)
+    use_lof=False → Sabit 80. percentile (~%20)
+    """
+    _run_one_core(
+        label,
+        g_name,
+        l_name,
+        matrix,
+        K,
+        seed,
+        save_dir,
+        algo_map,
+        use_lof,
+        lof_n_neighbors,
+        lof_contamination,
+        BASELINE_EPOCH,
+        GLOBAL_EPOCH,
+        LOCAL_EPOCH,
+        POP_SIZE,
+    )
 
 
 # ============================================================
@@ -372,7 +479,8 @@ def load_movielens_1m(path):
 
 def run_dataset(dataset_name, matrix, K, out_root, algo_filter=None,
                 use_lof=False, lof_n_neighbors=LOF_N_NEIGHBORS,
-                lof_contamination=LOF_CONTAMINATION):
+                lof_contamination=LOF_CONTAMINATION,
+                max_workers: Optional[int] = None):
     print(f"\n{'='*60}")
     print(f"DATASET: {dataset_name.upper()}  |  K={K}  |  Seed={SEED}")
     mode_str = f'LOF (n={lof_n_neighbors}, cont={lof_contamination})' \
@@ -380,24 +488,67 @@ def run_dataset(dataset_name, matrix, K, out_root, algo_filter=None,
     print(f"Gray sheep  : {mode_str}")
     print(f"{'='*60}")
 
-    print("Algoritma kataloğu yükleniyor (1 kez)...")
-    algo_map = {a['full_name']: a for a in get_all_algorithms_v3()}
-
     # K=default için suffix yok, farklı K için _k{K} eklenir
     default_k = K_100K_DEFAULT if dataset_name == 'ml100k' else K_1M_DEFAULT
     k_suffix  = '' if K == default_k else f'_k{K}'
 
+    jobs_meta = []
     for label, g_name, l_name in ALGO_CONFIG:
         if algo_filter and label not in algo_filter:
             print(f"  [{label}] atlandı (filtre)")
             continue
         save_dir = os.path.join(out_root, dataset_name, f"{label}{k_suffix}")
-        run_one(
-            label, g_name, l_name, matrix, K, SEED, save_dir, algo_map,
-            use_lof=use_lof,
-            lof_n_neighbors=lof_n_neighbors,
-            lof_contamination=lof_contamination,
+        jobs_meta.append((label, g_name, l_name, save_dir))
+
+    if not jobs_meta:
+        print(f"\n{dataset_name.upper()} — çalıştırılacak algoritma yok.")
+        return
+
+    nw = _resolve_pool_workers(max_workers, len(jobs_meta))
+
+    if nw == 1:
+        print("Algoritma kataloğu yükleniyor (1 kez)...")
+        algo_map = {a['full_name']: a for a in get_all_algorithms_v3()}
+        for label, g_name, l_name, save_dir in jobs_meta:
+            run_one(
+                label,
+                g_name,
+                l_name,
+                matrix,
+                K,
+                SEED,
+                save_dir,
+                algo_map,
+                use_lof=use_lof,
+                lof_n_neighbors=lof_n_neighbors,
+                lof_contamination=lof_contamination,
+            )
+    else:
+        print(
+            f"Paralel atama: {len(jobs_meta)} iş, en fazla {nw} süreç "
+            "(CPU-yoğun optimizasyon için süreç havuzu)."
         )
+        jobs = [
+            (
+                label,
+                g_name,
+                l_name,
+                matrix,
+                K,
+                SEED,
+                save_dir,
+                use_lof,
+                lof_n_neighbors,
+                lof_contamination,
+                BASELINE_EPOCH,
+                GLOBAL_EPOCH,
+                LOCAL_EPOCH,
+                POP_SIZE,
+            )
+            for label, g_name, l_name, save_dir in jobs_meta
+        ]
+        with ProcessPoolExecutor(max_workers=nw) as pool:
+            list(pool.map(_mp_run_assignment_job, jobs))
 
     print(f"\n{dataset_name.upper()} tamamlandı → {os.path.join(out_root, dataset_name)}/")
 
@@ -446,9 +597,34 @@ def parse_args():
     )
     p.add_argument('--data-100k', default=DATA_100K)
     p.add_argument('--data-1m',   default=DATA_1M)
+    p.add_argument(
+        '--jobs', type=int, default=None,
+        help='Paralel algoritma süreç sayısı (varsayılan: 1 = sıralı; '
+             '2+ veya 0=CPU ile sınırlandırılmış havuz)',
+    )
     return p.parse_args()
 
+def _multi_start_init(matrix, K, pop_size, seed, n_restarts=10):
+    """
+    n_restarts farklı seed ile MkMeans++ çalıştır.
+    Her seferinde 1 çözüm üret, WCSS hesapla.
+    En iyi pop_size kadar çözümü döndür.
+    """
+    candidates = []
+    for i in range(n_restarts * 3):   # fazla üret, en iyileri seç
+        sols = mkmeans_plus_plus_init(
+            matrix, K=K, n_solutions=1, seed=seed + i * 17
+        )
+        sol = sols[0]
+        wcss, _ = compute_wcss_fast(matrix, sol, K)
+        candidates.append((wcss, sol))
 
+    # WCSS'e göre sırala, en iyi pop_size tanesini al
+    candidates.sort(key=lambda x: x[0])
+    best = [c[1] for c in candidates[:pop_size + 10]]
+    print(f"    Init: {n_restarts*3} aday → en iyi {pop_size} seçildi  "
+          f"(WCSS aralığı: {candidates[0][0]:.1f} – {candidates[pop_size-1][0]:.1f})")
+    return best
 # ============================================================
 # MAIN
 # ============================================================
@@ -484,9 +660,22 @@ if __name__ == '__main__':
     print(f"Epoch       : baseline={BASELINE_EPOCH}, global={GLOBAL_EPOCH}, local={LOCAL_EPOCH}")
     print(f"Pop size    : {POP_SIZE}  |  Seed: {SEED}")
     print(f"Çıktı kökü  : {out_root}")
+    if args.jobs is None or args.jobs == 1:
+        print("Paralellik    : sıralı (tek süreç)")
+    elif args.jobs <= 0:
+        print("Paralellik    : süreç havuzu (iş ve CPU sayısına göre)")
+    else:
+        print(f"Paralellik    : en fazla {args.jobs} süreç")
     print("=" * 60)
 
     t_total = time.time()
+
+    def _pool_cap():
+        if args.jobs is None or args.jobs == 1:
+            return 1
+        if args.jobs <= 0:
+            return None
+        return args.jobs
 
     if args.dataset in ('100k', 'both'):
         print(f"\nML-100K yükleniyor: {args.data_100k}")
@@ -497,6 +686,7 @@ if __name__ == '__main__':
             use_lof=args.lof,
             lof_n_neighbors=args.n_neighbors,
             lof_contamination=contamination,
+            max_workers=_pool_cap(),
         )
 
     if args.dataset in ('1m', 'both'):
@@ -508,6 +698,7 @@ if __name__ == '__main__':
             use_lof=args.lof,
             lof_n_neighbors=args.n_neighbors,
             lof_contamination=contamination,
+            max_workers=_pool_cap(),
         )
 
     print(f"\n{'='*60}")

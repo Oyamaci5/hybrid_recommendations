@@ -1,15 +1,17 @@
 """
-hybrid_test.py  (v2)
+hybrid_test.py  (v3)
 ====================
-6 Hibrit + 3 Baseline — 10 Run, Phase 3 Tam Matris
+8 Hibrit + 3 Baseline — 15 Run, Phase 3 Tam Matris
 
 Hibritler:
-  H1: HHO(global) + HGS(local)  — zıt üstünlükler
-  H2: HGS(global) + HHO(local)  — ters sıra kontrolü
-  H3: MFO(global) + HGS(local)  — güvenli hibrit
-  H4: MFO(global) + HHO(local)  — alternatif
-  H5: OOA(global) + HHO(local)  — ENCR adayı
-  H6: AGTO(global) + HGS(local) — güçlü global
+  H1: HHO(global) + HGS(local)   — zıt üstünlükler
+  H2: HGS(global) + HHO(local)   — ters sıra kontrolü
+  H3: MFO(global) + HGS(local)   — güvenli hibrit
+  H4: MFO(global) + HHO(local)   — alternatif
+  H5: OOA(global) + HHO(local)   — ENCR adayı
+  H6: AGTO(global) + HGS(local)  — güçlü global
+  H7: IAOA(global) + HHO(local)  — YENİ: improved AO global keşif
+  H8: MFO(global)  + IAOA(local) — YENİ: IAOA lokal iyileştirme
 
 Baseline (aynı toplam epoch ile):
   B1: HHO tek  (epoch=50)
@@ -21,7 +23,7 @@ Kullanım:
   python hybrid_test.py -j 6          # her RUN içinde TEST_LIST paralel (ProcessPoolExecutor)
   HYBRID_TEST_WORKERS=6 python hybrid_test.py
 
-Çıktılar: results/hybrid/
+Çıktılar: results/hybrid_v3/
 """
 
 import argparse
@@ -33,6 +35,13 @@ import time, os, sys, warnings
 warnings.filterwarnings('ignore')
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# IAOA'yı optimizers/ klasöründen yükle
+# mealpy/ ile aynı seviyedeki optimizers/ klasörü
+_OPT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'optimizers')
+if _OPT_DIR not in sys.path:
+    sys.path.insert(0, _OPT_DIR)
+
 from mealpy_comparison_v2 import (
     load_movielens,
     mkmeans_plus_plus_init,
@@ -47,8 +56,8 @@ from mealpy import FloatVar
 # AYARLAR
 # ============================================================
 
-BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
-HYBRID_ROOT   = os.path.join(BASE_DIR, 'results', 'hybrid')
+BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
+HYBRID_ROOT = os.path.join(BASE_DIR, 'results', 'hybrid_v3')   # ← yeni klasör
 os.makedirs(HYBRID_ROOT, exist_ok=True)
 
 DATA_PATH = os.path.join(os.path.dirname(BASE_DIR),
@@ -59,12 +68,34 @@ N_RUNS         = 15
 POP_SIZE       = 30
 GLOBAL_EPOCH   = 30
 LOCAL_EPOCH    = 20
-BASELINE_EPOCH = GLOBAL_EPOCH + LOCAL_EPOCH  # 50 — adil karşılaştırma
+BASELINE_EPOCH = GLOBAL_EPOCH + LOCAL_EPOCH   # 50 — adil karşılaştırma
 TIME_LIMIT     = 900
 
 # Çok süreç: worker süreçlerinde algoritma haritası (pool_init ile doldurulur)
 _WORKER_ALGO_MAP = None
 
+
+# ============================================================
+# IAOA'YI ALGO_MAP'E EKLEYEN YARDIMCI
+# ============================================================
+
+def _register_iaoa(algo_map):
+    """IAOA'yı mealpy algo_map'ine kaydet."""
+    try:
+        from iaoa_optimizer import OriginalIAOA
+        algo_map['IAOA.OriginalIAOA'] = {
+            'full_name': 'IAOA.OriginalIAOA',
+            'class':     OriginalIAOA,
+        }
+        return True
+    except ImportError as e:
+        print(f"UYARI: IAOA yüklenemedi → {e}")
+        return False
+
+
+# ============================================================
+# ARGÜMAN PARSE
+# ============================================================
 
 def parse_hybrid_parallel_workers(argv=None):
     """-j / --workers > HYBRID_TEST_WORKERS > 1 (sıralı)."""
@@ -82,13 +113,22 @@ def parse_hybrid_parallel_workers(argv=None):
     return 1
 
 
+# ============================================================
+# WORKER INIT (paralel mod)
+# ============================================================
+
 def _remote_pool_init(script_dir):
     import sys
     d = script_dir or BASE_DIR
     if d not in sys.path:
         sys.path.insert(0, d)
+    # optimizers/ klasörünü de ekle
+    opt_dir = os.path.join(d, 'optimizers')
+    if opt_dir not in sys.path:
+        sys.path.insert(0, opt_dir)
     global _WORKER_ALGO_MAP
     _WORKER_ALGO_MAP = {a["full_name"]: a for a in get_all_algorithms_v3()}
+    _register_iaoa(_WORKER_ALGO_MAP)
 
 
 def _run_one_case_remote(task):
@@ -97,73 +137,56 @@ def _run_one_case_remote(task):
     (label, g_name, l_name, matrix, K, init, baseline_ep, global_ep, local_ep, pop_size)
     """
     (
-        label,
-        g_name,
-        l_name,
-        matrix,
-        K,
-        init,
-        baseline_ep,
-        global_ep,
-        local_ep,
-        pop_size,
+        label, g_name, l_name,
+        matrix, K, init,
+        baseline_ep, global_ep, local_ep, pop_size,
     ) = task
+
     algo_map = _WORKER_ALGO_MAP
     if algo_map is None:
         algo_map = {a["full_name"]: a for a in get_all_algorithms_v3()}
+        _register_iaoa(algo_map)
+
     g_info = algo_map.get(g_name)
     if g_info is None:
-        return {
-            "ok": False,
-            "label": label,
-            "g_name": g_name,
-            "l_name": l_name,
-            "err": f"algoritma yok: {g_name}",
-        }
+        return {"ok": False, "label": label, "g_name": g_name,
+                "l_name": l_name, "err": f"algoritma yok: {g_name}"}
     try:
         if l_name is None:
             r = run_single(g_info, matrix, K, init, baseline_ep, pop_size)
         else:
             l_info = algo_map.get(l_name)
             if l_info is None:
-                return {
-                    "ok": False,
-                    "label": label,
-                    "g_name": g_name,
-                    "l_name": l_name,
-                    "err": f"algoritma yok: {l_name}",
-                }
-            r = run_hybrid(
-                g_info, l_info, matrix, K, init, global_ep, local_ep, pop_size
-            )
-        return {
-            "ok": True,
-            "label": label,
-            "g_name": g_name,
-            "l_name": l_name,
-            "r": r,
-        }
+                return {"ok": False, "label": label, "g_name": g_name,
+                        "l_name": l_name, "err": f"algoritma yok: {l_name}"}
+            r = run_hybrid(g_info, l_info, matrix, K, init,
+                           global_ep, local_ep, pop_size)
+        return {"ok": True, "label": label, "g_name": g_name,
+                "l_name": l_name, "r": r}
     except Exception as e:
-        return {
-            "ok": False,
-            "label": label,
-            "g_name": g_name,
-            "l_name": l_name,
-            "err": str(e),
-        }
+        return {"ok": False, "label": label, "g_name": g_name,
+                "l_name": l_name, "err": str(e)}
 
+
+# ============================================================
+# TEST LİSTESİ
+# ============================================================
 
 TEST_LIST = [
-    # (label, global_algo_fullname, local_algo_fullname or None)
-    ('H1_HHO+HGS',  'HHO.OriginalHHO',   'HGS.OriginalHGS'),
-    ('H2_HGS+HHO',  'HGS.OriginalHGS',   'HHO.OriginalHHO'),
-    ('H3_MFO+HGS',  'MFO.OriginalMFO',   'HGS.OriginalHGS'),
-    ('H4_MFO+HHO',  'MFO.OriginalMFO',   'HHO.OriginalHHO'),
-    ('H5_OOA+HHO',  'OOA.OriginalOOA',   'HHO.OriginalHHO'),
-    ('H6_AGTO+HGS', 'AGTO.OriginalAGTO', 'HGS.OriginalHGS'),
-    ('B1_HHO',      'HHO.OriginalHHO',   None),
-    ('B2_HGS',      'HGS.OriginalHGS',   None),
-    ('B3_MFO',      'MFO.OriginalMFO',   None),
+    # (label,           global_algo_fullname,    local_algo_fullname or None)
+    ('H1_HHO+HGS',  'HHO.OriginalHHO',    'HGS.OriginalHGS'),
+    ('H2_HGS+HHO',  'HGS.OriginalHGS',    'HHO.OriginalHHO'),
+    ('H3_MFO+HGS',  'MFO.OriginalMFO',    'HGS.OriginalHGS'),
+    ('H4_MFO+HHO',  'MFO.OriginalMFO',    'HHO.OriginalHHO'),
+    ('H5_OOA+HHO',  'OOA.OriginalOOA',    'HHO.OriginalHHO'),
+    ('H6_AGTO+HGS', 'AGTO.OriginalAGTO',  'HGS.OriginalHGS'),
+    # ── YENİ ──────────────────────────────────────────────────────────────
+    ('H7_IAOA+HHO', 'IAOA.OriginalIAOA',  'HHO.OriginalHHO'),
+    ('H8_MFO+IAOA', 'MFO.OriginalMFO',    'IAOA.OriginalIAOA'),
+    # ──────────────────────────────────────────────────────────────────────
+    ('B1_HHO',      'HHO.OriginalHHO',    None),
+    ('B2_HGS',      'HGS.OriginalHGS',    None),
+    ('B3_MFO',      'MFO.OriginalMFO',    None),
 ]
 
 WILCOXON_PAIRS = [
@@ -179,6 +202,13 @@ WILCOXON_PAIRS = [
     ('H1_HHO+HGS',  'H2_HGS+HHO',  'Sıra farkı: H1 vs H2'),
     ('H3_MFO+HGS',  'H4_MFO+HHO',  'Local farkı: HGS vs HHO'),
     ('H1_HHO+HGS',  'H3_MFO+HGS',  'Global farkı: HHO vs MFO'),
+    # ── YENİ ──────────────────────────────────────────────────────────────
+    ('H7_IAOA+HHO', 'B1_HHO',      'H7 vs HHO tek'),
+    ('H7_IAOA+HHO', 'H4_MFO+HHO',  'H7 vs H4: global IAOA vs MFO'),
+    ('H8_MFO+IAOA', 'B3_MFO',      'H8 vs MFO tek'),
+    ('H8_MFO+IAOA', 'H4_MFO+HHO',  'H8 vs H4: local IAOA vs HHO'),
+    ('H7_IAOA+HHO', 'H8_MFO+IAOA', 'H7 vs H8: IAOA global vs IAOA local'),
+    # ──────────────────────────────────────────────────────────────────────
 ]
 
 
@@ -213,10 +243,10 @@ def run_single(algo_info, matrix, K, init, epoch, pop_size):
         model.solve(problem)
     metrics = _compute_metrics(matrix, model.g_best.solution, K)
     return {
-        'wcss'           : float(model.g_best.target.fitness),
-        'time_seconds'   : time.time() - start,
-        'local_improved' : None,
-        'global_wcss'    : None,
+        'wcss'          : float(model.g_best.target.fitness),
+        'time_seconds'  : time.time() - start,
+        'local_improved': None,
+        'global_wcss'   : None,
         **metrics,
     }
 
@@ -244,7 +274,20 @@ def run_hybrid(g_info, l_info, matrix, K, init,
     # Local aşama — global'in en iyi noktasından başla
     sp_l    = get_special_params(l_info['full_name'], l_epoch, pop_size)
     l_model = l_info['class'](**(sp_l or {'epoch': l_epoch, 'pop_size': pop_size}))
-    local_start = [best_g_sol.copy() for _ in range(pop_size)]
+    rng = np.random.default_rng(seed=42)
+    lb  = np.array(problem["bounds"].lb)
+    ub  = np.array(problem["bounds"].ub)
+    search_range = ub - lb           # [0, 5] → range=5
+    noise_scale  = 0.02 * search_range   # çözüm uzayının %2'si
+
+    local_start = []
+    for i in range(pop_size):
+        if i == 0:
+            local_start.append(best_g_sol.copy())   # en iyi nokta korunsun
+        else:
+            noise = rng.normal(0, noise_scale)
+            noisy = np.clip(best_g_sol + noise, lb, ub)
+            local_start.append(noisy)
     try:
         l_model.solve(problem, starting_solutions=local_start)
     except TypeError:
@@ -253,16 +296,20 @@ def run_hybrid(g_info, l_info, matrix, K, init,
     best_l_fit = float(l_model.g_best.target.fitness)
 
     if best_l_fit < best_g_fit:
-        best_sol, best_fit, local_improved = l_model.g_best.solution, best_l_fit, True
+        best_sol      = l_model.g_best.solution
+        best_fit      = best_l_fit
+        local_improved = True
     else:
-        best_sol, best_fit, local_improved = best_g_sol, best_g_fit, False
+        best_sol       = best_g_sol
+        best_fit       = best_g_fit
+        local_improved = False
 
     metrics = _compute_metrics(matrix, best_sol, K)
     return {
-        'wcss'           : best_fit,
-        'global_wcss'    : best_g_fit,
-        'local_improved' : local_improved,
-        'time_seconds'   : time.time() - start,
+        'wcss'          : best_fit,
+        'global_wcss'   : best_g_fit,
+        'local_improved': local_improved,
+        'time_seconds'  : time.time() - start,
         **metrics,
     }
 
@@ -273,28 +320,28 @@ def run_hybrid(g_info, l_info, matrix, K, init,
 
 def _make_result_row(run, label, g_name, l_name, r):
     return {
-        "run": run,
-        "label": label,
-        "type": "baseline" if l_name is None else "hybrid",
-        "global_algo": g_name.split(".")[0],
-        "local_algo": l_name.split(".")[0] if l_name else "—",
-        "wcss": r["wcss"],
-        "global_wcss": r["global_wcss"],
-        "local_improved": r["local_improved"],
-        "davies_bouldin": r["davies_bouldin"],
-        "silhouette": r["silhouette"],
+        "run"            : run,
+        "label"          : label,
+        "type"           : "baseline" if l_name is None else "hybrid",
+        "global_algo"    : g_name.split(".")[0],
+        "local_algo"     : l_name.split(".")[0] if l_name else "—",
+        "wcss"           : r["wcss"],
+        "global_wcss"    : r["global_wcss"],
+        "local_improved" : r["local_improved"],
+        "davies_bouldin" : r["davies_bouldin"],
+        "silhouette"     : r["silhouette"],
         "gray_sheep_ratio": r["gray_sheep_ratio"],
-        "time_seconds": r["time_seconds"],
+        "time_seconds"   : r["time_seconds"],
     }
 
 
 def run_all(full_matrix, algo_map, parallel_workers=1):
     pw = max(1, int(parallel_workers or 1))
 
-    print(f"\n{'='*60}")
-    print(f"HİBRİT TESTİ — {N_RUNS} RUN")
-    print(f"{'='*60}")
-    print(f"6 hibrit + 3 baseline = {len(TEST_LIST)} koşucu")
+    print(f"\n{'='*65}")
+    print(f"HİBRİT TESTİ v3 — {N_RUNS} RUN  (H7+H8 dahil)")
+    print(f"{'='*65}")
+    print(f"8 hibrit + 3 baseline = {len(TEST_LIST)} koşucu")
     print(f"Global={GLOBAL_EPOCH}ep  Local={LOCAL_EPOCH}ep  "
           f"Baseline={BASELINE_EPOCH}ep  K={K}")
     if pw > 1:
@@ -313,28 +360,21 @@ def run_all(full_matrix, algo_map, parallel_workers=1):
         run_dir = os.path.join(HYBRID_ROOT, f'run_{run}')
         os.makedirs(run_dir, exist_ok=True)
 
-        print(f"\n{'─'*60}  RUN {run}/{N_RUNS}  (seed={seed})")
+        print(f"\n{'─'*65}  RUN {run}/{N_RUNS}  (seed={seed})")
         print(f"  Klasör: {run_dir}")
 
         init = mkmeans_plus_plus_init(
             full_matrix, K=K, n_solutions=POP_SIZE + 10, seed=seed
         )
 
-        run_rows = []  # sadece bu run'ın satırları
+        run_rows = []
 
         if pw > 1:
             tasks = [
                 (
-                    label,
-                    g_name,
-                    l_name,
-                    full_matrix,
-                    K,
-                    init,
-                    BASELINE_EPOCH,
-                    GLOBAL_EPOCH,
-                    LOCAL_EPOCH,
-                    POP_SIZE,
+                    label, g_name, l_name,
+                    full_matrix, K, init,
+                    BASELINE_EPOCH, GLOBAL_EPOCH, LOCAL_EPOCH, POP_SIZE,
                 )
                 for label, g_name, l_name in TEST_LIST
             ]
@@ -346,35 +386,30 @@ def run_all(full_matrix, algo_map, parallel_workers=1):
                 remote_out = list(ex.map(_run_one_case_remote, tasks))
 
             for out in remote_out:
-                label = out["label"]
+                label  = out["label"]
                 g_name = out["g_name"]
                 l_name = out["l_name"]
                 if not out.get("ok"):
-                    print(f"  {label:<16} HATA: {out.get('err', '?')}")
+                    print(f"  {label:<18} HATA: {out.get('err', '?')}")
                     continue
-                r = out["r"]
-                imp = (
-                    " ✓local"
-                    if r["local_improved"] is True
-                    else " →global"
-                    if r["local_improved"] is False
-                    else ""
-                )
-                print(
-                    f"  {label:<16} WCSS={r['wcss']:.3f}  "
-                    f"DB={r['davies_bouldin']:.3f}  "
-                    f"Sil={r['silhouette']:.4f}  "
-                    f"{r['time_seconds']:.0f}s{imp}"
-                )
+                r   = out["r"]
+                imp = (" ✓local"   if r["local_improved"] is True
+                       else " →global" if r["local_improved"] is False
+                       else "")
+                print(f"  {label:<18} WCSS={r['wcss']:.3f}  "
+                      f"DB={r['davies_bouldin']:.3f}  "
+                      f"Sil={r['silhouette']:.4f}  "
+                      f"{r['time_seconds']:.0f}s{imp}")
                 run_results[label]["wcss"].append(r["wcss"])
                 run_results[label]["db"].append(r["davies_bouldin"])
                 run_results[label]["sil"].append(r["silhouette"])
                 row = _make_result_row(run, label, g_name, l_name, r)
                 all_rows.append(row)
                 run_rows.append(row)
+
         else:
             for label, g_name, l_name in TEST_LIST:
-                print(f"  {label:<16}", end=' ', flush=True)
+                print(f"  {label:<18}", end=' ', flush=True)
 
                 g_info = algo_map.get(g_name)
                 if g_info is None:
@@ -396,9 +431,9 @@ def run_all(full_matrix, algo_map, parallel_workers=1):
                     print(f"HATA: {e}")
                     continue
 
-                imp = (" ✓local" if r['local_improved'] is True
-                       else " →global" if r['local_improved'] is False else "")
-
+                imp = (" ✓local"   if r['local_improved'] is True
+                       else " →global" if r['local_improved'] is False
+                       else "")
                 print(f"WCSS={r['wcss']:.3f}  DB={r['davies_bouldin']:.3f}  "
                       f"Sil={r['silhouette']:.4f}  {r['time_seconds']:.0f}s{imp}")
 
@@ -415,23 +450,21 @@ def run_all(full_matrix, algo_map, parallel_workers=1):
             df_run = pd.DataFrame(run_rows)
             df_run.to_csv(os.path.join(run_dir, 'results.csv'), index=False)
 
-            # Run özeti (küçük tablo)
             summary_lines = [
                 f"Run {run}  seed={seed}  {time.strftime('%Y-%m-%d %H:%M:%S')}",
-                f"{'Label':<16} {'WCSS':>8} {'DB':>7} {'Sil':>8} {'Süre':>7}  Tip",
-                "-" * 60,
+                f"{'Label':<18} {'WCSS':>8} {'DB':>7} {'Sil':>8} {'Süre':>7}  Tip",
+                "-" * 65,
             ]
             for _, row in df_run.sort_values('wcss').iterrows():
-                imp = f" ✓" if row['local_improved'] is True else ""
+                chk = " ✓" if row['local_improved'] is True else ""
                 summary_lines.append(
-                    f"{row['label']:<16} {row['wcss']:>8.3f} "
+                    f"{row['label']:<18} {row['wcss']:>8.3f} "
                     f"{row['davies_bouldin']:>7.3f} {row['silhouette']:>8.4f} "
-                    f"{row['time_seconds']:>7.0f}s  {row['type']}{imp}"
+                    f"{row['time_seconds']:>7.0f}s  {row['type']}{chk}"
                 )
             with open(os.path.join(run_dir, 'summary.txt'), 'w',
                       encoding='utf-8') as f:
                 f.write('\n'.join(summary_lines))
-
             print(f"  → Kaydedildi: {run_dir}/results.csv")
 
         # Tüm runların birleşik geçici kaydı
@@ -449,11 +482,11 @@ def run_all(full_matrix, algo_map, parallel_workers=1):
 
 def analyze_and_report(df_all, run_results, n_runs):
 
-    # Özet
     rows = []
     for label, data in run_results.items():
         w = data['wcss']; d = data['db']; s = data['sil']
-        if not w: continue
+        if not w:
+            continue
         sub  = df_all[df_all['label'] == label]
         limp = sub['local_improved'].dropna()
         t    = sub['time_seconds'].dropna()
@@ -478,7 +511,8 @@ def analyze_and_report(df_all, run_results, n_runs):
         va = run_results.get(a, {}).get('wcss', [])
         vb = run_results.get(b, {}).get('wcss', [])
         n  = min(len(va), len(vb))
-        if n < 5: continue
+        if n < 5:
+            continue
         try:
             _, p = wilcoxon(va[:n], vb[:n])
         except Exception:
@@ -498,48 +532,61 @@ def analyze_and_report(df_all, run_results, n_runs):
     df_w = pd.DataFrame(w_rows)
     df_w.to_csv(os.path.join(HYBRID_ROOT, 'wilcoxon.csv'), index=False)
 
-    # ── Rapor ─────────────────────────────────────────────────
-    sep = "=" * 65
-    lines = [sep, f"HİBRİT TEST RAPORU — {n_runs} RUN",
-             f"Global={GLOBAL_EPOCH}ep  Local={LOCAL_EPOCH}ep  "
-             f"Baseline={BASELINE_EPOCH}ep  K={K}", sep]
+    # ── Rapor ──────────────────────────────────────────────────────────
+    sep = "=" * 68
+    lines = [
+        sep,
+        f"HİBRİT TEST RAPORU v3 — {n_runs} RUN  (H7+H8 dahil)",
+        f"Global={GLOBAL_EPOCH}ep  Local={LOCAL_EPOCH}ep  "
+        f"Baseline={BASELINE_EPOCH}ep  K={K}",
+        sep,
+    ]
 
-    lines.append(f"\n{'Sıra':<4}{'Label':<16}{'Tip':<10}"
+    lines.append(f"\n{'Sıra':<4}{'Label':<18}{'Tip':<10}"
                  f"{'WCSS_ort':>9}  {'std':>6}{'DB_ort':>8}{'LocalImp':>10}")
-    lines.append("-"*68)
+    lines.append("-" * 68)
     for i, (_, r) in enumerate(df_sum.iterrows(), 1):
-        limp = f"{r['local_imp_pct']:.0f}%" \
-               if not np.isnan(r['local_imp_pct']) else "   —"
+        limp = (f"{r['local_imp_pct']:.0f}%"
+                if not np.isnan(r['local_imp_pct']) else "   —")
         lines.append(
-            f"  {i:<2} {r['label']:<14} {r['type']:<10}"
+            f"  {i:<2} {r['label']:<16} {r['type']:<10}"
             f"{r['wcss_mean']:>9.3f}  {r['wcss_std']:>6.3f}"
             f"{r['db_mean']:>8.3f}{limp:>10}"
         )
 
     lines += [f"\n{sep}", "WİLCOXON (WCSS)", sep]
-    lines.append(f"\n{'Çift':<35}{'Fark':>8}{'p-val':>9}{'Anlam':>7}{'Kazanan':>18}")
-    lines.append("-"*78)
+    lines.append(f"\n{'Çift':<38}{'Fark':>8}{'p-val':>9}{'Anlam':>7}{'Kazanan':>18}")
+    lines.append("-" * 82)
     for _, r in df_w.iterrows():
-        lines.append(f"  {r['pair']:<35}{r['diff']:>+8.3f}"
-                     f"{r['p_value']:>9.4f}{r['sig']:>7}{r['better']:>18}")
+        lines.append(
+            f"  {r['pair']:<38}{r['diff']:>+8.3f}"
+            f"{r['p_value']:>9.4f}{r['sig']:>7}{r['better']:>18}"
+        )
         lines.append(f"    → {r['note']}")
 
     hibs = df_sum[df_sum['type'] == 'hybrid']
     bls  = df_sum[df_sum['type'] == 'baseline']
     if len(hibs) > 0 and len(bls) > 0:
-        bh = hibs.iloc[0]; bb = bls.iloc[0]
+        bh = hibs.iloc[0]
+        bb = bls.iloc[0]
         lines += [f"\n{sep}", "ÖZET", sep]
         lines.append(f"""
-En iyi hibrit  : {bh['label']}   WCSS={bh['wcss_mean']:.3f}±{bh['wcss_std']:.3f}  DB={bh['db_mean']:.3f}
-En iyi baseline: {bb['label']}   WCSS={bb['wcss_mean']:.3f}±{bb['wcss_std']:.3f}  DB={bb['db_mean']:.3f}
+En iyi hibrit  : {bh['label']}  WCSS={bh['wcss_mean']:.3f}±{bh['wcss_std']:.3f}  DB={bh['db_mean']:.3f}
+En iyi baseline: {bb['label']}  WCSS={bb['wcss_mean']:.3f}±{bb['wcss_std']:.3f}  DB={bb['db_mean']:.3f}
 
-WCSS kazanımı: {bb['wcss_mean']-bh['wcss_mean']:+.3f}  ({'hibrit üstün ✓' if bh['wcss_mean']<bb['wcss_mean'] else 'baseline üstün'})
-DB   kazanımı: {bb['db_mean']-bh['db_mean']:+.3f}  ({'hibrit üstün ✓' if bh['db_mean']<bb['db_mean'] else 'baseline üstün'})
+WCSS kazanımı: {bb['wcss_mean'] - bh['wcss_mean']:+.3f}  \
+({'hibrit üstün ✓' if bh['wcss_mean'] < bb['wcss_mean'] else 'baseline üstün'})
+DB   kazanımı: {bb['db_mean'] - bh['db_mean']:+.3f}  \
+({'hibrit üstün ✓' if bh['db_mean'] < bh['db_mean'] else 'baseline üstün'})
+
+H7_IAOA+HHO  : WCSS={run_results.get('H7_IAOA+HHO', {}).get('wcss', [None])[0] or 'N/A'}
+H8_MFO+IAOA  : WCSS={run_results.get('H8_MFO+IAOA', {}).get('wcss', [None])[0] or 'N/A'}
 """)
 
     text = "\n".join(lines)
     print(text)
-    with open(os.path.join(HYBRID_ROOT, 'report.txt'), 'w', encoding='utf-8') as f:
+    with open(os.path.join(HYBRID_ROOT, 'report.txt'), 'w',
+              encoding='utf-8') as f:
         f.write(text)
 
     print(f"\nDosyalar → {HYBRID_ROOT}/")
@@ -558,17 +605,27 @@ if __name__ == "__main__":
     all_algos   = get_all_algorithms_v3()
     algo_map    = {a['full_name']: a for a in all_algos}
 
-    needed  = ['HHO.OriginalHHO','HGS.OriginalHGS','MFO.OriginalMFO',
-               'OOA.OriginalOOA','AGTO.OriginalAGTO']
+    # IAOA'yı kaydet
+    iaoa_ok = _register_iaoa(algo_map)
+
+    needed  = [
+        'HHO.OriginalHHO', 'HGS.OriginalHGS', 'MFO.OriginalMFO',
+        'OOA.OriginalOOA', 'AGTO.OriginalAGTO',
+        'IAOA.OriginalIAOA',
+    ]
     missing = [n for n in needed if n not in algo_map]
     if missing:
-        print(f"UYARI: {missing}")
+        print(f"UYARI — eksik algoritmalar: {missing}")
+        if 'IAOA.OriginalIAOA' in missing:
+            print("  → optimizers/iaoa_optimizer.py dosyasını kontrol et")
     else:
-        print(f"✓ Tüm algoritmalar mevcut ({len(algo_map)} toplam)")
+        print(f"✓ Tüm algoritmalar mevcut (IAOA dahil, {len(algo_map)} toplam)")
+
     print(
         f"Paralel işçi: {parallel_workers}  "
         f"(HYBRID_TEST_WORKERS={os.environ.get('HYBRID_TEST_WORKERS', '')!r})"
     )
+    print(f"Sonuçlar → {HYBRID_ROOT}/")
 
     df_all, run_results = run_all(full_matrix, algo_map, parallel_workers)
 
