@@ -81,6 +81,27 @@ def load_movielens(path):
     return matrix
 
 
+def load_movielens_1m(path):
+    df = pd.read_csv(
+        path, sep='::',
+        names=['user_id', 'item_id', 'rating', 'timestamp'],
+        engine='python',
+    )
+    matrix = df.pivot_table(
+        index='user_id',
+        columns='item_id',
+        values='rating',
+        fill_value=0,
+    ).values.astype(np.float32)
+
+    total = matrix.size
+    nonzero = np.count_nonzero(matrix)
+    print(f"Matrix shape     : {matrix.shape}")
+    print(f"Sparsity         : {1 - nonzero/total:.3f}")
+    print(f"Rating range     : {matrix[matrix>0].min():.1f} - {matrix.max():.1f}")
+    return matrix
+
+
 def sample_matrix(matrix, n_users=200, n_items=200, seed=42):
     np.random.seed(seed)
 
@@ -230,6 +251,13 @@ def get_special_params(algo_name, epoch, pop_size):
         'CEM.OriginalCEM'  : {'epoch': epoch, 'pop_size': pop_size, 'n_best': 5},
         'BSA.OriginalBSA'  : {'epoch': epoch, 'pop_size': pop_size, 'ff': 5},
         'EHO.OriginalEHO'  : {'epoch': epoch, 'pop_size': pop_size, 'n_clans': 3},
+        'GA.EliteMultiGA': {
+            'epoch': epoch, 'pop_size': pop_size,
+            'pc': 0.9, 'pm': 0.05,
+            'crossover': 'arithmetic', 'mutation': 'swap',
+            'elite_best': 0.1, 'elite_worst': 0.3,
+        },
+        'GAHHO.OriginalGAHHO': {'epoch': epoch, 'pop_size': pop_size, 'pc': 0.9, 'pm': 0.05, 'crossover': 'arithmetic', 'mutation': 'swap', 'mutation_multipoints': True},
     }
     return special.get(algo_name, None)
 
@@ -243,7 +271,7 @@ def get_all_algorithms_v3():
         try:
             module = __import__(modname, fromlist="dummy")
             for name, obj in inspect.getmembers(module, inspect.isclass):
-                if (name.startswith('Original') and
+                if (any(name.startswith(p) for p in ('Original', 'Dev', 'Improved', 'CL_', 'Swarm', 'Levy', 'AIW_', 'Elite')) and
                         hasattr(obj, 'solve') and hasattr(obj, 'generate_population')):
                     full_name = f"{modname.split('.')[-1]}.{name}"
                     if full_name not in BLACKLIST:
@@ -891,50 +919,67 @@ if __name__ == "__main__":
     print("=" * 60)
 
     DATA_PATH = os.path.join(os.path.dirname(BASE_DIR), 'data', 'ml-100k', 'u.data')
+    DATA_PATH_1M = os.path.join(os.path.dirname(BASE_DIR), 'data', 'ml-1m', 'ratings.dat')
     full_matrix = load_movielens(DATA_PATH)
     all_algos   = get_all_algorithms_v3()
 
-    K1, K2 = 60, 90
-    K_BEH = 60  # davranış analizi (küçük örnek matris 200×300)
+    K1, K2 = 50, 70
+    K_BEH = K1  # davranış analizi (küçük örnek matris 200×300)
 
-    # Tüm aşama çıktıları aynı çalıştırma klasöründe (results/phase3/<n>/)
+    # Tüm aşama çıktıları aynı çalıştırma kökünde (results/phase3/<n>/); alt klasörler aşama/dataset
     phase3_run_dir = next_phase3_run_dir()
     run_n = os.path.basename(phase3_run_dir)
 
-    # ── Aşama 2 (eleme, örnek matris) ─────────────────────────
-    print(f"\n>>> AŞAMA 2 (ELEME) BAŞLIYOR  (phase3/{run_n})")
+    ml100k_phase2_dir = os.path.join(phase3_run_dir, 'ml100k-phase2')
+    ml1m_phase2_dir = os.path.join(phase3_run_dir, 'ml1m-phase2')
+    ml100k_phase3_dir = os.path.join(phase3_run_dir, 'ml-100k-phase3')
+    ml1m_phase3_dir = os.path.join(phase3_run_dir, 'ml-1m-phase3')
+    os.makedirs(ml1m_phase2_dir, exist_ok=True)
+
+    # ── Aşama 2 (eleme, örnek matris ML-100K) ────────────────
+    print(f"\n>>> AŞAMA 2 (ELEME, ML-100K) BAŞLIYOR  (phase3/{run_n}/ml100k-phase2)")
     matrix_eleme = sample_matrix(full_matrix, n_users=300, n_items=400)
     init_eleme   = mkmeans_plus_plus_init(matrix_eleme, K=K1, n_solutions=30)
 
     df_elim = run_phase(2, all_algos, matrix_eleme, K1, init_eleme,
                         epoch=30, pop_size=20, time_limit=180,
-                        save_path=phase3_run_dir)
-    top10_elim = rank_and_filter(df_elim, top_n=10)
-    top10_names = set(top10_elim['algorithm'].tolist())
-    algos_phase3 = [a for a in all_algos if a['full_name'] in top10_names]
+                        save_path=ml100k_phase2_dir)
+    top25_elim = rank_and_filter(df_elim, top_n=25)
+    top25_names = set(top25_elim['algorithm'].tolist())
+    algos_phase3 = [a for a in all_algos if a['full_name'] in top25_names]
 
-    # ── Aşama 3 (tam matris) ─────────────────────────────────
-    print(f"\n>>> AŞAMA 3 (FİNAL) BAŞLIYOR  (phase3/{run_n})")
-    init_full = mkmeans_plus_plus_init(full_matrix, K=K2, n_solutions=50)
+    # ── Aşama 3 (ML-100K tam matris) ───────────────────────
+    print(f"\n>>> AŞAMA 3 (FİNAL, ML-100K) BAŞLIYOR  (phase3/{run_n}/ml-100k-phase3)")
+    init_full_100k = mkmeans_plus_plus_init(full_matrix, K=K2, n_solutions=50)
 
-    df3 = run_phase(3, algos_phase3, full_matrix, K2, init_full,
-                    epoch=50, pop_size=30, time_limit=900,
-                    save_path=phase3_run_dir)
-    final = rank_and_filter(df3, top_n=5, save_path=phase3_run_dir)
+    df3_100k = run_phase(3, algos_phase3, full_matrix, K2, init_full_100k,
+                         epoch=50, pop_size=30, time_limit=900,
+                         save_path=ml100k_phase3_dir)
+    final = rank_and_filter(df3_100k, top_n=10, save_path=ml100k_phase3_dir)
 
-    # ── Davranış Analizi ─────────────────────────────────────
-    print("\n>>> DAVRANIŞ ANALİZİ BAŞLIYOR")
+    # ── Aşama 3 (ML-1M tam matris, aynı algos_phase3) ───────
+    print(f"\n>>> AŞAMA 3 (FİNAL, ML-1M) BAŞLIYOR  (phase3/{run_n}/ml-1m-phase3)")
+    full_matrix_1m = load_movielens_1m(DATA_PATH_1M)
+    init_full_1m = mkmeans_plus_plus_init(full_matrix_1m, K=K2, n_solutions=30)
+
+    df3_1m = run_phase(3, algos_phase3, full_matrix_1m, K2, init_full_1m,
+                       epoch=50, pop_size=30, time_limit=1800,
+                       save_path=ml1m_phase3_dir)
+    rank_and_filter(df3_1m, top_n=10, save_path=ml1m_phase3_dir)
+
+    # ── Davranış Analizi (yalnız ML-100K) ───────────────────
+    print("\n>>> DAVRANIŞ ANALİZİ BAŞLIYOR (ML-100K)")
     matrix_beh = sample_matrix(full_matrix, n_users=200, n_items=300)
     init_beh   = mkmeans_plus_plus_init(matrix_beh, K=K_BEH, n_solutions=20)
 
     behavior_results, local_algos, global_algos = run_behavior_analysis(
         algos_phase3, matrix_beh, K=K_BEH,
         initial_solutions=init_beh, epoch=50, pop_size=20,
-        save_path=phase3_run_dir,
+        save_path=ml100k_phase3_dir,
     )
 
-    # ── Hibrit Test ───────────────────────────────────────────
-    print("\n>>> HİBRİT ALGORİTMA TESTİ BAŞLIYOR")
+    # ── Hibrit Test (yalnız ML-100K) ───────────────────────
+    print("\n>>> HİBRİT ALGORİTMA TESTİ BAŞLIYOR (ML-100K)")
 
     if len(global_algos) > 0:
         best_global_r = sorted(global_algos, key=lambda x: x['final_wcss'])[0]
@@ -987,7 +1032,7 @@ if __name__ == "__main__":
 
         hybrid_row = run_hybrid_algorithm(
             global_info, local_info,
-            full_matrix, K2, init_full,
+            full_matrix, K2, init_full_100k,
             global_epoch=30, local_epoch=20, pop_size=30,
         )
         if hybrid_row['success']:
@@ -1000,7 +1045,7 @@ if __name__ == "__main__":
             print(f"  HATA: {hybrid_row['error']}")
 
     pd.DataFrame([hybrid_row]).to_csv(
-        os.path.join(phase3_run_dir, 'hybrid_result.csv'), index=False)
+        os.path.join(ml100k_phase3_dir, 'hybrid_result.csv'), index=False)
 
     # ── Final özet ───────────────────────────────────────────
     print("\n" + "=" * 60)
@@ -1014,24 +1059,26 @@ if __name__ == "__main__":
         print(f"   GS Oranı  : {row['gray_sheep_ratio']:.1%}")
         print(f"   Süre      : {row['time_seconds']:.1f}s")
 
-    final.to_csv(os.path.join(phase3_run_dir, 'FINAL_RECOMMENDATIONS.csv'), index=False)
+    final.to_csv(os.path.join(ml100k_phase3_dir, 'FINAL_RECOMMENDATIONS.csv'), index=False)
 
     # DÜZELTİLDİ: RUN_INFO.txt artık tarih + config içeriyor
     algo_names_p3 = [a['full_name'] for a in algos_phase3]
-    manifest = f"""Phase 3 çalıştırması #{run_n} (2 aşama: eleme + final)
+    manifest = f"""Phase 3 çalıştırması #{run_n} (eleme + çift final: ML-100K / ML-1M)
 Tarih         : {RUN_START}
-Klasör        : results/phase3/{run_n}/
+Kök klasör    : results/phase3/{run_n}/
+Alt klasörler : ml100k-phase2 | ml1m-phase2 | ml-100k-phase3 | ml-1m-phase3
 
-── Aşama 2 (eleme) ──────────────────────────────
+── Aşama 2 (eleme, ML-100K örnek) ─────────────
 K             : {K1}
-sample        : 300×400 kullanıcı/film alt kümesi
+sample        : 300×400
 init_solutions: 30
 epoch         : 30
 pop_size      : 20
 time_limit    : 180s
-final havuz   : elemeden top-10 (zorunlu algoritma yok)
+ML-100K kayıt : …/{run_n}/ml100k-phase2/  → top-25 kohort (Aşama 3 listesi)
+ml1m-phase2/  : boş klasör (adlandırma tutarlılığı)
 
-── Aşama 3 (final) ───────────────────────────────
+── Aşama 3 (final, ML-100K) ────────────────────
 K             : {K2}
 epoch         : 50
 pop_size      : 30
@@ -1039,33 +1086,49 @@ time_limit    : 900s
 matrix        : {full_matrix.shape}
 sparsity      : {1 - np.count_nonzero(full_matrix)/full_matrix.size:.3f}
 data_path     : {DATA_PATH}
+kayıt         : …/{run_n}/ml-100k-phase3/
+rank_and_filter: top_n=10
 
-── Davranış analizi ─────────────────────────────
+── Aşama 3 (final, ML-1M) ───────────────────────
+K             : {K2}
+epoch         : 50
+pop_size      : 30
+time_limit    : 900s
+matrix        : {full_matrix_1m.shape}
+sparsity      : {1 - np.count_nonzero(full_matrix_1m)/full_matrix_1m.size:.3f}
+data_path     : {DATA_PATH_1M}
+kayıt         : …/{run_n}/ml-1m-phase3/
+rank_and_filter: top_n=10
+katılımcılar  : Aşama 2 (ML-100K) top-25 ile aynı liste ({len(algos_phase3)})
+
+── Davranış analizi (yalnız ML-100K) ────────────
 K             : {K_BEH}
 sample        : 200×300
-katılımcılar  : Aşama 3'e giren top-10 kohort ({len(algos_phase3)})
+kayıt         : …/{run_n}/ml-100k-phase3/
+katılımcılar  : Aşama 3 kohortu ({len(algos_phase3)})
 
 ── Aşama 3 Algoritmaları ({len(algos_phase3)}) ─────────────────
 {chr(10).join('  ' + n for n in algo_names_p3)}
 
-── Hibrit ───────────────────────────────────────
+── Hibrit (yalnız ML-100K) ─────────────────────
 global : {global_info['full_name'] if global_info else 'SKIP'}  [{global_src}]
 local  : {local_info['full_name']  if local_info  else 'SKIP'}  [{local_src}]
 
 ── Dosyalar ─────────────────────────────────────
-  phase2_*.csv               Aşama 2 (eleme) ham/partial/success/failed
-  phase3_complete.csv          ham Aşama 3 sonuçları
-  phase3_success.csv           başarılı algoritmalar
-  phase3_failed.csv            başarısız / timeout
-  ranked_scores.csv            composite skor (final sıralama)
-  FINAL_RECOMMENDATIONS.csv    top-5 özet
-  behavior_analysis.csv        davranış kategorileri
-  hybrid_result.csv            hibrit metrikler
-  RUN_INFO.txt                 bu dosya
+  ml100k-phase2/phase2_*.csv       Aşama 2 eleme (ML-100K örnek)
+  ml1m-phase2/                     (bu koşuda Aşama 2 yok; klasör oluşturulur)
+  ml-100k-phase3/phase3_*.csv      Aşama 3 tam ML-100K
+  ml-100k-phase3/ranked_scores.csv composite top-10 (ML-100K)
+  ml-100k-phase3/FINAL_RECOMMENDATIONS.csv
+  ml-100k-phase3/behavior_analysis.csv
+  ml-100k-phase3/hybrid_result.csv
+  ml-1m-phase3/phase3_*.csv        Aşama 3 tam ML-1M
+  ml-1m-phase3/ranked_scores.csv     composite top-10 (ML-1M)
+  RUN_INFO.txt                     bu dosya (kök)
 """
     with open(os.path.join(phase3_run_dir, 'RUN_INFO.txt'), 'w', encoding='utf-8') as f:
         f.write(manifest)
 
     print(f"\n── Kayıt: results/phase3/{run_n}/ ──")
-    print("   phase2_*.csv | phase3_*.csv | ranked_scores.csv | FINAL_RECOMMENDATIONS.csv")
-    print("   behavior_analysis.csv | hybrid_result.csv | RUN_INFO.txt")
+    print("   ml100k-phase2 | ml1m-phase2 | ml-100k-phase3 | ml-1m-phase3")
+    print("   RUN_INFO.txt (kök) | ML-100K: FINAL / behavior / hybrid → ml-100k-phase3/")

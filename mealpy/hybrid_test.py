@@ -64,7 +64,7 @@ DATA_PATH = os.path.join(os.path.dirname(BASE_DIR),
                          'data', 'ml-100k', 'u.data')
 
 K              = 90
-N_RUNS         = 15
+N_RUNS         = 5
 POP_SIZE       = 30
 GLOBAL_EPOCH   = 30
 LOCAL_EPOCH    = 20
@@ -178,11 +178,9 @@ TEST_LIST = [
     ('H2_HGS+HHO',  'HGS.OriginalHGS',    'HHO.OriginalHHO'),
     ('H3_MFO+HGS',  'MFO.OriginalMFO',    'HGS.OriginalHGS'),
     ('H4_MFO+HHO',  'MFO.OriginalMFO',    'HHO.OriginalHHO'),
-    ('H5_OOA+HHO',  'OOA.OriginalOOA',    'HHO.OriginalHHO'),
     ('H6_AGTO+HGS', 'AGTO.OriginalAGTO',  'HGS.OriginalHGS'),
-    # ── YENİ ──────────────────────────────────────────────────────────────
-    ('H7_IAOA+HHO', 'IAOA.OriginalIAOA',  'HHO.OriginalHHO'),
-    ('H8_MFO+IAOA', 'MFO.OriginalMFO',    'IAOA.OriginalIAOA'),
+    ('H5_EliteMultiGA+HHO', 'GA.EliteMultiGA', 'HHO.OriginalHHO'),
+
     # ──────────────────────────────────────────────────────────────────────
     ('B1_HHO',      'HHO.OriginalHHO',    None),
     ('B2_HGS',      'HGS.OriginalHGS',    None),
@@ -197,7 +195,6 @@ WILCOXON_PAIRS = [
     ('H3_MFO+HGS',  'B2_HGS',      'H3 vs HGS tek'),
     ('H3_MFO+HGS',  'B3_MFO',      'H3 vs MFO tek'),
     ('H4_MFO+HHO',  'B1_HHO',      'H4 vs HHO tek'),
-    ('H5_OOA+HHO',  'B1_HHO',      'H5 vs HHO tek'),
     ('H6_AGTO+HGS', 'B2_HGS',      'H6 vs HGS tek'),
     ('H1_HHO+HGS',  'H2_HGS+HHO',  'Sıra farkı: H1 vs H2'),
     ('H3_MFO+HGS',  'H4_MFO+HHO',  'Local farkı: HGS vs HHO'),
@@ -209,6 +206,10 @@ WILCOXON_PAIRS = [
     ('H8_MFO+IAOA', 'H4_MFO+HHO',  'H8 vs H4: local IAOA vs HHO'),
     ('H7_IAOA+HHO', 'H8_MFO+IAOA', 'H7 vs H8: IAOA global vs IAOA local'),
     # ──────────────────────────────────────────────────────────────────────
+    ('H5_EliteMultiGA+HHO', 'H4_MFO+HHO', 'GA global vs MFO global'),
+    ('H5_EliteMultiGA+HHO', 'B1_HHO',     'H5 vs HHO tek'),
+    ('H5_EliteMultiGA+HHO', 'B3_MFO',     'H5 vs MFO tek'),
+
 ]
 
 

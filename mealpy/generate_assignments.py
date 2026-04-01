@@ -24,6 +24,7 @@ Kullanım:
     python generate_assignments.py                            # varsayılan
     python generate_assignments.py --lof                      # LOF gray sheep
     python generate_assignments.py --dataset 100k --algo H4_MFO+HHO
+    python generate_assignments.py --last-only               # sadece son algoritma
     python generate_assignments.py --lof --k 70               # LOF + K=70
     python generate_assignments.py --k-100k 70 --k-1m 120     # ayrı K
     python generate_assignments.py --lof --n-neighbors 15 --contamination 0.1
@@ -42,6 +43,9 @@ import pandas as pd
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
+_OPT_DIR = os.path.join(os.path.dirname(BASE_DIR), 'optimizers')
+if _OPT_DIR not in sys.path:
+    sys.path.insert(0, _OPT_DIR)
 
 from mealpy_comparison_v2 import (
     load_movielens,
@@ -53,6 +57,11 @@ from mealpy_comparison_v2 import (
     get_special_params,
 )
 from mealpy import FloatVar
+from mealpy.evolutionary_based import GA
+try:
+    from ga_hho_optimizer import OriginalGAHHO  # pyright: ignore[reportMissingImports]
+except ImportError:
+    from ga_hho import OriginalGAHHO  # pyright: ignore[reportMissingImports]
 
 # ============================================================
 # AYARLAR
@@ -76,8 +85,18 @@ LOF_CONTAMINATION = 'auto'
 ALGO_CONFIG = [
     ('B1_HHO',     'HHO.OriginalHHO', None),
     ('B2_HGS',     'HGS.OriginalHGS', None),
+    ('B3_MFO',     'MFO.OriginalMFO', None),
     ('H1_HHO+HGS', 'HHO.OriginalHHO', 'HGS.OriginalHGS'),
     ('H4_MFO+HHO', 'MFO.OriginalMFO', 'HHO.OriginalHHO'),
+    ('H5_GAHHO',   'GAHHO.OriginalGAHHO', None),
+    ('H5_EliteGA+HHO', 'GA.EliteMultiGA', 'HHO.OriginalHHO'),
+]
+
+# hybrid_test / rapor ile aynı etiketler; Wilcoxon çiftleri (klasör adı = ilk sütun)
+WILCOXON_PAIRS = [
+    ('H5_EliteGA+HHO', 'H4_MFO+HHO', 'GA global vs MFO global'),
+    ('H5_EliteGA+HHO', 'B1_HHO',     'H5 vs HHO tek'),
+    ('H5_EliteGA+HHO', 'B3_MFO',     'H5 vs MFO tek'),
 ]
 
 
@@ -400,6 +419,14 @@ def _mp_run_assignment_job(job):
         pop_size,
     ) = job
     algo_map = {a['full_name']: a for a in get_all_algorithms_v3()}
+    algo_map['GAHHO.OriginalGAHHO'] = {
+        'full_name': 'GAHHO.OriginalGAHHO',
+        'class':     OriginalGAHHO,
+    }
+    algo_map['GA.EliteMultiGA'] = {
+        'full_name': 'GA.EliteMultiGA',
+        'class':     GA.EliteMultiGA,
+    }
     _run_one_core(
         label,
         g_name,
@@ -509,6 +536,14 @@ def run_dataset(dataset_name, matrix, K, out_root, algo_filter=None,
     if nw == 1:
         print("Algoritma kataloğu yükleniyor (1 kez)...")
         algo_map = {a['full_name']: a for a in get_all_algorithms_v3()}
+        algo_map['GAHHO.OriginalGAHHO'] = {
+            'full_name': 'GAHHO.OriginalGAHHO',
+            'class':     OriginalGAHHO,
+        }
+        algo_map['GA.EliteMultiGA'] = {
+            'full_name': 'GA.EliteMultiGA',
+            'class':     GA.EliteMultiGA,
+        }
         for label, g_name, l_name, save_dir in jobs_meta:
             run_one(
                 label,
@@ -572,6 +607,10 @@ def parse_args():
         help=f"Algoritmalar (default: hepsi): {labels}"
     )
     p.add_argument(
+        '--last-only', action='store_true',
+        help=f"Sadece son algoritmayı çalıştır: {labels[-1]}"
+    )
+    p.add_argument(
         '--lof', action='store_true',
         help="LOF tabanlı gray sheep kullan (default: sabit 80. percentile)"
     )
@@ -631,6 +670,7 @@ def _multi_start_init(matrix, K, pop_size, seed, n_restarts=10):
 
 if __name__ == '__main__':
     args = parse_args()
+    selected_algos = [ALGO_CONFIG[-1][0]] if args.last_only else args.algo
 
     # Contamination dönüşümü
     contamination = args.contamination
@@ -652,7 +692,7 @@ if __name__ == '__main__':
     print("ASSIGNMENT ÜRETİCİ")
     print("=" * 60)
     print(f"Gray sheep  : {'LOF (adaptif)' if args.lof else 'Percentile (sabit %20)'}")
-    print(f"Algoritmalar: {args.algo or [c[0] for c in ALGO_CONFIG]}")
+    print(f"Algoritmalar: {selected_algos or [c[0] for c in ALGO_CONFIG]}")
     print(f"Dataset     : {args.dataset}")
     print(f"ML-100K K   : {k_100k}  |  ML-1M K: {k_1m}")
     if args.lof:
@@ -682,7 +722,7 @@ if __name__ == '__main__':
         matrix_100k = load_movielens(args.data_100k)
         run_dataset(
             'ml100k', matrix_100k, k_100k, out_root,
-            algo_filter=args.algo,
+            algo_filter=selected_algos,
             use_lof=args.lof,
             lof_n_neighbors=args.n_neighbors,
             lof_contamination=contamination,
@@ -694,7 +734,7 @@ if __name__ == '__main__':
         matrix_1m = load_movielens_1m(args.data_1m)
         run_dataset(
             'ml1m', matrix_1m, k_1m, out_root,
-            algo_filter=args.algo,
+            algo_filter=selected_algos,
             use_lof=args.lof,
             lof_n_neighbors=args.n_neighbors,
             lof_contamination=contamination,
