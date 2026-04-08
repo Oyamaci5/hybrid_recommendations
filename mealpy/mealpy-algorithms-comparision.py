@@ -13,6 +13,8 @@ Düzeltmeler:
   v5: Eleme time_limit 180s, init n_solutions=30; final havuz = eleme top-10 (PHASE3_MUST yok);
       davranış analizi K=60; davranışta tüm Aşama 3 katılımcıları (top-10 kohort)
   v6: Silhouette: beyaz koyun alt kümesinde max 300 örnek, Pearson precomputed mesafe matrisi
+  v7: Ana koşu: run_phase için parallel_workers=4, time_limit=None (paralel havuz)
+  v8: run_phase n_runs + seed 0..n-1 ortalama; Aşama 2 kohort WCSS10∪DB5; davranış/hibrit tam ML-100K
 """
 
 import numpy as np
@@ -237,7 +239,8 @@ BLACKLIST = {
     'PSS.OriginalPSS', 'ACOR.OriginalACOR', 'FFA.OriginalFFA',
     'ALO.OriginalALO', 'HCO.OriginalHCO', 'SPBO.OriginalSPBO',
     'GSKA.OriginalGSKA', 'MA.OriginalMA', 'ESO.OriginalESO',
-    'BFO.OriginalBFO', 'DMOA.OriginalDMOA', 'SSA.OriginalSSA',
+    'BFO.OriginalBFO', 'DMOA.OriginalDMOA',
+    'HS.OriginalHS', 'EPC.DevEPC',
 }
 
 
@@ -258,6 +261,10 @@ def get_special_params(algo_name, epoch, pop_size):
             'elite_best': 0.1, 'elite_worst': 0.3,
         },
         'GAHHO.OriginalGAHHO': {'epoch': epoch, 'pop_size': pop_size, 'pc': 0.9, 'pm': 0.05, 'crossover': 'arithmetic', 'mutation': 'swap', 'mutation_multipoints': True},
+        'SSA.DevSSA': {
+            'epoch': epoch, 'pop_size': pop_size,
+            'ST': 0.8, 'PD': 0.2, 'SD': 0.1
+        },
     }
     return special.get(algo_name, None)
 
@@ -330,13 +337,54 @@ def _compute_metrics(matrix, best_sol, K):
     }
 
 
+def _aggregate_phase_runs(rows, algo_name, n_runs):
+    """n_runs tekrarın sonuçlarını birleştirir; tümü başarılı değilse hata döner."""
+    if len(rows) != n_runs:
+        return {
+            'algorithm': algo_name, 'wcss': None, 'silhouette': None,
+            'davies_bouldin': None, 'gray_sheep_count': None,
+            'gray_sheep_ratio': None, 'gray_sheep_threshold': None,
+            'time_seconds': None, 'success': False,
+            'error': f'n_runs uyuşmazlığı: {len(rows)} != {n_runs}',
+        }
+    if not all(r.get('success') for r in rows):
+        errs = [str(r.get('error') or '') for r in rows if not r.get('success')]
+        return {
+            'algorithm': algo_name, 'wcss': None, 'silhouette': None,
+            'davies_bouldin': None, 'gray_sheep_count': None,
+            'gray_sheep_ratio': None, 'gray_sheep_threshold': None,
+            'time_seconds': float(np.mean([r.get('time_seconds') or 0 for r in rows])),
+            'success': False, 'error': '; '.join(e for e in errs if e) or 'partial failure',
+            'n_runs': n_runs,
+        }
+
+    def _mean(key):
+        return float(np.mean([float(r[key]) for r in rows]))
+
+    return {
+        'algorithm': algo_name,
+        'wcss': _mean('wcss'),
+        'silhouette': float(np.nanmean([r['silhouette'] for r in rows])),
+        'davies_bouldin': _mean('davies_bouldin'),
+        'gray_sheep_count': int(round(_mean('gray_sheep_count'))),
+        'gray_sheep_ratio': _mean('gray_sheep_ratio'),
+        'gray_sheep_threshold': _mean('gray_sheep_threshold'),
+        'time_seconds': _mean('time_seconds'),
+        'success': True,
+        'error': None,
+        'n_runs': n_runs,
+    }
+
+
 def _run_algo_v3_serialized(algo_module, class_name, algo_name,
                             matrix, K, initial_solutions,
-                            epoch, pop_size):
+                            epoch, pop_size, rng_seed=None):
     """
     Tek algoritma çözümü (module/class string ile) — timeout worker ve
     ProcessPoolExecutor görevleri için ortak gövde; sonuç sözlüğü döner.
     """
+    if rng_seed is not None:
+        np.random.seed(int(rng_seed))
     start = time.time()
     try:
         from mealpy import FloatVar
@@ -392,11 +440,11 @@ def _run_algo_v3_serialized(algo_module, class_name, algo_name,
 
 def _solve_worker_v3(algo_module, class_name, algo_name,
                      matrix, K, initial_solutions,
-                     epoch, pop_size, out_queue):
+                     epoch, pop_size, out_queue, rng_seed=None):
     """Multiprocessing worker (timeout dalı)."""
     out_queue.put(_run_algo_v3_serialized(
         algo_module, class_name, algo_name, matrix, K,
-        initial_solutions, epoch, pop_size,
+        initial_solutions, epoch, pop_size, rng_seed=rng_seed,
     ))
 
 
@@ -746,12 +794,16 @@ def run_hybrid_algorithm(global_algo_info, local_algo_info,
 def run_phase(phase_num, algo_list, matrix, K,
               initial_solutions, epoch, pop_size,
               time_limit=None, save_path=RESULTS_DIR,
-              parallel_workers=1):
+              parallel_workers=1, use_init=True, n_runs=1):
 
+    init_for_run = initial_solutions if use_init else None
+    nr = max(1, int(n_runs))
     os.makedirs(save_path, exist_ok=True)
     print(f"\n{'='*60}")
     print(f"AŞAMA {phase_num}: {len(algo_list)} algoritma")
     print(f"Matrix: {matrix.shape} | K={K} | epoch={epoch} | pop={pop_size}")
+    if nr > 1:
+        print(f"n_runs={nr} (seed=0..{nr - 1}, WCSS/Sil/DB ve diğer metrikler ortalama)")
     pw = int(parallel_workers) if parallel_workers else 1
     if time_limit is not None and pw > 1:
         print("Uyarı: time_limit ile paralel çalıştırma desteklenmiyor; sıralı mod.")
@@ -773,7 +825,7 @@ def run_phase(phase_num, algo_list, matrix, K,
         tasks = [
             (
                 a['module'], a['class_name'], a['full_name'],
-                matrix, K, initial_solutions, epoch, pop_size,
+                matrix, K, init_for_run, epoch, pop_size, nr,
             )
             for a in algo_list
         ]
@@ -799,9 +851,21 @@ def run_phase(phase_num, algo_list, matrix, K,
     else:
         for i, algo in enumerate(algo_list):
             print(f"\n[{i+1}/{len(algo_list)}] {algo['full_name']}...", end=' ', flush=True)
-            result = run_algorithm_v3(algo, matrix, K,
-                                      initial_solutions, epoch, pop_size,
-                                      time_limit=time_limit)
+            if nr == 1:
+                result = run_algorithm_v3(algo, matrix, K,
+                                          init_for_run, epoch, pop_size,
+                                          time_limit=time_limit)
+            else:
+                run_rows = []
+                for run_index in range(nr):
+                    np.random.seed(run_index)
+                    run_rows.append(
+                        run_algorithm_v3(algo, matrix, K,
+                                         init_for_run, epoch, pop_size,
+                                         time_limit=time_limit)
+                    )
+                result = _aggregate_phase_runs(
+                    run_rows, algo['full_name'], nr)
             results.append(result)
 
             if result['success']:
@@ -924,57 +988,52 @@ if __name__ == "__main__":
     all_algos   = get_all_algorithms_v3()
 
     K1, K2 = 50, 70
-    K_BEH = K1  # davranış analizi (küçük örnek matris 200×300)
 
     # Tüm aşama çıktıları aynı çalıştırma kökünde (results/phase3/<n>/); alt klasörler aşama/dataset
-    phase3_run_dir = next_phase3_run_dir()
+    phase3_root = os.path.join(RESULTS_DIR, 'phase3')
+    run_dirs = [int(d) for d in os.listdir(phase3_root) if d.isdigit()]
+    if not run_dirs:
+        raise RuntimeError("results/phase3 altında mevcut çalıştırma klasörü bulunamadı.")
+    phase3_run_dir = os.path.join(phase3_root, str(max(run_dirs)))
     run_n = os.path.basename(phase3_run_dir)
 
     ml100k_phase2_dir = os.path.join(phase3_run_dir, 'ml100k-phase2')
     ml1m_phase2_dir = os.path.join(phase3_run_dir, 'ml1m-phase2')
     ml100k_phase3_dir = os.path.join(phase3_run_dir, 'ml-100k-phase3')
     ml1m_phase3_dir = os.path.join(phase3_run_dir, 'ml-1m-phase3')
-    os.makedirs(ml1m_phase2_dir, exist_ok=True)
+    os.makedirs(ml100k_phase3_dir, exist_ok=True)
+    os.makedirs(ml1m_phase3_dir, exist_ok=True)
 
-    # ── Aşama 2 (eleme, örnek matris ML-100K) ────────────────
-    print(f"\n>>> AŞAMA 2 (ELEME, ML-100K) BAŞLIYOR  (phase3/{run_n}/ml100k-phase2)")
-    matrix_eleme = sample_matrix(full_matrix, n_users=300, n_items=400)
-    init_eleme   = mkmeans_plus_plus_init(matrix_eleme, K=K1, n_solutions=30)
-
-    df_elim = run_phase(2, all_algos, matrix_eleme, K1, init_eleme,
-                        epoch=30, pop_size=20, time_limit=180,
-                        save_path=ml100k_phase2_dir)
+    # ── Aşama 2 (mevcut sonuçlardan okuma, ML-100K) ───────────
+    print(f"\n>>> AŞAMA 2 SKIP (mevcut dosyadan okunuyor)  (phase3/{run_n}/ml100k-phase2)")
+    df_elim = pd.read_csv(os.path.join(phase3_run_dir, 'ml100k-phase2', 'phase2_complete.csv'))
     top25_elim = rank_and_filter(df_elim, top_n=25)
     top25_names = set(top25_elim['algorithm'].tolist())
     algos_phase3 = [a for a in all_algos if a['full_name'] in top25_names]
 
     # ── Aşama 3 (ML-100K tam matris) ───────────────────────
     print(f"\n>>> AŞAMA 3 (FİNAL, ML-100K) BAŞLIYOR  (phase3/{run_n}/ml-100k-phase3)")
-    init_full_100k = mkmeans_plus_plus_init(full_matrix, K=K2, n_solutions=50)
-
-    df3_100k = run_phase(3, algos_phase3, full_matrix, K2, init_full_100k,
-                         epoch=50, pop_size=30, time_limit=900,
-                         save_path=ml100k_phase3_dir)
+    df3_100k = run_phase(3, algos_phase3, full_matrix, K2, None,
+                         epoch=50, pop_size=30, time_limit=None,
+                         parallel_workers=4, save_path=ml100k_phase3_dir,
+                         use_init=False, n_runs=5)
     final = rank_and_filter(df3_100k, top_n=10, save_path=ml100k_phase3_dir)
 
     # ── Aşama 3 (ML-1M tam matris, aynı algos_phase3) ───────
     print(f"\n>>> AŞAMA 3 (FİNAL, ML-1M) BAŞLIYOR  (phase3/{run_n}/ml-1m-phase3)")
     full_matrix_1m = load_movielens_1m(DATA_PATH_1M)
-    init_full_1m = mkmeans_plus_plus_init(full_matrix_1m, K=K2, n_solutions=30)
 
-    df3_1m = run_phase(3, algos_phase3, full_matrix_1m, K2, init_full_1m,
-                       epoch=50, pop_size=30, time_limit=1800,
-                       save_path=ml1m_phase3_dir)
+    df3_1m = run_phase(3, algos_phase3, full_matrix_1m, K2, None,
+                       epoch=70, pop_size=50, time_limit=None,
+                       parallel_workers=4, save_path=ml1m_phase3_dir,
+                       use_init=False, n_runs=5)
     rank_and_filter(df3_1m, top_n=10, save_path=ml1m_phase3_dir)
 
-    # ── Davranış Analizi (yalnız ML-100K) ───────────────────
-    print("\n>>> DAVRANIŞ ANALİZİ BAŞLIYOR (ML-100K)")
-    matrix_beh = sample_matrix(full_matrix, n_users=200, n_items=300)
-    init_beh   = mkmeans_plus_plus_init(matrix_beh, K=K_BEH, n_solutions=20)
-
+    # ── Davranış Analizi (tam ML-100K, algos_phase3) ────────
+    print("\n>>> DAVRANIŞ ANALİZİ BAŞLIYOR (ML-100K tam matris, algos_phase3)")
     behavior_results, local_algos, global_algos = run_behavior_analysis(
-        algos_phase3, matrix_beh, K=K_BEH,
-        initial_solutions=init_beh, epoch=50, pop_size=20,
+        algos_phase3, full_matrix, K2,
+        initial_solutions=None, epoch=50, pop_size=20,
         save_path=ml100k_phase3_dir,
     )
 
@@ -1032,7 +1091,7 @@ if __name__ == "__main__":
 
         hybrid_row = run_hybrid_algorithm(
             global_info, local_info,
-            full_matrix, K2, init_full_100k,
+            full_matrix, K2, None,
             global_epoch=30, local_epoch=20, pop_size=30,
         )
         if hybrid_row['success']:
@@ -1070,19 +1129,25 @@ Alt klasörler : ml100k-phase2 | ml1m-phase2 | ml-100k-phase3 | ml-1m-phase3
 
 ── Aşama 2 (eleme, ML-100K örnek) ─────────────
 K             : {K1}
-sample        : 300×400
-init_solutions: 30
-epoch         : 30
-pop_size      : 20
-time_limit    : 180s
-ML-100K kayıt : …/{run_n}/ml100k-phase2/  → top-25 kohort (Aşama 3 listesi)
+sample        : 200×200
+use_init      : False
+n_runs        : 20 (seed 0..19, ortalama metrik)
+epoch         : 50
+pop_size      : 30
+time_limit    : yok (ProcessPoolExecutor, paralel)
+parallel_workers: 4
+kohort        : WCSS en iyi 10 ∪ Davies-Bouldin en iyi 5 (tekrarsız) → algos_phase3
+ML-100K kayıt : …/{run_n}/ml100k-phase2/
 ml1m-phase2/  : boş klasör (adlandırma tutarlılığı)
 
 ── Aşama 3 (final, ML-100K) ────────────────────
 K             : {K2}
+use_init      : False
+n_runs        : 5
 epoch         : 50
 pop_size      : 30
-time_limit    : 900s
+time_limit    : yok (ProcessPoolExecutor, paralel)
+parallel_workers: 4
 matrix        : {full_matrix.shape}
 sparsity      : {1 - np.count_nonzero(full_matrix)/full_matrix.size:.3f}
 data_path     : {DATA_PATH}
@@ -1091,21 +1156,24 @@ rank_and_filter: top_n=10
 
 ── Aşama 3 (final, ML-1M) ───────────────────────
 K             : {K2}
+use_init      : False
+n_runs        : 5
 epoch         : 50
 pop_size      : 30
-time_limit    : 900s
+time_limit    : yok (ProcessPoolExecutor, paralel)
+parallel_workers: 4
 matrix        : {full_matrix_1m.shape}
 sparsity      : {1 - np.count_nonzero(full_matrix_1m)/full_matrix_1m.size:.3f}
 data_path     : {DATA_PATH_1M}
 kayıt         : …/{run_n}/ml-1m-phase3/
 rank_and_filter: top_n=10
-katılımcılar  : Aşama 2 (ML-100K) top-25 ile aynı liste ({len(algos_phase3)})
+katılımcılar  : algos_phase3 ({len(algos_phase3)})
 
-── Davranış analizi (yalnız ML-100K) ────────────
-K             : {K_BEH}
-sample        : 200×300
+── Davranış analizi (ML-100K tam matris) ───────
+K             : {K2}
+matrix        : {full_matrix.shape} (tam ML-100K)
 kayıt         : …/{run_n}/ml-100k-phase3/
-katılımcılar  : Aşama 3 kohortu ({len(algos_phase3)})
+katılımcılar  : algos_phase3 ({len(algos_phase3)})
 
 ── Aşama 3 Algoritmaları ({len(algos_phase3)}) ─────────────────
 {chr(10).join('  ' + n for n in algo_names_p3)}

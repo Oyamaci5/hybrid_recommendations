@@ -1,16 +1,18 @@
-import pandas as pd
+import numpy as np
+import os
 
-df2 = pd.read_csv('mealpy/results/phase2_success.csv')
-df2_all = pd.read_csv('mealpy/results/phase2_complete.csv')
-
-print(f"Aşama 2 toplam: {len(df2_all)}")
-print(f"Başarılı: {len(df2)}")
-print()
-print("TÜM BAŞARILI SONUÇLAR (silhouette sıralı):")
-cols = ['algorithm','wcss','silhouette','davies_bouldin','gray_sheep_ratio','time_seconds']
-print(df2[cols].sort_values('silhouette', ascending=False).to_string())
-print()
-print("SSA, GWO, HHO, WOA, PSO sonuçları:")
-hedef = ['SSA.OriginalSSA','GWO.OriginalGWO','HHO.OriginalHHO',
-         'WOA.OriginalWOA','PSO.OriginalPSO']
-print(df2[df2['algorithm'].isin(hedef)][cols].to_string())
+# Mevcut assignment sonuçlarına bak
+base = 'results/assignments_lof'
+for dataset in ['ml100k']:
+    for algo in ['B1_HHO', 'B2_HGS', 'H1_HHO+HGS', 'H4_MFO+HHO']:
+        path = os.path.join(base, dataset, algo)
+        if not os.path.exists(path):
+            path = os.path.join(base, dataset, f'{algo}_k70')
+        if os.path.exists(path):
+            # best_sol'un WCSS'ini hesapla
+            from mealpy_comparison_v2 import load_movielens, compute_wcss_fast
+            matrix = load_movielens('../data/ml-100k/u.data')
+            best_sol = np.load(os.path.join(path, 'best_sol.npy'))
+            K = int(best_sol.shape[0] / matrix.shape[1])
+            wcss, _ = compute_wcss_fast(matrix, best_sol, K)
+            print(f"{algo:<20} K={K}  WCSS={wcss:.2f}")

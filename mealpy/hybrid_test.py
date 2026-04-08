@@ -22,8 +22,9 @@ Kullanım:
   python hybrid_test.py
   python hybrid_test.py -j 6          # her RUN içinde TEST_LIST paralel (ProcessPoolExecutor)
   HYBRID_TEST_WORKERS=6 python hybrid_test.py
+  python hybrid_test.py --no-mkss     # mkmeans++ başlangıç yok → results/hybrid_v4_without_mkss/
 
-Çıktılar: results/hybrid_v3/
+Çıktılar: results/hybrid_v4/  (varsayılan)  veya  results/hybrid_v4_without_mkss/  (--no-mkss)
 """
 
 import argparse
@@ -57,19 +58,18 @@ from mealpy import FloatVar
 # ============================================================
 
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
-HYBRID_ROOT = os.path.join(BASE_DIR, 'results', 'hybrid_v3')   # ← yeni klasör
-os.makedirs(HYBRID_ROOT, exist_ok=True)
+HYBRID_ROOT = os.path.join(BASE_DIR, 'results', 'hybrid_v4')
 
 DATA_PATH = os.path.join(os.path.dirname(BASE_DIR),
                          'data', 'ml-100k', 'u.data')
 
-K              = 90
-N_RUNS         = 5
+K              = 70
+N_RUNS         = 10
 POP_SIZE       = 30
 GLOBAL_EPOCH   = 30
 LOCAL_EPOCH    = 20
 BASELINE_EPOCH = GLOBAL_EPOCH + LOCAL_EPOCH   # 50 — adil karşılaştırma
-TIME_LIMIT     = 900
+TIME_LIMIT     = 1800
 
 # Çok süreç: worker süreçlerinde algoritma haritası (pool_init ile doldurulur)
 _WORKER_ALGO_MAP = None
@@ -97,20 +97,24 @@ def _register_iaoa(algo_map):
 # ARGÜMAN PARSE
 # ============================================================
 
-def parse_hybrid_parallel_workers(argv=None):
-    """-j / --workers > HYBRID_TEST_WORKERS > 1 (sıralı)."""
+def parse_hybrid_args(argv=None):
+    """-j / --workers > HYBRID_TEST_WORKERS > 1 (sıralı); --no-mkss → mkmeans++ yok."""
     p = argparse.ArgumentParser(description="Hibrit + baseline testi")
     p.add_argument(
         "-j", "--workers", type=int, default=None, metavar="N",
         help="Her RUN içinde TEST_LIST paralel süreç sayısı (1=sıralı).",
     )
+    p.add_argument(
+        "--no-mkss", action="store_true",
+        help="mkmeans++ başlangıç çözümleri kullanma; çıktı hybrid_v4_without_mkss/",
+    )
     ns, _ = p.parse_known_args(argv if argv is not None else sys.argv[1:])
     if ns.workers is not None:
-        return max(1, int(ns.workers))
-    ev = os.environ.get("HYBRID_TEST_WORKERS", "").strip()
-    if ev:
-        return max(1, int(ev))
-    return 1
+        workers = max(1, int(ns.workers))
+    else:
+        ev = os.environ.get("HYBRID_TEST_WORKERS", "").strip()
+        workers = max(1, int(ev)) if ev else 1
+    return workers, bool(ns.no_mkss)
 
 
 # ============================================================
@@ -178,8 +182,12 @@ TEST_LIST = [
     ('H2_HGS+HHO',  'HGS.OriginalHGS',    'HHO.OriginalHHO'),
     ('H3_MFO+HGS',  'MFO.OriginalMFO',    'HGS.OriginalHGS'),
     ('H4_MFO+HHO',  'MFO.OriginalMFO',    'HHO.OriginalHHO'),
+    ('H9_QSA+CDO',  'QSA.LevyQSA',      'CDO.OriginalCDO'),
+    ('H10_GWO+CDO',  'GWO.OriginalGWO',  'CDO.OriginalCDO'),
+    ('H11_GWO+HHO',  'GWO.OriginalGWO',  'HHO.OriginalHHO'),
+    ('H12_MFO+CDO',  'MFO.OriginalMFO',  'CDO.OriginalCDO'),
     ('H6_AGTO+HGS', 'AGTO.OriginalAGTO',  'HGS.OriginalHGS'),
-    ('H5_EliteMultiGA+HHO', 'GA.EliteMultiGA', 'HHO.OriginalHHO'),
+    ('H5_EliteGA+HHO', 'GA.EliteMultiGA', 'HHO.OriginalHHO'),
 
     # ──────────────────────────────────────────────────────────────────────
     ('B1_HHO',      'HHO.OriginalHHO',    None),
@@ -206,9 +214,13 @@ WILCOXON_PAIRS = [
     ('H8_MFO+IAOA', 'H4_MFO+HHO',  'H8 vs H4: local IAOA vs HHO'),
     ('H7_IAOA+HHO', 'H8_MFO+IAOA', 'H7 vs H8: IAOA global vs IAOA local'),
     # ──────────────────────────────────────────────────────────────────────
-    ('H5_EliteMultiGA+HHO', 'H4_MFO+HHO', 'GA global vs MFO global'),
-    ('H5_EliteMultiGA+HHO', 'B1_HHO',     'H5 vs HHO tek'),
-    ('H5_EliteMultiGA+HHO', 'B3_MFO',     'H5 vs MFO tek'),
+    ('H5_EliteGA+HHO', 'H4_MFO+HHO', 'GA global vs MFO global'),
+    ('H5_EliteGA+HHO', 'B1_HHO',     'H5 vs HHO tek'),
+    ('H5_EliteGA+HHO', 'B3_MFO',     'H5 vs MFO tek'),
+    ('H9_QSA+CDO',  'H4_MFO+HHO',  'QSA+CDO vs mevcut en iyi'),
+    ('H10_GWO+CDO',  'H4_MFO+HHO',  'GWO+CDO vs mevcut en iyi'),
+    ('H12_MFO+CDO',  'H4_MFO+HHO',  'CDO local vs HHO local, MFO sabit'),
+    ('H10_GWO+CDO',  'H9_QSA+CDO',  'GWO global vs QSA global'),
 
 ]
 
@@ -238,9 +250,12 @@ def run_single(algo_info, matrix, K, init, epoch, pop_size):
     problem = make_problem(matrix, K)
     sp      = get_special_params(algo_info['full_name'], epoch, pop_size)
     model   = algo_info['class'](**(sp or {'epoch': epoch, 'pop_size': pop_size}))
-    try:
-        model.solve(problem, starting_solutions=init[:pop_size])
-    except TypeError:
+    if init is not None:
+        try:
+            model.solve(problem, starting_solutions=init[:pop_size])
+        except TypeError:
+            model.solve(problem)
+    else:
         model.solve(problem)
     metrics = _compute_metrics(matrix, model.g_best.solution, K)
     return {
@@ -264,9 +279,12 @@ def run_hybrid(g_info, l_info, matrix, K, init,
     # Global aşama
     sp_g    = get_special_params(g_info['full_name'], g_epoch, pop_size)
     g_model = g_info['class'](**(sp_g or {'epoch': g_epoch, 'pop_size': pop_size}))
-    try:
-        g_model.solve(problem, starting_solutions=init[:pop_size])
-    except TypeError:
+    if init is not None:
+        try:
+            g_model.solve(problem, starting_solutions=init[:pop_size])
+        except TypeError:
+            g_model.solve(problem)
+    else:
         g_model.solve(problem)
 
     best_g_sol = g_model.g_best.solution
@@ -336,13 +354,14 @@ def _make_result_row(run, label, g_name, l_name, r):
     }
 
 
-def run_all(full_matrix, algo_map, parallel_workers=1):
+def run_all(full_matrix, algo_map, parallel_workers=1, use_mkss=True):
     pw = max(1, int(parallel_workers or 1))
 
     print(f"\n{'='*65}")
     print(f"HİBRİT TESTİ v3 — {N_RUNS} RUN  (H7+H8 dahil)")
     print(f"{'='*65}")
     print(f"8 hibrit + 3 baseline = {len(TEST_LIST)} koşucu")
+    print(f"Başlangıç: {'mkmeans++ (POP+10 çözüm)' if use_mkss else 'yok (algoritma varsayılan)'}")
     print(f"Global={GLOBAL_EPOCH}ep  Local={LOCAL_EPOCH}ep  "
           f"Baseline={BASELINE_EPOCH}ep  K={K}")
     if pw > 1:
@@ -364,9 +383,12 @@ def run_all(full_matrix, algo_map, parallel_workers=1):
         print(f"\n{'─'*65}  RUN {run}/{N_RUNS}  (seed={seed})")
         print(f"  Klasör: {run_dir}")
 
-        init = mkmeans_plus_plus_init(
-            full_matrix, K=K, n_solutions=POP_SIZE + 10, seed=seed
-        )
+        if use_mkss:
+            init = mkmeans_plus_plus_init(
+                full_matrix, K=K, n_solutions=POP_SIZE + 10, seed=seed
+            )
+        else:
+            init = None
 
         run_rows = []
 
@@ -600,7 +622,11 @@ H8_MFO+IAOA  : WCSS={run_results.get('H8_MFO+IAOA', {}).get('wcss', [None])[0] o
 # ============================================================
 
 if __name__ == "__main__":
-    parallel_workers = parse_hybrid_parallel_workers()
+    parallel_workers, no_mkss = parse_hybrid_args()
+    if no_mkss:
+        HYBRID_ROOT = os.path.join(BASE_DIR, 'results', 'hybrid_v4_without_mkss')
+    os.makedirs(HYBRID_ROOT, exist_ok=True)
+
     print("Yükleniyor...")
     full_matrix = load_movielens(DATA_PATH)
     all_algos   = get_all_algorithms_v3()
@@ -626,9 +652,13 @@ if __name__ == "__main__":
         f"Paralel işçi: {parallel_workers}  "
         f"(HYBRID_TEST_WORKERS={os.environ.get('HYBRID_TEST_WORKERS', '')!r})"
     )
+    if no_mkss:
+        print("Mod: --no-mkss (mkmeans++ başlangıç yok)")
     print(f"Sonuçlar → {HYBRID_ROOT}/")
 
-    df_all, run_results = run_all(full_matrix, algo_map, parallel_workers)
+    df_all, run_results = run_all(
+        full_matrix, algo_map, parallel_workers, use_mkss=not no_mkss
+    )
 
     print("\nAnaliz...")
     analyze_and_report(df_all, run_results, N_RUNS)

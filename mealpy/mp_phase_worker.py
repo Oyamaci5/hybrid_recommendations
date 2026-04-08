@@ -33,7 +33,7 @@ def _ensure_shared():
 def run_algo_v3_task(task):
     """
     task: (algo_module, class_name, algo_name, matrix, K,
-           initial_solutions, epoch, pop_size)
+           initial_solutions, epoch, pop_size, n_runs)
     """
     mod = _ensure_shared()
     (
@@ -45,14 +45,34 @@ def run_algo_v3_task(task):
         initial_solutions,
         epoch,
         pop_size,
+        n_runs,
     ) = task
-    return mod._run_algo_v3_serialized(
-        algo_module,
-        class_name,
-        algo_name,
-        matrix,
-        K,
-        initial_solutions,
-        epoch,
-        pop_size,
-    )
+    nr = max(1, int(n_runs))
+    if nr == 1:
+        return mod._run_algo_v3_serialized(
+            algo_module,
+            class_name,
+            algo_name,
+            matrix,
+            K,
+            initial_solutions,
+            epoch,
+            pop_size,
+            rng_seed=None,
+        )
+    rows = []
+    for run_index in range(nr):
+        rows.append(
+            mod._run_algo_v3_serialized(
+                algo_module,
+                class_name,
+                algo_name,
+                matrix,
+                K,
+                initial_solutions,
+                epoch,
+                pop_size,
+                rng_seed=run_index,
+            )
+        )
+    return mod._aggregate_phase_runs(rows, algo_name, nr)

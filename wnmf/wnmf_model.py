@@ -65,6 +65,7 @@ class WNMFModel:
         regularization : float = 0.01,
         n_epochs       : int   = 100,
         random_seed    : int   = 42,
+        use_bias       : bool  = True,
     ):
         self.n_users        = n_users
         self.n_items        = n_items
@@ -73,20 +74,31 @@ class WNMFModel:
         self.regularization = regularization
         self.n_epochs       = n_epochs
         self.random_seed    = random_seed
+        self.use_bias       = use_bias
         self.is_fitted      = False
+
+        self.mu  = 0.0
+        self.b_u = np.zeros(n_users, dtype=np.float32)
+        self.b_i = np.zeros(n_items, dtype=np.float32)
 
         rng   = np.random.RandomState(random_seed)
         scale = np.sqrt(5.0 / latent_dim)
         self.U = rng.uniform(0, scale, (n_users, latent_dim)).astype(np.float32)
         self.V = rng.uniform(0, scale, (n_items, latent_dim)).astype(np.float32)
 
-    def fit(self, train_ratings: np.ndarray, verbose: bool = False) -> "WNMFModel":
+    def fit(
+        self,
+        train_ratings : np.ndarray,
+        sample_weights: Optional[np.ndarray] = None,
+        verbose       : bool = False,
+    ) -> "WNMFModel":
         """
         Modeli eğit — hem U hem V güncellenir.
 
         Parametreler
         ------------
         train_ratings : shape (n, 3) — [user_id, item_id, rating], 0-indexed
+        sample_weights: shape (n,) — gözlem ağırlıkları; None ise 1.0
         verbose       : her 10 epoch'ta kayıp yazdır
         """
         np.random.seed(self.random_seed)
@@ -98,6 +110,9 @@ class WNMFModel:
         lr       = self.learning_rate
         reg      = self.regularization
 
+        if self.use_bias:
+            self.mu = float(ratings.mean())
+
         for epoch in range(self.n_epochs):
             idx    = np.random.permutation(n)
             u_shuf = user_ids[idx]
@@ -105,19 +120,46 @@ class WNMFModel:
             r_shuf = ratings[idx]
 
             for k in range(n):
-                u     = u_shuf[k]
-                i     = i_shuf[k]
-                r     = r_shuf[k]
-                error = r - float(np.dot(self.U[u], self.V[i]))
+                u = u_shuf[k]
+                i = i_shuf[k]
+                r = r_shuf[k]
 
-                grad_u = -error * self.V[i] + reg * self.U[u]
-                grad_v = -error * self.U[u] + reg * self.V[i]
+                if self.use_bias:
+                    w = (
+                        sample_weights[idx[k]]
+                        if sample_weights is not None
+                        else 1.0
+                    )
+                    pred = (
+                        self.mu
+                        + self.b_u[u]
+                        + self.b_i[i]
+                        + float(np.dot(self.U[u], self.V[i]))
+                    )
+                    error = r - pred
+                    grad_u = -error * w * self.V[i] + reg * self.U[u]
+                    grad_v = -error * w * self.U[u] + reg * self.V[i]
+                    self.U[u] -= lr * grad_u
+                    self.V[i] -= lr * grad_v
+                    self.b_u[u] += lr * (error * w - reg * self.b_u[u])
+                    self.b_i[i] += lr * (error * w - reg * self.b_i[i])
+                    np.maximum(self.U[u], 0, out=self.U[u])
+                    np.maximum(self.V[i], 0, out=self.V[i])
+                else:
+                    error = r - float(np.dot(self.U[u], self.V[i]))
+                    if sample_weights is not None:
+                        w      = sample_weights[idx[k]]
+                        grad_u = -error * w * self.V[i] + reg * self.U[u]
+                        grad_v = -error * w * self.U[u] + reg * self.V[i]
+                    else:
+                        grad_u = -error * self.V[i] + reg * self.U[u]
+                        grad_v = -error * self.U[u] + reg * self.V[i]
 
-                self.U[u] -= lr * grad_u
-                self.V[i] -= lr * grad_v
+                    self.U[u] -= lr * grad_u
+                    self.V[i] -= lr * grad_v
 
-                np.maximum(self.U[u], 0, out=self.U[u])
-                np.maximum(self.V[i], 0, out=self.V[i])
+                    np.maximum(self.U[u], 0, out=self.U[u])
+                    np.maximum(self.V[i], 0, out=self.V[i])
 
             if verbose and (epoch % 10 == 0 or epoch == self.n_epochs - 1):
                 loss = self._compute_loss(user_ids, item_ids, ratings)
@@ -135,7 +177,15 @@ class WNMFModel:
         """Rating tahmini — U[u] · V[i], [1,5] aralığına clip edilir."""
         user_ids = np.asarray(user_ids, dtype=np.int32)
         item_ids = np.asarray(item_ids, dtype=np.int32)
-        preds    = np.sum(self.U[user_ids] * self.V[item_ids], axis=1)
+        if self.use_bias:
+            preds = (
+                self.mu
+                + self.b_u[user_ids]
+                + self.b_i[item_ids]
+                + np.sum(self.U[user_ids] * self.V[item_ids], axis=1)
+            )
+        else:
+            preds = np.sum(self.U[user_ids] * self.V[item_ids], axis=1)
         if clip:
             np.clip(preds, 1.0, 5.0, out=preds)
         return preds.astype(np.float32)
@@ -200,6 +250,7 @@ class WNMFSharedV:
         regularization : float = 0.01,
         n_epochs_global: int   = 100,
         random_seed    : int   = 42,
+        use_bias       : bool  = True,
     ):
         self.n_items         = n_items
         self.latent_dim      = latent_dim
@@ -207,8 +258,11 @@ class WNMFSharedV:
         self.regularization  = regularization
         self.n_epochs_global = n_epochs_global
         self.random_seed     = random_seed
+        self._use_bias       = use_bias
         self.V               = None   # global V, fit_global_V sonrası dolar
         self.V_fitted        = False
+        self.mu              = 0.0
+        self.b_i             = np.zeros(n_items, dtype=np.float32)
 
         # Global modeli içeride tut — V'yi buradan alacağız
         self._global_model = WNMFModel(
@@ -219,11 +273,13 @@ class WNMFSharedV:
             regularization = regularization,
             n_epochs       = n_epochs_global,
             random_seed    = random_seed,
+            use_bias       = use_bias,
         )
 
     def fit_global_V(
         self,
         all_train : np.ndarray,
+        gray_mask : Optional[np.ndarray] = None,
         verbose   : bool = False,
     ) -> "WNMFSharedV":
         """
@@ -235,11 +291,19 @@ class WNMFSharedV:
         Parametreler
         ------------
         all_train : shape (n, 3) — tüm train rating'leri
+        gray_mask : shape (n_users,) bool; True ise o kullanıcının rating'leri düşük ağırlıkla
         verbose   : eğitim ilerlemesini yazdır
         """
         print("  [Global V] eğitiliyor...")
-        self._global_model.fit(all_train, verbose=verbose)
-        self.V       = self._global_model.V.copy()   # (n_items, latent_dim)
+        if gray_mask is not None:
+            user_ids       = all_train[:, 0].astype(np.int32)
+            sample_weights = np.where(gray_mask[user_ids], 0.1, 1.0).astype(np.float32)
+        else:
+            sample_weights = None
+        self._global_model.fit(all_train, sample_weights=sample_weights, verbose=verbose)
+        self.V        = self._global_model.V.copy()   # (n_items, latent_dim)
+        self.mu       = self._global_model.mu
+        self.b_i      = self._global_model.b_i.copy()
         self.V_fitted = True
         print(f"  [Global V] tamamlandı — V shape: {self.V.shape}")
         return self
@@ -249,6 +313,7 @@ class WNMFSharedV:
         n_users_cluster : int,
         n_epochs_cluster: int = 50,
         random_seed     : int = 42,
+        cluster_ratings : Optional[np.ndarray] = None,
     ) -> "ClusterWNMF":
         """
         Bir küme için ClusterWNMF nesnesi oluştur.
@@ -276,6 +341,10 @@ class WNMFSharedV:
             regularization = self.regularization,
             n_epochs       = n_epochs_cluster,
             random_seed    = random_seed,
+            use_bias       = self._use_bias,
+            mu             = self.mu,
+            b_i_global     = self.b_i,
+            cluster_ratings= cluster_ratings,
         )
 
 
@@ -296,6 +365,10 @@ class ClusterWNMF:
         regularization : float = 0.01,
         n_epochs       : int   = 50,
         random_seed    : int   = 42,
+        use_bias       : bool  = True,
+        mu             : float = 0.0,
+        b_i_global     : Optional[np.ndarray] = None,
+        cluster_ratings: Optional[np.ndarray] = None,
     ):
         self.n_users        = n_users
         self.n_items        = n_items
@@ -304,9 +377,21 @@ class ClusterWNMF:
         self.regularization = regularization
         self.n_epochs       = n_epochs
         self.random_seed    = random_seed
+        self.use_bias       = use_bias
+        self.mu             = mu
+        if cluster_ratings is not None and len(cluster_ratings) > 0:
+            self.mu_k = float(cluster_ratings[:, 2].mean())
+        else:
+            self.mu_k = mu
 
         # V sabit — global modelden kopyalanmış
         self.V = V_shared.copy()
+
+        if b_i_global is not None:
+            self.b_i = b_i_global.copy()
+        else:
+            self.b_i = np.zeros(n_items, dtype=np.float32)
+        self.b_u = np.zeros(n_users, dtype=np.float32)
 
         # U sıfırdan başlar — küme özelinde öğrenilecek
         rng    = np.random.RandomState(random_seed)
@@ -342,17 +427,27 @@ class ClusterWNMF:
             r_shuf = ratings[idx]
 
             for k in range(n):
-                u     = u_shuf[k]
-                i     = i_shuf[k]
-                r     = r_shuf[k]
+                u = u_shuf[k]
+                i = i_shuf[k]
+                r = r_shuf[k]
 
-                # Hata hesapla
-                error = r - float(np.dot(self.U[u], self.V[i]))
-
-                # Sadece U güncellenir — V sabit
-                grad_u     = -error * self.V[i] + reg * self.U[u]
-                self.U[u] -= lr * grad_u
-                np.maximum(self.U[u], 0, out=self.U[u])
+                if self.use_bias:
+                    pred = (
+                        self.mu_k
+                        + self.b_u[u]
+                        + self.b_i[i]
+                        + float(np.dot(self.U[u], self.V[i]))
+                    )
+                    error = r - pred
+                    grad_u = -error * self.V[i] + reg * self.U[u]
+                    self.U[u] -= lr * grad_u
+                    self.b_u[u] += lr * (error - reg * self.b_u[u])
+                    np.maximum(self.U[u], 0, out=self.U[u])
+                else:
+                    error = r - float(np.dot(self.U[u], self.V[i]))
+                    grad_u     = -error * self.V[i] + reg * self.U[u]
+                    self.U[u] -= lr * grad_u
+                    np.maximum(self.U[u], 0, out=self.U[u])
 
             if verbose and (epoch % 10 == 0 or epoch == self.n_epochs - 1):
                 loss = self._compute_loss(user_ids, item_ids, ratings)
@@ -369,7 +464,15 @@ class ClusterWNMF:
         """Rating tahmini — U[u] · V[i]"""
         user_ids = np.asarray(user_ids, dtype=np.int32)
         item_ids = np.asarray(item_ids, dtype=np.int32)
-        preds    = np.sum(self.U[user_ids] * self.V[item_ids], axis=1)
+        if self.use_bias:
+            preds = (
+                self.mu_k
+                + self.b_u[user_ids]
+                + self.b_i[item_ids]
+                + np.sum(self.U[user_ids] * self.V[item_ids], axis=1)
+            )
+        else:
+            preds = np.sum(self.U[user_ids] * self.V[item_ids], axis=1)
         if clip:
             np.clip(preds, 1.0, 5.0, out=preds)
         return preds.astype(np.float32)

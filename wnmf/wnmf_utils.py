@@ -9,7 +9,8 @@ WNMF deneyleri için yardımcı fonksiyonlar.
     load_assignment()      — assignments.npy + gray_sheep_mask.npy yükle
     split_by_cluster()     — rating'leri kümelere böl
     remap_user_ids()       — küme içi kullanıcı indekslerini sıfırdan başlat
-    save_results()         — sonuçları CSV olarak kaydet
+    save_results()         — sonuçları CSV olarak kaydet (isteğe bağlı komut satırı başlığı)
+    save_dataframe_csv()   — DataFrame’i CSV’ye yaz (isteğe bağlı komut satırı başlığı)
 """
 
 import os
@@ -256,19 +257,45 @@ def remap_user_ids(
 # SONUÇ KAYDETME
 # ============================================================
 
-def save_results(results: list, save_path: str, filename: str = 'wnmf_results.csv'):
+def save_dataframe_csv(
+    df          : pd.DataFrame,
+    path        : str,
+    run_command : Optional[str] = None,
+    index       : bool = False,
+) -> None:
+    """
+    DataFrame’i CSV olarak yazar; run_command verilirse ilk satır:
+    # command: <çalıştırılan komut>
+    (pandas: pd.read_csv(..., comment='#') ile okunabilir)
+    """
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, 'w', encoding='utf-8', newline='') as f:
+        if run_command:
+            f.write(f"# command: {run_command}\n")
+        df.to_csv(f, index=index)
+
+
+def save_results(
+    results      : list,
+    save_path    : str,
+    filename     : str = 'wnmf_results.csv',
+    run_command  : Optional[str] = None,
+):
     """
     Deney sonuçlarını CSV olarak kaydet.
 
     Parametreler
     ------------
-    results   : list of dict — her satır bir sonuç
-    save_path : str          — kayıt klasörü
-    filename  : str          — dosya adı
+    results      : list of dict — her satır bir sonuç
+    save_path    : str          — kayıt klasörü
+    filename     : str          — dosya adı
+    run_command  : çalıştırılan komut satırı (dosya başına yorum olarak yazılır)
     """
     os.makedirs(save_path, exist_ok=True)
     df   = pd.DataFrame(results)
     path = os.path.join(save_path, filename)
-    df.to_csv(path, index=False)
+    save_dataframe_csv(df, path, run_command=run_command)
     print(f"Sonuçlar kaydedildi: {path}")
     return df

@@ -1,41 +1,34 @@
-# test_ml1m_size.py
-import numpy as np
+# test_combined_phases.py
 import pandas as pd
-import time
 import os
-from mealpy_comparison_v2 import make_fitness_function, mkmeans_plus_plus_init
 
-print("ML-1M yükleniyor...")
-path = os.path.join(os.path.dirname(os.getcwd()), 'data', 'ml-1m', 'ratings.dat')
-print("Yol:", path)
-print("Dosya var mı:", os.path.exists(path))
+phase3_root = 'results/phase3'
+runs = sorted([d for d in os.listdir(phase3_root)
+               if os.path.isdir(os.path.join(phase3_root, d)) and d.isdigit()])
+latest = runs[-1]
 
-rows = []
-with open(path, 'r', encoding='latin-1') as f:
-    for line in f:
-        parts = line.strip().split('::')
-        if len(parts) >= 3:
-            rows.append((int(parts[0]), int(parts[1]), float(parts[2])))
+# Phase 2 sonuçları
+path_p2 = os.path.join(phase3_root, latest, 'ml100k-phase2', 'phase2_complete.csv')
+# Phase 3 ML-100K sonuçları
+path_p3 = os.path.join(phase3_root, latest, 'ml-100k-phase3', 'phase3_complete.csv')
 
-df = pd.DataFrame(rows, columns=['user_id', 'item_id', 'rating'])
-matrix = df.pivot_table(index='user_id', columns='item_id',
-                        values='rating', fill_value=0).values.astype(np.float32)
-print(f"Matrix: {matrix.shape}")
-print(f"Boyut : {matrix.nbytes / 1e6:.1f} MB")
+df2 = pd.read_csv(path_p2)
+df3 = pd.read_csv(path_p3)
 
-K = 70
-print(f"\n1 init çözümü üretiliyor (K={K})...")
-t0 = time.time()
-init = mkmeans_plus_plus_init(matrix, K=K, n_solutions=1, seed=42)
-t1 = time.time()
-print(f"1 init çözümü: {t1-t0:.2f}s")
-print(f"30 çözüm tahmini: {(t1-t0)*30/60:.1f} dakika")
+suc2 = df2[df2['success']==True][['algorithm','wcss','davies_bouldin','silhouette','time_seconds']].copy()
+suc3 = df3[df3['success']==True][['algorithm','wcss','davies_bouldin','silhouette','time_seconds']].copy()
 
-print(f"\n1 fitness çağrısı test ediliyor...")
-fitness_fn = make_fitness_function(matrix, K)
-t0 = time.time()
-fitness_fn(init[0])
-t1 = time.time()
-print(f"1 fitness çağrısı: {t1-t0:.2f}s")
-print(f"50 epoch × 30 pop = 1500 çağrı tahmini: {(t1-t0)*1500/60:.1f} dakika/algoritma")
-print(f"25 algoritma toplam tahmini: {(t1-t0)*1500*25/3600:.1f} saat")
+suc2.columns = ['algorithm','wcss_p2','db_p2','sil_p2','time_p2']
+suc3.columns = ['algorithm','wcss_p3','db_p3','sil_p3','time_p3']
+
+merged = suc2.merge(suc3, on='algorithm', how='outer')
+merged = merged.sort_values('wcss_p2')
+
+print(f"Phase 2: {len(suc2)} algoritma")
+print(f"Phase 3: {len(suc3)} algoritma")
+print(f"\n{'Algoritma':<35} {'WCSS_P2':>8} {'DB_P2':>6} {'WCSS_P3':>8} {'DB_P3':>6}")
+print("-"*70)
+for _, row in merged.iterrows():
+    p2 = f"{row['wcss_p2']:>8.2f} {row['db_p2']:>6.3f}" if pd.notna(row.get('wcss_p2')) else f"{'—':>8} {'—':>6}"
+    p3 = f"{row['wcss_p3']:>8.2f} {row['db_p3']:>6.3f}" if pd.notna(row.get('wcss_p3')) else f"{'—':>8} {'—':>6}"
+    print(f"{row['algorithm']:<35} {p2} {p3}")

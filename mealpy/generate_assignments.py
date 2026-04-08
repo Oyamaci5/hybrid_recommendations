@@ -1,7 +1,7 @@
 """
 generate_assignments.py
 =======================
-4 algoritma (B1_HHO, B2_HGS, H1_HHO+HGS, H4_MFO+HHO) için
+ALGO_CONFIG listesindeki algoritmalar için (başta B1/B2/H1/H4, sonra B3, hibritler, LIT_*)
 ML-100K ve ML-1M üzerinde tek run çalıştırır, assignment kaydeder.
 
 Gray sheep tespiti:
@@ -26,7 +26,8 @@ Kullanım:
     python generate_assignments.py --dataset 100k --algo H4_MFO+HHO
     python generate_assignments.py --last-only               # sadece son algoritma
     python generate_assignments.py --lof --k 70               # LOF + K=70
-    python generate_assignments.py --k-100k 70 --k-1m 120     # ayrı K
+    python generate_assignments.py --lof --k 20 30 50 90     # aynı koşuda birden fazla K
+    python generate_assignments.py --k-100k 70 --k-1m 120     # ayrı K (--k çoklu ile birlikte kullanılmaz)
     python generate_assignments.py --lof --n-neighbors 15 --contamination 0.1
     python generate_assignments.py --jobs 4              # algoritmaları paralel süreçte
 """
@@ -85,11 +86,16 @@ LOF_CONTAMINATION = 'auto'
 ALGO_CONFIG = [
     ('B1_HHO',     'HHO.OriginalHHO', None),
     ('B2_HGS',     'HGS.OriginalHGS', None),
-    ('B3_MFO',     'MFO.OriginalMFO', None),
     ('H1_HHO+HGS', 'HHO.OriginalHHO', 'HGS.OriginalHGS'),
     ('H4_MFO+HHO', 'MFO.OriginalMFO', 'HHO.OriginalHHO'),
+    ('B3_MFO',     'MFO.OriginalMFO', None),
+    ('H9_QSA+CDO',  'QSA.LevyQSA',     'CDO.OriginalCDO'),
+    ('H12_MFO+CDO', 'MFO.OriginalMFO', 'CDO.OriginalCDO'),
     ('H5_GAHHO',   'GAHHO.OriginalGAHHO', None),
     ('H5_EliteGA+HHO', 'GA.EliteMultiGA', 'HHO.OriginalHHO'),
+    ('LIT_GOA', 'GOA.OriginalGOA', None),
+    ('LIT_GWO', 'GWO.OriginalGWO', None),
+    ('LIT_SSA', 'SSA.DevSSA', None),
 ]
 
 # hybrid_test / rapor ile aynı etiketler; Wilcoxon çiftleri (klasör adı = ilk sütun)
@@ -615,8 +621,10 @@ def parse_args():
         help="LOF tabanlı gray sheep kullan (default: sabit 80. percentile)"
     )
     p.add_argument(
-        '--k', type=int, default=None,
-        help="Her iki dataset için K (default: 100K=90, 1M=150)"
+        '--k', nargs='+', type=int, default=None, metavar='K',
+        help="Küme sayısı; birden fazla değer: --k 20 30 50 (her K için ayrı klasör). "
+             "Tek değer: --k 70. Verilmezse 100K=90, 1M=150. "
+             "--k-100k / --k-1m ile birlikte kullanılamaz."
     )
     p.add_argument(
         '--k-100k', type=int, default=None,
@@ -641,7 +649,10 @@ def parse_args():
         help='Paralel algoritma süreç sayısı (varsayılan: 1 = sıralı; '
              '2+ veya 0=CPU ile sınırlandırılmış havuz)',
     )
-    return p.parse_args()
+    args = p.parse_args()
+    if args.k is not None and (args.k_100k is not None or args.k_1m is not None):
+        p.error('--k (tek veya çoklu) ile --k-100k / --k-1m birlikte kullanılamaz')
+    return args
 
 def _multi_start_init(matrix, K, pop_size, seed, n_restarts=10):
     """
@@ -677,9 +688,11 @@ if __name__ == '__main__':
     if contamination != 'auto':
         contamination = float(contamination)
 
-    # K değerleri
-    k_100k = args.k_100k or args.k or K_100K_DEFAULT
-    k_1m   = args.k_1m   or args.k or K_1M_DEFAULT
+    # K değerleri: --k 20 30 50 → her dataset için bu liste; yoksa dataset başına tek K
+    k_multi = list(args.k) if args.k is not None else None
+    if k_multi is None:
+        k_100k = args.k_100k or K_100K_DEFAULT
+        k_1m   = args.k_1m   or K_1M_DEFAULT
 
     # Çıktı klasörü — LOF ve percentile ayrı tutulur
     out_root = os.path.join(
@@ -694,7 +707,10 @@ if __name__ == '__main__':
     print(f"Gray sheep  : {'LOF (adaptif)' if args.lof else 'Percentile (sabit %20)'}")
     print(f"Algoritmalar: {selected_algos or [c[0] for c in ALGO_CONFIG]}")
     print(f"Dataset     : {args.dataset}")
-    print(f"ML-100K K   : {k_100k}  |  ML-1M K: {k_1m}")
+    if k_multi is not None:
+        print(f"K listesi     : {k_multi}  (her değer sırayla işlenir)")
+    else:
+        print(f"ML-100K K   : {k_100k}  |  ML-1M K: {k_1m}")
     if args.lof:
         print(f"LOF         : n_neighbors={args.n_neighbors}, contamination={contamination}")
     print(f"Epoch       : baseline={BASELINE_EPOCH}, global={GLOBAL_EPOCH}, local={LOCAL_EPOCH}")
@@ -720,26 +736,48 @@ if __name__ == '__main__':
     if args.dataset in ('100k', 'both'):
         print(f"\nML-100K yükleniyor: {args.data_100k}")
         matrix_100k = load_movielens(args.data_100k)
-        run_dataset(
-            'ml100k', matrix_100k, k_100k, out_root,
-            algo_filter=selected_algos,
-            use_lof=args.lof,
-            lof_n_neighbors=args.n_neighbors,
-            lof_contamination=contamination,
-            max_workers=_pool_cap(),
-        )
+        if k_multi is not None:
+            for K in k_multi:
+                run_dataset(
+                    'ml100k', matrix_100k, K, out_root,
+                    algo_filter=selected_algos,
+                    use_lof=args.lof,
+                    lof_n_neighbors=args.n_neighbors,
+                    lof_contamination=contamination,
+                    max_workers=_pool_cap(),
+                )
+        else:
+            run_dataset(
+                'ml100k', matrix_100k, k_100k, out_root,
+                algo_filter=selected_algos,
+                use_lof=args.lof,
+                lof_n_neighbors=args.n_neighbors,
+                lof_contamination=contamination,
+                max_workers=_pool_cap(),
+            )
 
     if args.dataset in ('1m', 'both'):
         print(f"\nML-1M yükleniyor: {args.data_1m}")
         matrix_1m = load_movielens_1m(args.data_1m)
-        run_dataset(
-            'ml1m', matrix_1m, k_1m, out_root,
-            algo_filter=selected_algos,
-            use_lof=args.lof,
-            lof_n_neighbors=args.n_neighbors,
-            lof_contamination=contamination,
-            max_workers=_pool_cap(),
-        )
+        if k_multi is not None:
+            for K in k_multi:
+                run_dataset(
+                    'ml1m', matrix_1m, K, out_root,
+                    algo_filter=selected_algos,
+                    use_lof=args.lof,
+                    lof_n_neighbors=args.n_neighbors,
+                    lof_contamination=contamination,
+                    max_workers=_pool_cap(),
+                )
+        else:
+            run_dataset(
+                'ml1m', matrix_1m, k_1m, out_root,
+                algo_filter=selected_algos,
+                use_lof=args.lof,
+                lof_n_neighbors=args.n_neighbors,
+                lof_contamination=contamination,
+                max_workers=_pool_cap(),
+            )
 
     print(f"\n{'='*60}")
     print(f"TAMAMLANDI — toplam {(time.time()-t_total)/60:.1f} dakika")
