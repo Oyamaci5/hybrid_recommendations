@@ -84,6 +84,7 @@ LOF_N_NEIGHBORS   = 20
 LOF_CONTAMINATION = 'auto'
 
 ALGO_CONFIG = [
+    ('B0_KMEANS',  'KMEANS', None),
     ('B1_HHO',     'HHO.OriginalHHO', None),
     ('B2_HGS',     'HGS.OriginalHGS', None),
     ('H1_HHO+HGS', 'HHO.OriginalHHO', 'HGS.OriginalHGS'),
@@ -371,7 +372,28 @@ def _run_one_core(
     #init = mkmeans_plus_plus_init(matrix, K=K, n_solutions=50, seed=seed)
     init = _multi_start_init(matrix, K=K, pop_size=POP_SIZE, seed=seed, n_restarts=10)
 
-    if l_name is None:
+    if g_name == 'KMEANS':
+        from sklearn.cluster import KMeans
+        from sklearn.preprocessing import normalize
+
+        matrix_norm = normalize(matrix, norm='l2')
+        kmeans = KMeans(
+            n_clusters=K,
+            init='k-means++',
+            n_init=10,
+            random_state=seed,
+            max_iter=300,
+            verbose=0
+        )
+        kmeans.fit(matrix_norm)
+        assignments_km = kmeans.labels_
+
+        # best_sol: centroidleri orijinal rating uzayına döndür
+        # centroids shape: (K, n_items)
+        best_sol = kmeans.cluster_centers_.flatten()
+        best_fit = float(kmeans.inertia_)
+        assignments = assignments_km
+    elif l_name is None:
         best_sol, best_fit = run_single(
             algo_map[g_name], matrix, K, init, baseline_epoch, pop_size
         )
@@ -381,7 +403,8 @@ def _run_one_core(
             matrix, K, init, global_epoch, local_epoch, pop_size
         )
 
-    _, assignments = compute_wcss_fast(matrix, best_sol, K)
+    if g_name != 'KMEANS':
+        _, assignments = compute_wcss_fast(matrix, best_sol, K)
 
     if use_lof:
         print(f"    LOF hesaplanıyor (n_neighbors={lof_n_neighbors})...")
@@ -432,6 +455,10 @@ def _mp_run_assignment_job(job):
     algo_map['GA.EliteMultiGA'] = {
         'full_name': 'GA.EliteMultiGA',
         'class':     GA.EliteMultiGA,
+    }
+    algo_map['KMEANS'] = {
+        'full_name': 'KMEANS',
+        'class': None,
     }
     _run_one_core(
         label,
@@ -549,6 +576,10 @@ def run_dataset(dataset_name, matrix, K, out_root, algo_filter=None,
         algo_map['GA.EliteMultiGA'] = {
             'full_name': 'GA.EliteMultiGA',
             'class':     GA.EliteMultiGA,
+        }
+        algo_map['KMEANS'] = {
+            'full_name': 'KMEANS',
+            'class': None,
         }
         for label, g_name, l_name, save_dir in jobs_meta:
             run_one(

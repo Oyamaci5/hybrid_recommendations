@@ -82,6 +82,7 @@ N_EPOCHS_CLUSTER = 50    # küme U eğitimi için (daha az veri, daha az epoch y
 RANDOM_SEED      = 42
 
 ALGO_LABELS = [
+    'B0_KMEANS',
     'B1_HHO', 'B2_HGS', 'H1_HHO+HGS', 'H4_MFO+HHO',
     'H9_QSA+CDO', 'H12_MFO+CDO',
     # generate_assignments.py ALGO_CONFIG — önce --lof ile atama üretin
@@ -565,6 +566,77 @@ def run_cluster_sharedV(train, test, assignments, gray_mask,
     }
 
 
+def run_cluster_average(train, test, assignments, gray_mask,
+                        n_items, algo_label):
+    t0 = time.time()
+
+    # Her küme için her item'ın ortalama rating'ini hesapla
+    n_clusters = int(assignments.max()) + 1
+    cluster_item_means = np.zeros((n_clusters, n_items), dtype=np.float32)
+    cluster_item_counts = np.zeros((n_clusters, n_items), dtype=np.int32)
+
+    # Train verisinden küme-item ortalamalarını hesapla
+    for row in train:
+        u, i, r = int(row[0]), int(row[1]), float(row[2])
+        cid = int(assignments[u])
+        cluster_item_means[cid, i] += r
+        cluster_item_counts[cid, i] += 1
+
+    # Ortalamaları hesapla, rating olmayan item için global ortalama kullan
+    global_mean = float(train[:, 2].mean())
+    for cid in range(n_clusters):
+        mask = cluster_item_counts[cid] > 0
+        cluster_item_means[cid, mask] /= cluster_item_counts[cid, mask]
+        cluster_item_means[cid, ~mask] = global_mean
+
+    # Test verisinde tahmin yap
+    true_vals, pred_vals = [], []
+    gray_true, gray_pred = [], []
+
+    for row in test:
+        u, i, r = int(row[0]), int(row[1]), float(row[2])
+        cid = int(assignments[u])
+        pred = float(np.clip(cluster_item_means[cid, i], 1.0, 5.0))
+
+        if gray_mask[u]:
+            gray_true.append(r)
+            gray_pred.append(pred)
+        else:
+            true_vals.append(r)
+            pred_vals.append(pred)
+
+    all_true = true_vals + gray_true
+    all_pred = pred_vals + gray_pred
+    mae, rmse = _compute_metrics(all_true, all_pred)
+
+    gray_mae, gray_rmse = float('nan'), float('nan')
+    if gray_true:
+        gray_errors = np.array(gray_true) - np.array(gray_pred)
+        gray_mae  = float(np.mean(np.abs(gray_errors)))
+        gray_rmse = float(np.sqrt(np.mean(gray_errors**2)))
+
+    elapsed = time.time() - t0
+    print(f"  [{algo_label} | ClusterAvg] MAE={mae:.4f} "
+          f"RMSE={rmse:.4f} | Gray MAE={gray_mae:.4f} ({elapsed:.1f}s)")
+
+    return {
+        'scenario'    : 'cluster_avg',
+        'algo_label'  : algo_label,
+        'mae'         : mae,
+        'rmse'        : rmse,
+        'gray_mae'    : gray_mae,
+        'gray_rmse'   : gray_rmse,
+        'n_clusters'  : n_clusters,
+        'n_train'     : len(train),
+        'n_test'      : len(test),
+        'time_seconds': elapsed,
+        'cluster_mae_std' : float('nan'),
+        'cluster_mae_mean': float('nan'),
+        'cluster_mae_min' : float('nan'),
+        'cluster_mae_max' : float('nan'),
+    }
+
+
 # ============================================================
 # GRAY SHEEP YARDIMCILAR
 # ============================================================
@@ -635,6 +707,7 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
                 weighted_v: bool = False,
                 use_bias: bool = True,
                 use_cluster_bias: bool = False,
+                run_cluster_avg: bool = True,
                 run_command: Optional[str] = None):
     """
     Bir dataset üzerinde tüm senaryoları çalıştır.
@@ -684,6 +757,13 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
             continue
 
         assignments, gray_mask = load_assignment(assign_dir)
+
+        if run_cluster_avg:
+            row = run_cluster_average(
+                train, test, assignments, gray_mask, n_items, label
+            )
+            row['dataset'] = dataset_name
+            results.append(row)
 
         if mode in ('full', 'all'):
             row = run_cluster_full(
@@ -872,6 +952,10 @@ def parse_args():
         '--cluster-bias', action='store_true',
         help='Küme bazlı mu_k kullan (global mu yerine)',
     )
+    p.add_argument(
+        '--no-cluster-avg', action='store_true',
+        help='ClusterAvg senaryosunu çalıştırma',
+    )
     args = p.parse_args()
     if args.assignment_k is not None and (
         args.assignment_k_100k is not None or args.assignment_k_1m is not None
@@ -989,6 +1073,7 @@ if __name__ == '__main__':
                     weighted_v=args.weighted_v,
                     use_bias=not args.no_bias,
                     use_cluster_bias=args.cluster_bias,
+                    run_cluster_avg=not args.no_cluster_avg,
                     run_command=RUN_COMMAND,
                 )
                 all_rows.extend(rows)
@@ -1008,6 +1093,7 @@ if __name__ == '__main__':
                     weighted_v=args.weighted_v,
                     use_bias=not args.no_bias,
                     use_cluster_bias=args.cluster_bias,
+                    run_cluster_avg=not args.no_cluster_avg,
                     run_command=RUN_COMMAND,
                 )
                 all_rows.extend(rows)
