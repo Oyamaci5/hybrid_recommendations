@@ -23,6 +23,11 @@ Kullanım:
     python wnmf_experiment.py --dataset 100k --k 30 --no-global --latent-dim 10 20 50 100 --algo H4_MFO+HHO
     python wnmf_experiment.py --dataset 100k --k 30 --no-global --reg 0.001 0.01 0.1 --lr 0.001 0.01
     python wnmf_experiment.py --dataset 100k --k 30 --epochs-global 50 100 150 200 --epochs-cluster 25 50 75 100
+    python wnmf_experiment.py --dataset 1m --k 30 --algo H4_MFO+HHO --epochs-grid \\
+        --epochs-global 50 100 150 --epochs-cluster 50 75 100 150 200 \\
+        --accum-csv results/wnmf/ml1m/k30/accum_hyper_sweep.csv --accum-label sweep_apr10
+    python wnmf_experiment.py --dataset both --k 30 70 --algo H4_MFO+HHO --compare-mf-svdpp \\
+        --accum-csv results/wnmf/compare_mf_svdpp_k30_k70.csv --accum-label full_table
     python wnmf_experiment.py --dataset 1m --k 70            # .../B1_HHO_k70/ vb.
     python wnmf_experiment.py --k-100k 90 --k-1m 70        # dataset başına ayrı K (--k çoklu ile birlikte kullanılmaz)
 
@@ -56,6 +61,7 @@ from wnmf_utils import (
     load_assignment,
     split_by_cluster,
     remap_user_ids,
+    append_rows_to_accum_csv,
     save_dataframe_csv,
     save_results,
 )
@@ -78,7 +84,7 @@ LATENT_DIM       = 20
 LEARNING_RATE    = 0.01
 REGULARIZATION   = 0.01
 N_EPOCHS_GLOBAL  = 100   # global V ve global baseline için
-N_EPOCHS_CLUSTER = 50    # küme U eğitimi için (daha az veri, daha az epoch yeterli)
+N_EPOCHS_CLUSTER = 100   # küme U eğitimi için
 RANDOM_SEED      = 42
 
 ALGO_LABELS = [
@@ -88,6 +94,11 @@ ALGO_LABELS = [
     # generate_assignments.py ALGO_CONFIG — önce --lof ile atama üretin
     'LIT_GOA', 'LIT_GWO', 'LIT_SSA',
 ]
+
+# Yaygın yazım hatası: --algo H1_HGS+HHO → H1_HHO+HGS
+ALGO_ALIASES = {
+    'H1_HGS+HHO': 'H1_HHO+HGS',
+}
 
 
 def _expand_epoch_pairs(
@@ -106,8 +117,19 @@ def _expand_epoch_pairs(
         return [(g, ec[0]) for g in eg]
     raise ValueError(
         f"--epochs-global ({len(eg)} değer) ile --epochs-cluster ({len(ec)} değer) "
-        "uyumsuz; birini tek bırakın veya uzunlukları eşitleyin."
+        "uyumsuz; birini tek bırakın veya uzunlukları eşitleyin. "
+        "Tüm (global×cluster) çiftleri için --epochs-grid kullanın."
     )
+
+
+def _epoch_cartesian_pairs(eg: List[int], ec: List[int]) -> List[Tuple[int, int]]:
+    """Tüm (epochs_global, epochs_cluster) kombinasyonları."""
+    return list(product(eg, ec))
+
+
+def _hyperparam_line(eg: int, ec: int, ld: int, lr: float, reg: float) -> str:
+    """Özet dosyada arama için tek satırlık etiket."""
+    return f"eg{eg}_ec{ec}_ld{ld}_lr{lr:g}_r{reg:g}"
 
 
 def _format_hyperparam_tag(k_used: int) -> str:
@@ -199,7 +221,7 @@ def _parallel_cluster_map(func, jobs: list, max_workers: Optional[int]):
 def _mp_fit_predict_cluster_full(job):
     """
     Pickle edilebilir küme işi — full WNMF (U+V).
-    job: (c_train, c_test, n_items, latent_dim, lr, reg, n_epochs, random_seed)
+    job: (c_train, c_test, n_items, latent_dim, lr, reg, n_epochs, random_seed, use_svdpp)
     """
     (
         c_train,
@@ -210,6 +232,7 @@ def _mp_fit_predict_cluster_full(job):
         reg,
         n_epochs,
         random_seed,
+        use_svdpp,
     ) = job
     c_train_r, c_test_r, _, n_loc = remap_user_ids(c_train, c_test, n_items)
     model = WNMFModel(
@@ -220,6 +243,7 @@ def _mp_fit_predict_cluster_full(job):
         regularization = reg,
         n_epochs       = n_epochs,
         random_seed    = random_seed,
+        use_svdpp      = use_svdpp,
     )
     model.fit(c_train_r)
     if len(c_test_r) == 0:
@@ -314,7 +338,8 @@ def _mp_fit_predict_cluster_sharedV(job):
 # SENARYO 1: GLOBAL WNMF BASELINE
 # ============================================================
 
-def run_global_wnmf(train, test, n_items, verbose=False, use_bias=True):
+def run_global_wnmf(train, test, n_items, verbose=False, use_bias=True,
+                    use_svdpp: bool = False):
     """
     Tüm kullanıcılara tek model — ablation baseline.
     'Kümeleme eklemek ne kadar iyileştiriyor?' sorusunu cevaplar.
@@ -332,6 +357,7 @@ def run_global_wnmf(train, test, n_items, verbose=False, use_bias=True):
         n_epochs       = N_EPOCHS_GLOBAL,
         random_seed    = RANDOM_SEED,
         use_bias       = use_bias,
+        use_svdpp      = use_svdpp,
     )
     model.fit(train, verbose=verbose)
     mae, rmse = model.evaluate(test)
@@ -357,7 +383,8 @@ def run_global_wnmf(train, test, n_items, verbose=False, use_bias=True):
 
 def run_cluster_full(train, test, assignments, gray_mask,
                      n_items, algo_label, verbose=False,
-                     max_workers: Optional[int] = None):
+                     max_workers: Optional[int] = None,
+                     use_svdpp: bool = False):
     """
     Her küme bağımsız U ve V öğrenir.
     Karşılaştırma için tutulur — SharedV ile farkı görmek için.
@@ -383,6 +410,7 @@ def run_cluster_full(train, test, assignments, gray_mask,
                 REGULARIZATION,
                 N_EPOCHS_CLUSTER,
                 RANDOM_SEED,
+                use_svdpp,
             )
         )
 
@@ -397,7 +425,7 @@ def run_cluster_full(train, test, assignments, gray_mask,
 
     mae, rmse   = _compute_metrics(all_true, all_pred)
     gray_mae, gray_rmse = _run_gray_sheep(
-        gray_train, gray_test, n_items, 'full'
+        gray_train, gray_test, n_items, 'full', use_svdpp=use_svdpp,
     )
 
     elapsed = time.time() - t0
@@ -429,6 +457,7 @@ def run_cluster_sharedV(train, test, assignments, gray_mask,
                         weighted_v: bool = False,
                         use_bias: bool = True,
                         use_cluster_bias: bool = False,
+                        use_svdpp: bool = False,
                         run_command: Optional[str] = None):
     """
     Global V + küme bazlı U.
@@ -455,6 +484,7 @@ def run_cluster_sharedV(train, test, assignments, gray_mask,
         n_epochs_global = N_EPOCHS_GLOBAL,
         random_seed     = RANDOM_SEED,
         use_bias        = use_bias,
+        use_svdpp       = use_svdpp,
     )
     if weighted_v:
         full_gray_mask = np.zeros(int(train[:, 0].max()) + 1, dtype=bool)
@@ -544,6 +574,8 @@ def run_cluster_sharedV(train, test, assignments, gray_mask,
         shared, gray_train, gray_test, n_items
     )
 
+    white_mae, white_rmse = _compute_metrics(all_true, all_pred)
+
     elapsed = time.time() - t0
     print(f"  [{algo_label} | SharedV] MAE={mae:.4f} RMSE={rmse:.4f} | "
           f"Gray MAE={gray_mae:.4f}  ({elapsed:.1f}s)")
@@ -555,6 +587,8 @@ def run_cluster_sharedV(train, test, assignments, gray_mask,
         'rmse'        : rmse,
         'gray_mae'    : gray_mae,
         'gray_rmse'   : gray_rmse,
+        'white_mae'   : white_mae,
+        'white_rmse'  : white_rmse,
         'n_clusters'  : n_clusters_fit,
         'n_train'     : len(train),
         'n_test'      : len(test),
@@ -563,11 +597,65 @@ def run_cluster_sharedV(train, test, assignments, gray_mask,
         'cluster_mae_mean': cluster_mae_mean,
         'cluster_mae_min' : cluster_mae_min,
         'cluster_mae_max' : cluster_mae_max,
+        'precision_at_10' : float('nan'),
+        'recall_at_10'    : float('nan'),
+        'f1_at_10'        : float('nan'),
     }
 
 
+def compute_precision_recall(train, test, assignments,
+                             cluster_item_means, N=10,
+                             threshold=3.5):
+
+    # Her kullanıcının train'de izlediği filmleri bul
+    user_rated = {}
+    for row in train:
+        u = int(row[0])
+        i = int(row[1])
+        if u not in user_rated:
+            user_rated[u] = set()
+        user_rated[u].add(i)
+
+    # Her kullanıcının test'te beğendiği filmleri bul (threshold üstü)
+    user_relevant = {}
+    for row in test:
+        u, i, r = int(row[0]), int(row[1]), float(row[2])
+        if r >= threshold:
+            if u not in user_relevant:
+                user_relevant[u] = set()
+            user_relevant[u].add(i)
+
+    precisions, recalls = [], []
+
+    for u in user_relevant:
+        cid = int(assignments[u])
+        scores = cluster_item_means[cid].copy()
+
+        # Zaten izlenenleri çıkar
+        rated = user_rated.get(u, set())
+        for i in rated:
+            scores[i] = -1.0
+
+        # Top-N öner
+        top_n = set(np.argsort(scores)[-N:][::-1].tolist())
+        relevant = user_relevant[u]
+
+        hits = len(top_n & relevant)
+        precisions.append(hits / N)
+        recalls.append(hits / len(relevant) if relevant else 0.0)
+
+    if not precisions:
+        return float('nan'), float('nan'), float('nan')
+
+    p = float(np.mean(precisions))
+    r = float(np.mean(recalls))
+    f1 = (2 * p * r / (p + r)) if (p + r) > 0 else 0.0
+    return p, r, f1
+
+
 def run_cluster_average(train, test, assignments, gray_mask,
-                        n_items, algo_label):
+                        n_items, algo_label, top_n: int = 10,
+                        relevance_threshold: float = 3.5):
     t0 = time.time()
 
     # Her küme için her item'ın ortalama rating'ini hesapla
@@ -588,6 +676,11 @@ def run_cluster_average(train, test, assignments, gray_mask,
         mask = cluster_item_counts[cid] > 0
         cluster_item_means[cid, mask] /= cluster_item_counts[cid, mask]
         cluster_item_means[cid, ~mask] = global_mean
+
+    precision, recall, f1 = compute_precision_recall(
+        train, test, assignments, cluster_item_means, N=top_n,
+        threshold=relevance_threshold,
+    )
 
     # Test verisinde tahmin yap
     true_vals, pred_vals = [], []
@@ -615,6 +708,8 @@ def run_cluster_average(train, test, assignments, gray_mask,
         gray_mae  = float(np.mean(np.abs(gray_errors)))
         gray_rmse = float(np.sqrt(np.mean(gray_errors**2)))
 
+    white_mae, white_rmse = _compute_metrics(true_vals, pred_vals)
+
     elapsed = time.time() - t0
     print(f"  [{algo_label} | ClusterAvg] MAE={mae:.4f} "
           f"RMSE={rmse:.4f} | Gray MAE={gray_mae:.4f} ({elapsed:.1f}s)")
@@ -626,6 +721,8 @@ def run_cluster_average(train, test, assignments, gray_mask,
         'rmse'        : rmse,
         'gray_mae'    : gray_mae,
         'gray_rmse'   : gray_rmse,
+        'white_mae'   : white_mae,
+        'white_rmse'  : white_rmse,
         'n_clusters'  : n_clusters,
         'n_train'     : len(train),
         'n_test'      : len(test),
@@ -634,6 +731,9 @@ def run_cluster_average(train, test, assignments, gray_mask,
         'cluster_mae_mean': float('nan'),
         'cluster_mae_min' : float('nan'),
         'cluster_mae_max' : float('nan'),
+        'precision_at_10' : precision,
+        'recall_at_10'    : recall,
+        'f1_at_10'        : f1,
     }
 
 
@@ -641,7 +741,8 @@ def run_cluster_average(train, test, assignments, gray_mask,
 # GRAY SHEEP YARDIMCILAR
 # ============================================================
 
-def _run_gray_sheep(gray_train, gray_test, n_items, mode='full'):
+def _run_gray_sheep(gray_train, gray_test, n_items, mode='full',
+                    use_svdpp: bool = False):
     """Gray sheep için bağımsız WNMFModel."""
     if len(gray_train) < 5 or len(gray_test) == 0:
         return float('nan'), float('nan')
@@ -656,6 +757,7 @@ def _run_gray_sheep(gray_train, gray_test, n_items, mode='full'):
         regularization = REGULARIZATION,
         n_epochs       = N_EPOCHS_CLUSTER,
         random_seed    = RANDOM_SEED,
+        use_svdpp      = use_svdpp,
     )
     model.fit(g_train_r)
 
@@ -708,7 +810,11 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
                 use_bias: bool = True,
                 use_cluster_bias: bool = False,
                 run_cluster_avg: bool = True,
-                run_command: Optional[str] = None):
+                top_n: int = 10,
+                relevance_threshold: float = 3.5,
+                use_svdpp: bool = False,
+                run_command: Optional[str] = None,
+                fold: Optional[int] = None):
     """
     Bir dataset üzerinde tüm senaryoları çalıştır.
 
@@ -733,7 +839,10 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
 
     n_items = int(train[:, 1].max()) + 1
     results = []
-    k_dir  = os.path.join(OUT_ROOT, dataset_name, f'k{k_used}')
+    if fold is None:
+        k_dir = os.path.join(OUT_ROOT, dataset_name, f'k{k_used}')
+    else:
+        k_dir = os.path.join(OUT_ROOT, dataset_name, f'k{k_used}', f'fold{fold}')
     run_n  = _next_run_index(k_dir)
     out_dir = os.path.join(k_dir, f'run{run_n}')
     os.makedirs(out_dir, exist_ok=True)
@@ -741,7 +850,9 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
 
     # Global WNMF baseline
     if run_global:
-        row = run_global_wnmf(train, test, n_items, use_bias=use_bias)
+        row = run_global_wnmf(
+            train, test, n_items, use_bias=use_bias, use_svdpp=use_svdpp,
+        )
         row['dataset'] = dataset_name
         results.append(row)
 
@@ -760,7 +871,9 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
 
         if run_cluster_avg:
             row = run_cluster_average(
-                train, test, assignments, gray_mask, n_items, label
+                train, test, assignments, gray_mask, n_items, label,
+                top_n=top_n,
+                relevance_threshold=relevance_threshold,
             )
             row['dataset'] = dataset_name
             results.append(row)
@@ -769,6 +882,7 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
             row = run_cluster_full(
                 train, test, assignments, gray_mask, n_items, label,
                 max_workers=cluster_workers,
+                use_svdpp=use_svdpp,
             )
             row['dataset'] = dataset_name
             results.append(row)
@@ -781,13 +895,18 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
                 weighted_v=weighted_v,
                 use_bias=use_bias,
                 use_cluster_bias=use_cluster_bias,
+                use_svdpp=use_svdpp,
                 run_command=run_command,
             )
             row['dataset'] = dataset_name
             results.append(row)
 
     meta = _result_row_meta(k_used)
-    results = [{**meta, **r} for r in results]
+    sub = os.path.basename(out_dir)
+    results = [
+        {**meta, **r, 'result_subdir': sub, 'use_svdpp': bool(use_svdpp)}
+        for r in results
+    ]
 
     # Kaydet ve özet yazdır (her koşu: results/wnmf/{dataset}/k{K}/run{N}/...)
     save_results(
@@ -830,20 +949,30 @@ def _print_summary(results, dataset_name):
     if tag_hdr:
         print(
             f"{'tag':<36} {'Algoritma':<16} {'Senaryo':<14} {'MAE':>8} {'RMSE':>8} "
-            f"{'ClStd':>8} {'GS MAE':>8}"
+            f"{'ClStd':>8} {'GS MAE':>8} {'Wh MAE':>8} "
+            f"{'P@10':>8} {'R@10':>8} {'F1':>8}"
         )
-        w = 36 + 16 + 14 + 8 + 8 + 8 + 8 + 6
+        w = 36 + 16 + 14 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 6
     else:
         print(
             f"{'Algoritma':<20} {'Senaryo':<16} {'MAE':>8} {'RMSE':>8} "
-            f"{'ClStd':>8} {'GS MAE':>8}"
+            f"{'ClStd':>8} {'GS MAE':>8} {'Wh MAE':>8} "
+            f"{'P@10':>8} {'R@10':>8} {'F1':>8}"
         )
-        w = 72
+        w = 72 + 8 + 8 + 8 + 8
     print("-" * max(w, 72))
 
     for r in results:
         gs = r.get('gray_mae', float('nan'))
         gs_str = f"{gs:.4f}" if not (isinstance(gs, float) and np.isnan(gs)) else "  —  "
+        wh = r.get('white_mae', float('nan'))
+        wh_str = f"{wh:.4f}" if not (isinstance(wh, float) and np.isnan(wh)) else "  —  "
+        pr = r.get('precision_at_10', float('nan'))
+        pr_str = f"{pr:.4f}" if not (isinstance(pr, float) and np.isnan(pr)) else "  —  "
+        rc = r.get('recall_at_10', float('nan'))
+        rc_str = f"{rc:.4f}" if not (isinstance(rc, float) and np.isnan(rc)) else "  —  "
+        f1v = r.get('f1_at_10', float('nan'))
+        f1_str = f"{f1v:.4f}" if not (isinstance(f1v, float) and np.isnan(f1v)) else "  —  "
         cms = r.get('cluster_mae_std', float('nan'))
         cms_str = (
             f"{cms:.4f}"
@@ -859,7 +988,11 @@ def _print_summary(results, dataset_name):
                 f"{r['mae']:>8.4f} "
                 f"{r['rmse']:>8.4f} "
                 f"{cms_str:>8} "
-                f"{gs_str:>8}"
+                f"{gs_str:>8} "
+                f"{wh_str:>8} "
+                f"{pr_str:>8} "
+                f"{rc_str:>8} "
+                f"{f1_str:>8}"
             )
         else:
             print(
@@ -868,7 +1001,11 @@ def _print_summary(results, dataset_name):
                 f"{r['mae']:>8.4f} "
                 f"{r['rmse']:>8.4f} "
                 f"{cms_str:>8} "
-                f"{gs_str:>8}"
+                f"{gs_str:>8} "
+                f"{wh_str:>8} "
+                f"{pr_str:>8} "
+                f"{rc_str:>8} "
+                f"{f1_str:>8}"
             )
     print("=" * 72)
 
@@ -880,7 +1017,19 @@ def _print_summary(results, dataset_name):
 def parse_args():
     p = argparse.ArgumentParser(description="WNMF karşılaştırma deneyi")
     p.add_argument('--dataset', choices=['100k', '1m', 'both'], default='both')
-    p.add_argument('--algo', nargs='+', choices=ALGO_LABELS, default=None)
+    p.add_argument(
+        '--fold', type=int, default=None, metavar='N',
+        help='İsteğe bağlı CV fold (1-5). Verilmezse: ML-100K u1.base/u1.test, ML-1M %%20 holdout, '
+             'sonuçlar .../k{K}/runN. Verilirse: ML-100K u{N}.base/test, ML-1M fold 1=holdout 2-5=KFold, '
+             'sonuçlar .../k{K}/fold{N}/runN.',
+    )
+    p.add_argument(
+        '--algo',
+        nargs='+',
+        metavar='LABEL',
+        default=None,
+        help='İzin verilen etiketler: ' + ', '.join(ALGO_LABELS),
+    )
     p.add_argument('--no-global', action='store_true')
     p.add_argument(
         '--mode', choices=['sharedV', 'full', 'all'], default='sharedV',
@@ -895,6 +1044,12 @@ def parse_args():
         '--epochs-cluster', nargs='+', type=int, default=None,
         metavar='N',
         help='Küme epoch; birden fazla: --epochs-cluster 25 50',
+    )
+    p.add_argument(
+        '--epochs-grid',
+        action='store_true',
+        help='epochs_global × epochs_cluster tüm çiftleri (Cartesian). '
+             'Kapalıyken eski kural: eşit uzunlukta zip, tek eleman yayılımı.',
     )
     p.add_argument(
         '--latent-dim', nargs='+', type=int, default=None,
@@ -956,11 +1111,58 @@ def parse_args():
         '--no-cluster-avg', action='store_true',
         help='ClusterAvg senaryosunu çalıştırma',
     )
+    p.add_argument(
+        '--top-n', type=int, default=10,
+        help='Precision/recall Top-N (cluster_avg)',
+    )
+    p.add_argument(
+        '--relevance-threshold', type=float, default=3.5,
+        help='Test rating >= bu değer relevant sayılır (cluster_avg P/R)',
+    )
+    p.add_argument(
+        '--svdpp', action='store_true',
+        help='WNMFModel / global WNMFSharedV için SVD++ (implicit Y) kullan',
+    )
+    p.add_argument(
+        '--compare-mf-svdpp',
+        action='store_true',
+        help='Aynı hiperparametrelerle ardışık iki koşu: önce MF (SVD++ kapalı), sonra SVD++. '
+             'CSV’de use_svdpp sütunu ile ayrışır; --svdpp ile birlikte verilirse bu bayrak önceliklidir.',
+    )
+    p.add_argument(
+        '--accum-csv',
+        type=str,
+        default=None,
+        metavar='PATH',
+        help='Her hiperparametre kombinasyonundan sonra sonuç satırlarını bu CSV’ye ekler '
+             '(reg / lr / latent / epoch taramaları tek dosyada birikir).',
+    )
+    p.add_argument(
+        '--accum-label',
+        type=str,
+        default=None,
+        metavar='TAG',
+        help='Birikim CSV’sinde accum_label sütunu; verilmezse zaman damgası (YYYYMMDD_HHMMSS).',
+    )
     args = p.parse_args()
     if args.assignment_k is not None and (
         args.assignment_k_100k is not None or args.assignment_k_1m is not None
     ):
         p.error('--k (tek veya çoklu) ile --k-100k / --k-1m birlikte kullanılamaz')
+    if args.fold is not None and args.fold not in (1, 2, 3, 4, 5):
+        p.error('--fold 1..5 olmalı veya tamamen verilmemeli')
+    if args.algo is not None:
+        resolved = []
+        for raw in args.algo:
+            canon = ALGO_ALIASES.get(raw, raw)
+            if canon not in ALGO_LABELS:
+                p.error(
+                    f"bilinmeyen --algo '{raw}'; izin verilenler: {', '.join(ALGO_LABELS)}"
+                )
+            if raw != canon:
+                print(f"not: --algo '{raw}' -> '{canon}' olarak yorumlandi", file=sys.stderr)
+            resolved.append(canon)
+        args.algo = resolved
     return args
 
 
@@ -979,13 +1181,17 @@ if __name__ == '__main__':
     ec_list  = args.epochs_cluster if args.epochs_cluster is not None else [N_EPOCHS_CLUSTER]
 
     try:
-        epoch_pairs = _expand_epoch_pairs(eg_list, ec_list)
+        if args.epochs_grid:
+            epoch_pairs = _epoch_cartesian_pairs(eg_list, ec_list)
+        else:
+            epoch_pairs = _expand_epoch_pairs(eg_list, ec_list)
     except ValueError as err:
         print(f"error: {err}", file=sys.stderr)
         sys.exit(2)
 
     combos      = list(product(epoch_pairs, ld_list, lr_list, reg_list))
     multi_hyper = len(combos) > 1
+    accum_lbl   = args.accum_label if args.accum_label is not None else time.strftime('%Y%m%d_%H%M%S')
 
     os.makedirs(OUT_ROOT, exist_ok=True)
 
@@ -995,8 +1201,12 @@ if __name__ == '__main__':
     print(f"Dataset       : {args.dataset}")
     print(f"Mod           : {args.mode}")
     print(f"Algoritmalar  : {args.algo or ALGO_LABELS}")
+    print(f"Epoch çiftleri: {len(epoch_pairs)} adet {'(grid/Cartesian)' if args.epochs_grid else '(zip/yayılım)'}")
+    if len(epoch_pairs) <= 12:
+        print(f"  -> {epoch_pairs}")
+    else:
+        print(f"  -> {epoch_pairs[:6]} ... {epoch_pairs[-3:]}")
     print(f"Hiper tarama  : {len(combos)} kombinasyon (epoch çift × latent × lr × reg)")
-    print(f"  epoch çiftleri: {epoch_pairs}")
     print(f"  latent_dim    : {ld_list}")
     print(f"  lr            : {lr_list}")
     print(f"  reg           : {reg_list}")
@@ -1008,6 +1218,12 @@ if __name__ == '__main__':
               f"(veya varsayılan 90/150)")
     if args.assign_root:
         print(f"Assignment kök: {args.assign_root}")
+    if args.accum_csv:
+        print(f"Birikim CSV   : {os.path.abspath(args.accum_csv)}  (etiket={accum_lbl})")
+    if args.compare_mf_svdpp:
+        print("MF vs SVD++   : --compare-mf-svdpp (her hiperparametre seti iki kez: MF sonra SVD++)")
+    elif args.svdpp:
+        print("Model         : SVD++ açık (--svdpp)")
     print("=" * 60)
 
     t_total  = time.time()
@@ -1046,57 +1262,98 @@ if __name__ == '__main__':
     train_100k = test_100k = None
     train_1m   = test_1m = None
     if args.dataset in ('100k', 'both'):
-        train_100k, test_100k = load_ratings_100k(DATA_100K_TRAIN, DATA_100K_TEST)
+        if args.fold is None:
+            train_100k, test_100k = load_ratings_100k(DATA_100K_TRAIN, DATA_100K_TEST)
+        else:
+            data_100k_train = os.path.join(
+                os.path.dirname(BASE_DIR), 'data', 'ml-100k', f'u{args.fold}.base'
+            )
+            data_100k_test = os.path.join(
+                os.path.dirname(BASE_DIR), 'data', 'ml-100k', f'u{args.fold}.test'
+            )
+            train_100k, test_100k = load_ratings_100k(data_100k_train, data_100k_test)
     if args.dataset in ('1m', 'both'):
-        train_1m, test_1m = load_ratings_1m(DATA_1M, random_seed=RANDOM_SEED)
+        train_1m, test_1m = load_ratings_1m(
+            DATA_1M, random_seed=RANDOM_SEED, fold=args.fold,
+        )
 
-    for (eg, ec), ld, lr, reg in combos:
-        N_EPOCHS_GLOBAL  = eg
-        N_EPOCHS_CLUSTER = ec
-        LATENT_DIM       = ld
-        LEARNING_RATE    = lr
-        REGULARIZATION   = reg
-        print(f"\n>>> Hiperparametre seti: ld={ld} lr={lr} reg={reg} eg={eg} ec={ec}")
+    svdpp_sequence = [False, True] if args.compare_mf_svdpp else [bool(args.svdpp)]
 
-        if args.dataset in ('100k', 'both'):
-            for K in _k_iter_100k():
-                rows = run_dataset(
-                    'ml100k', train_100k, test_100k,
-                    algo_filter=args.algo,
-                    run_global=not args.no_global,
-                    mode=args.mode,
-                    cluster_workers=args.jobs,
-                    assign_root=args.assign_root,
-                    assignment_k=K,
-                    assignment_k_100k=None,
-                    assignment_k_1m=None,
-                    weighted_v=args.weighted_v,
-                    use_bias=not args.no_bias,
-                    use_cluster_bias=args.cluster_bias,
-                    run_cluster_avg=not args.no_cluster_avg,
-                    run_command=RUN_COMMAND,
-                )
-                all_rows.extend(rows)
+    for use_sp in svdpp_sequence:
+        tag_sp = 'SVD++' if use_sp else 'MF'
+        for (eg, ec), ld, lr, reg in combos:
+            N_EPOCHS_GLOBAL  = eg
+            N_EPOCHS_CLUSTER = ec
+            LATENT_DIM       = ld
+            LEARNING_RATE    = lr
+            REGULARIZATION   = reg
+            print(f"\n>>> [{tag_sp}] Hiperparametre seti: ld={ld} lr={lr} reg={reg} eg={eg} ec={ec}")
 
-        if args.dataset in ('1m', 'both'):
-            for K in _k_iter_1m():
-                rows = run_dataset(
-                    'ml1m', train_1m, test_1m,
-                    algo_filter=args.algo,
-                    run_global=not args.no_global,
-                    mode=args.mode,
-                    cluster_workers=args.jobs,
-                    assign_root=args.assign_root,
-                    assignment_k=K,
-                    assignment_k_100k=None,
-                    assignment_k_1m=None,
-                    weighted_v=args.weighted_v,
-                    use_bias=not args.no_bias,
-                    use_cluster_bias=args.cluster_bias,
-                    run_cluster_avg=not args.no_cluster_avg,
-                    run_command=RUN_COMMAND,
-                )
-                all_rows.extend(rows)
+            combo_rows: List[dict] = []
+
+            if args.dataset in ('100k', 'both'):
+                for K in _k_iter_100k():
+                    rows = run_dataset(
+                        'ml100k', train_100k, test_100k,
+                        algo_filter=args.algo,
+                        run_global=not args.no_global,
+                        mode=args.mode,
+                        cluster_workers=args.jobs,
+                        assign_root=args.assign_root,
+                        assignment_k=K,
+                        assignment_k_100k=None,
+                        assignment_k_1m=None,
+                        weighted_v=args.weighted_v,
+                        use_bias=not args.no_bias,
+                        use_cluster_bias=args.cluster_bias,
+                        run_cluster_avg=not args.no_cluster_avg,
+                        top_n=args.top_n,
+                        relevance_threshold=args.relevance_threshold,
+                        use_svdpp=use_sp,
+                        run_command=RUN_COMMAND,
+                        fold=args.fold,
+                    )
+                    combo_rows.extend(rows)
+
+            if args.dataset in ('1m', 'both'):
+                for K in _k_iter_1m():
+                    rows = run_dataset(
+                        'ml1m', train_1m, test_1m,
+                        algo_filter=args.algo,
+                        run_global=not args.no_global,
+                        mode=args.mode,
+                        cluster_workers=args.jobs,
+                        assign_root=args.assign_root,
+                        assignment_k=K,
+                        assignment_k_100k=None,
+                        assignment_k_1m=None,
+                        weighted_v=args.weighted_v,
+                        use_bias=not args.no_bias,
+                        use_cluster_bias=args.cluster_bias,
+                        run_cluster_avg=not args.no_cluster_avg,
+                        top_n=args.top_n,
+                        relevance_threshold=args.relevance_threshold,
+                        use_svdpp=use_sp,
+                        run_command=RUN_COMMAND,
+                        fold=args.fold,
+                    )
+                    combo_rows.extend(rows)
+
+            all_rows.extend(combo_rows)
+
+            if args.accum_csv and combo_rows:
+                hp_line = _hyperparam_line(eg, ec, ld, lr, reg)
+                stamped = [
+                    {
+                        **r,
+                        'accum_label': accum_lbl,
+                        'hyperparam_line': hp_line,
+                        'model_variant': tag_sp,
+                        'cli_command': RUN_COMMAND,
+                    }
+                    for r in combo_rows
+                ]
+                append_rows_to_accum_csv(stamped, args.accum_csv)
 
     if all_rows and len(all_tags) > 1 and not multi_k and not multi_hyper:
         mode_tag     = f"mode-{args.mode}"

@@ -66,6 +66,7 @@ class WNMFModel:
         n_epochs       : int   = 100,
         random_seed    : int   = 42,
         use_bias       : bool  = True,
+        use_svdpp      : bool  = False,
     ):
         self.n_users        = n_users
         self.n_items        = n_items
@@ -75,7 +76,10 @@ class WNMFModel:
         self.n_epochs       = n_epochs
         self.random_seed    = random_seed
         self.use_bias       = use_bias
+        self.use_svdpp      = use_svdpp
         self.is_fitted      = False
+        self.user_implicit  = None
+        self._svdpp_train_items: Optional[dict] = None
 
         self.mu  = 0.0
         self.b_u = np.zeros(n_users, dtype=np.float32)
@@ -85,6 +89,11 @@ class WNMFModel:
         scale = np.sqrt(5.0 / latent_dim)
         self.U = rng.uniform(0, scale, (n_users, latent_dim)).astype(np.float32)
         self.V = rng.uniform(0, scale, (n_items, latent_dim)).astype(np.float32)
+        if use_svdpp:
+            rng2 = np.random.RandomState(random_seed + 1)
+            self.Y = rng2.uniform(0, scale, (n_items, latent_dim)).astype(np.float32)
+        else:
+            self.Y = None
 
     def fit(
         self,
@@ -110,6 +119,24 @@ class WNMFModel:
         lr       = self.learning_rate
         reg      = self.regularization
 
+        user_items: dict = {}
+        user_implicit: dict = {}
+        if self.use_svdpp:
+            for k in range(n):
+                u = int(user_ids[k])
+                i = int(item_ids[k])
+                if u not in user_items:
+                    user_items[u] = []
+                user_items[u].append(i)
+            for u, items in user_items.items():
+                ni = len(items)
+                if ni > 0:
+                    implicit = self.Y[items].sum(axis=0) / np.sqrt(ni)
+                else:
+                    implicit = np.zeros(self.latent_dim, dtype=np.float32)
+                user_implicit[u] = implicit
+            self._svdpp_train_items = user_items
+
         if self.use_bias:
             self.mu = float(ratings.mean())
 
@@ -124,12 +151,66 @@ class WNMFModel:
                 i = i_shuf[k]
                 r = r_shuf[k]
 
-                if self.use_bias:
-                    w = (
-                        sample_weights[idx[k]]
-                        if sample_weights is not None
-                        else 1.0
-                    )
+                w = (
+                    sample_weights[idx[k]]
+                    if sample_weights is not None
+                    else 1.0
+                )
+
+                if self.use_svdpp:
+                    u_vec = self.U[u] + user_implicit[u]
+                    if self.use_bias:
+                        pred = (
+                            self.mu
+                            + self.b_u[u]
+                            + self.b_i[i]
+                            + float(np.dot(u_vec, self.V[i]))
+                        )
+                        error = r - pred
+                        grad_u = -error * w * self.V[i] + reg * self.U[u]
+                        self.U[u] -= lr * grad_u
+                        np.maximum(self.U[u], 0, out=self.U[u])
+                        n_u = len(user_items[u])
+                        sqrt_n = np.sqrt(n_u) if n_u > 0 else 1.0
+                        for j in user_items[u]:
+                            grad_y = (
+                                -error * w * self.V[i] / sqrt_n
+                                + reg * self.Y[j]
+                            )
+                            self.Y[j] -= lr * grad_y
+                            np.maximum(self.Y[j], 0, out=self.Y[j])
+                        grad_v = -error * w * u_vec + reg * self.V[i]
+                        self.V[i] -= lr * grad_v
+                        np.maximum(self.V[i], 0, out=self.V[i])
+                        self.b_u[u] += lr * (error * w - reg * self.b_u[u])
+                        self.b_i[i] += lr * (error * w - reg * self.b_i[i])
+                        if n_u > 0:
+                            user_implicit[u] = (
+                                self.Y[user_items[u]].sum(axis=0) / sqrt_n
+                            )
+                    else:
+                        pred = float(np.dot(u_vec, self.V[i]))
+                        error = r - pred
+                        grad_u = -error * w * self.V[i] + reg * self.U[u]
+                        self.U[u] -= lr * grad_u
+                        np.maximum(self.U[u], 0, out=self.U[u])
+                        n_u = len(user_items[u])
+                        sqrt_n = np.sqrt(n_u) if n_u > 0 else 1.0
+                        for j in user_items[u]:
+                            grad_y = (
+                                -error * w * self.V[i] / sqrt_n
+                                + reg * self.Y[j]
+                            )
+                            self.Y[j] -= lr * grad_y
+                            np.maximum(self.Y[j], 0, out=self.Y[j])
+                        grad_v = -error * w * u_vec + reg * self.V[i]
+                        self.V[i] -= lr * grad_v
+                        np.maximum(self.V[i], 0, out=self.V[i])
+                        if n_u > 0:
+                            user_implicit[u] = (
+                                self.Y[user_items[u]].sum(axis=0) / sqrt_n
+                            )
+                elif self.use_bias:
                     pred = (
                         self.mu
                         + self.b_u[u]
@@ -148,7 +229,6 @@ class WNMFModel:
                 else:
                     error = r - float(np.dot(self.U[u], self.V[i]))
                     if sample_weights is not None:
-                        w      = sample_weights[idx[k]]
                         grad_u = -error * w * self.V[i] + reg * self.U[u]
                         grad_v = -error * w * self.U[u] + reg * self.V[i]
                     else:
@@ -165,8 +245,32 @@ class WNMFModel:
                 loss = self._compute_loss(user_ids, item_ids, ratings)
                 print(f"    Epoch {epoch:3d}/{self.n_epochs}  loss={loss:.4f}")
 
+        if self.use_svdpp:
+            self.user_implicit = np.zeros(
+                (self.n_users, self.latent_dim), dtype=np.float32,
+            )
+            for u, items in user_items.items():
+                ni = len(items)
+                if ni > 0:
+                    self.user_implicit[u] = (
+                        self.Y[items].sum(axis=0) / np.sqrt(ni)
+                    )
+
         self.is_fitted = True
         return self
+
+    def _svdpp_implicit_u(self, u: int) -> np.ndarray:
+        if (
+            not self.use_svdpp
+            or self.Y is None
+            or self._svdpp_train_items is None
+        ):
+            return np.zeros(self.latent_dim, dtype=np.float32)
+        items = self._svdpp_train_items.get(u, [])
+        ni = len(items)
+        if ni <= 0:
+            return np.zeros(self.latent_dim, dtype=np.float32)
+        return self.Y[items].sum(axis=0) / np.sqrt(ni)
 
     def predict(
         self,
@@ -177,6 +281,28 @@ class WNMFModel:
         """Rating tahmini — U[u] · V[i], [1,5] aralığına clip edilir."""
         user_ids = np.asarray(user_ids, dtype=np.int32)
         item_ids = np.asarray(item_ids, dtype=np.int32)
+        if self.use_svdpp:
+            preds = []
+            for u, i in zip(user_ids, item_ids):
+                uu, ii = int(u), int(i)
+                if self.is_fitted and self.user_implicit is not None:
+                    implicit = self.user_implicit[uu]
+                else:
+                    implicit = self._svdpp_implicit_u(uu)
+                u_vec = self.U[uu] + implicit
+                if self.use_bias:
+                    pred = (
+                        self.mu
+                        + self.b_u[uu]
+                        + self.b_i[ii]
+                        + float(np.dot(u_vec, self.V[ii]))
+                    )
+                else:
+                    pred = float(np.dot(u_vec, self.V[ii]))
+                if clip:
+                    pred = float(np.clip(pred, 1.0, 5.0))
+                preds.append(pred)
+            return np.array(preds, dtype=np.float32)
         if self.use_bias:
             preds = (
                 self.mu
@@ -251,6 +377,7 @@ class WNMFSharedV:
         n_epochs_global: int   = 100,
         random_seed    : int   = 42,
         use_bias       : bool  = True,
+        use_svdpp      : bool  = False,
     ):
         self.n_items         = n_items
         self.latent_dim      = latent_dim
@@ -259,6 +386,7 @@ class WNMFSharedV:
         self.n_epochs_global = n_epochs_global
         self.random_seed     = random_seed
         self._use_bias       = use_bias
+        self._use_svdpp      = use_svdpp
         self.V               = None   # global V, fit_global_V sonrası dolar
         self.V_fitted        = False
         self.mu              = 0.0
@@ -274,6 +402,7 @@ class WNMFSharedV:
             n_epochs       = n_epochs_global,
             random_seed    = random_seed,
             use_bias       = use_bias,
+            use_svdpp      = use_svdpp,
         )
 
     def fit_global_V(

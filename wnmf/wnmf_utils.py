@@ -16,14 +16,15 @@ WNMF deneyleri için yardımcı fonksiyonlar.
 import os
 import numpy as np
 import pandas as pd
-from typing import Dict, Tuple, Optional
+from sklearn.model_selection import KFold, train_test_split
+from typing import Dict, List, Tuple, Optional, Any
 
 
 # ============================================================
 # VERİ YÜKLEME
 # ============================================================
 
-def load_ratings_100k(base_path: str, test_path: str) -> Tuple[np.ndarray, np.ndarray]:
+def load_ratings_100k(base_path: str, test_path: str, fold: int = 1) -> Tuple[np.ndarray, np.ndarray]:
     """
     ML-100K formatında train ve test rating'lerini yükle.
 
@@ -34,12 +35,19 @@ def load_ratings_100k(base_path: str, test_path: str) -> Tuple[np.ndarray, np.nd
     ------------
     base_path : str — eğitim dosyası (örn: data/ml-100k/u1.base)
     test_path : str — test dosyası   (örn: data/ml-100k/u1.test)
+    fold      : int — 1 ise base_path/test_path olduğu gibi kullanılır;
+                      2–5 ise aynı dizinde u{fold}.base / u{fold}.test okunur.
 
     Döndürür
     --------
     (train_ratings, test_ratings) : her biri shape (n, 3) array
         sütunlar: [user_id, item_id, rating]
     """
+    if fold != 1:
+        data_dir = os.path.dirname(os.path.abspath(base_path))
+        base_path = os.path.join(data_dir, f'u{fold}.base')
+        test_path = os.path.join(data_dir, f'u{fold}.test')
+
     def _read(path):
         df = pd.read_csv(
             path, sep='\t',
@@ -62,23 +70,29 @@ def load_ratings_100k(base_path: str, test_path: str) -> Tuple[np.ndarray, np.nd
 
 
 def load_ratings_1m(ratings_path: str, test_ratio: float = 0.2,
-                    random_seed: int = 42) -> Tuple[np.ndarray, np.ndarray]:
+                    random_seed: int = 42, fold: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
     """
     ML-1M formatında rating'leri yükle ve train/test'e böl.
 
-    ML-1M'in hazır fold'ları yok — random split kullanılır.
+    ML-1M'in hazır fold'ları yok.
+    fold None veya 1: train_test_split ile test_ratio (varsayılan %20), random_state=random_seed.
+    fold=2..5: KFold(n_splits=5, shuffle=True, random_state=random_seed) parçası splits[fold-1].
     Dosya formatı: UserID::MovieID::Rating::Timestamp
 
     Parametreler
     ------------
     ratings_path : str   — ratings.dat dosya yolu
-    test_ratio   : float — test oranı (varsayılan: 0.2)
-    random_seed  : int   — tekrarlanabilirlik için
+    test_ratio   : float — holdout için test oranı; KFold fold'larında yok sayılır
+    random_seed  : int   — holdout ve KFold için random_state
+    fold         : int veya None — None/1: holdout; 2..5: KFold parçası
 
     Döndürür
     --------
     (train_ratings, test_ratings)
     """
+    if fold is not None and not (1 <= fold <= 5):
+        raise ValueError(f"load_ratings_1m: fold None veya 1..5 olmalı, gelen: {fold}")
+
     rows = []
     with open(ratings_path, 'r', encoding='latin-1') as f:
         for line in f:
@@ -93,23 +107,37 @@ def load_ratings_1m(ratings_path: str, test_ratio: float = 0.2,
                     float(parts[2]),
                 ))
 
-    arr = np.array(rows, dtype=np.float32)
+    df = pd.DataFrame(rows, columns=['user_id', 'item_id', 'rating'])
 
-    # Kullanıcı bazlı stratified split
-    np.random.seed(random_seed)
-    train_rows, test_rows = [], []
+    if fold is None or fold == 1:
+        train_df, test_df = train_test_split(
+            df,
+            test_size=test_ratio,
+            random_state=random_seed,
+            shuffle=True,
+        )
+    else:
+        kf = KFold(n_splits=5, shuffle=True, random_state=random_seed)
+        splits = list(kf.split(df))
+        train_idx, test_idx = splits[fold - 1]
+        train_df = df.iloc[train_idx]
+        test_df = df.iloc[test_idx]
 
-    for uid in np.unique(arr[:, 0].astype(int)):
-        mask    = arr[:, 0] == uid
-        u_data  = arr[mask]
-        n       = len(u_data)
-        n_test  = max(1, int(n * test_ratio))
-        idx     = np.random.permutation(n)
-        test_rows.append(u_data[idx[:n_test]])
-        train_rows.append(u_data[idx[n_test:]])
+    combo = pd.concat([train_df, test_df], axis=0)
+    unique_users = np.sort(combo['user_id'].unique())
+    unique_items = np.sort(combo['item_id'].unique())
+    u_map = {int(u): i for i, u in enumerate(unique_users)}
+    i_map = {int(i): j for j, i in enumerate(unique_items)}
 
-    train = np.vstack(train_rows)
-    test  = np.vstack(test_rows)
+    train_df = train_df.copy()
+    test_df = test_df.copy()
+    train_df['user_id'] = train_df['user_id'].map(u_map)
+    train_df['item_id'] = train_df['item_id'].map(i_map)
+    test_df['user_id'] = test_df['user_id'].map(u_map)
+    test_df['item_id'] = test_df['item_id'].map(i_map)
+
+    train = train_df[['user_id', 'item_id', 'rating']].values.astype(np.float32)
+    test = test_df[['user_id', 'item_id', 'rating']].values.astype(np.float32)
 
     print(f"ML-1M yüklendi")
     print(f"  Train: {len(train):,} rating")
@@ -299,3 +327,35 @@ def save_results(
     save_dataframe_csv(df, path, run_command=run_command)
     print(f"Sonuçlar kaydedildi: {path}")
     return df
+
+
+def append_rows_to_accum_csv(rows: List[Dict[str, Any]], path: str) -> None:
+    """
+    Deney satırlarını tek bir CSV'de biriktirir (aynı dosyaya tekrar tekrar yazım).
+
+    Var olan dosyayla sütun birleşimi yapılır; dosya yoksa oluşturulur.
+    Başlık satırı # ile başlamaz (append ile uyum için).
+    """
+    if not rows:
+        return
+    path = os.path.abspath(path)
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    new_df = pd.DataFrame(rows)
+    if not os.path.isfile(path) or os.path.getsize(path) == 0:
+        new_df.to_csv(path, index=False, encoding='utf-8')
+        print(f"Birikim CSV oluşturuldu: {path}  (+{len(new_df)} satır)")
+        return
+    try:
+        old_df = pd.read_csv(path, encoding='utf-8', comment='#')
+    except pd.errors.EmptyDataError:
+        new_df.to_csv(path, index=False, encoding='utf-8')
+        print(f"Birikim CSV yazıldı: {path}  (+{len(new_df)} satır)")
+        return
+    all_cols = list(dict.fromkeys(list(old_df.columns) + list(new_df.columns)))
+    old_df = old_df.reindex(columns=all_cols)
+    new_df = new_df.reindex(columns=all_cols)
+    combined = pd.concat([old_df, new_df], ignore_index=True)
+    combined.to_csv(path, index=False, encoding='utf-8')
+    print(f"Birikim CSV güncellendi: {path}  (+{len(new_df)} satır, toplam {len(combined)})")
