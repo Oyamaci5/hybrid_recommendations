@@ -533,6 +533,93 @@ def load_movielens_1m(path):
     return matrix
 
 
+def zscore_normalize(matrix):
+    """
+    Kullanıcı bazlı Z-score normalizasyon.
+    Her kullanıcının rating'lerini normalize et:
+    r_norm = (r - user_mean) / user_std
+
+    Rating olmayan (0) hücreler normalize edilmez.
+    std=0 olan kullanıcılar için sadece mean çıkar.
+    """
+    normalized = matrix.copy().astype(np.float32)
+    for u in range(matrix.shape[0]):
+        rated = matrix[u] != 0
+        if rated.sum() == 0:
+            continue
+        mean = matrix[u, rated].mean()
+        std  = matrix[u, rated].std()
+        if std > 0:
+            normalized[u, rated] = (matrix[u, rated] - mean) / std
+        else:
+            normalized[u, rated] = matrix[u, rated] - mean
+    return normalized
+
+
+def wnmf_feature_extract(matrix, n_components,
+                         n_epochs=50, lr=0.01,
+                         reg=0.01, random_seed=42):
+    """
+    Ham rating matrisini WNMF ile ayrıştır.
+    Sadece kullanıcı latent matrisini (U) döndür.
+
+    Neden WNMF: Sıfır hücreler 'rating yok' anlamına gelir,
+    standart NMF bunları sıfır rating olarak işler (hatalı).
+    WNMF sadece gözlemlenen rating'leri kullanır.
+
+    Çıktı: (n_users × n_components) dense matris
+    Bu matris üzerinde metasezgisel çok daha iyi çalışır:
+    - Sparse değil, dense
+    - Gürültüsüz, anlamlı latent özellikler
+    - Kullanıcıların zevk profili özet vektörleri
+    """
+    import numpy as np
+
+    n_users, n_items = matrix.shape
+    rng = np.random.RandomState(random_seed)
+
+    # Başlangıç değerleri
+    rated = matrix > 0
+    mean_rating = matrix[rated].mean() if rated.any() else 3.0
+    scale = np.sqrt(mean_rating / n_components)
+
+    U = rng.uniform(0, scale,
+                    (n_users, n_components)).astype(np.float32)
+    V = rng.uniform(0, scale,
+                    (n_items, n_components)).astype(np.float32)
+
+    # Sadece gözlemlenen rating'leri al
+    rows, cols = np.where(matrix > 0)
+    ratings = matrix[rows, cols].astype(np.float32)
+    n = len(ratings)
+
+    print(f"  WNMF feature extraction başlıyor...")
+    print(f"  Matris: {n_users}×{n_items} → U: {n_users}×{n_components}")
+    print(f"  Gözlemlenen rating: {n}, epoch: {n_epochs}")
+
+    for epoch in range(n_epochs):
+        idx = np.random.permutation(n)
+        for k in idx:
+            u = rows[k]
+            i = cols[k]
+            r = ratings[k]
+
+            pred = float(np.dot(U[u], V[i]))
+            error = r - pred
+
+            grad_u = -error * V[i] + reg * U[u]
+            grad_v = -error * U[u] + reg * V[i]
+
+            U[u] -= lr * grad_u
+            V[i] -= lr * grad_v
+
+            np.maximum(U[u], 0, out=U[u])
+            np.maximum(V[i], 0, out=V[i])
+
+    print(f"  WNMF tamamlandı. U shape: {U.shape}")
+    return U  # (n_users × n_components) dense
+
+
 # ============================================================
 # DATASET ÇALIŞTIRICI
 # ============================================================
@@ -540,7 +627,7 @@ def load_movielens_1m(path):
 def run_dataset(dataset_name, matrix, K, out_root, algo_filter=None,
                 use_lof=False, lof_n_neighbors=LOF_N_NEIGHBORS,
                 lof_contamination=LOF_CONTAMINATION,
-                max_workers: Optional[int] = None):
+                max_workers: Optional[int] = None, out_suffix: str = ''):
     print(f"\n{'='*60}")
     print(f"DATASET: {dataset_name.upper()}  |  K={K}  |  Seed={SEED}")
     mode_str = f'LOF (n={lof_n_neighbors}, cont={lof_contamination})' \
@@ -557,7 +644,7 @@ def run_dataset(dataset_name, matrix, K, out_root, algo_filter=None,
         if algo_filter and label not in algo_filter:
             print(f"  [{label}] atlandı (filtre)")
             continue
-        save_dir = os.path.join(out_root, dataset_name, f"{label}{k_suffix}")
+        save_dir = os.path.join(out_root, dataset_name, f"{label}{k_suffix}{out_suffix}")
         jobs_meta.append((label, g_name, l_name, save_dir))
 
     if not jobs_meta:
@@ -650,6 +737,17 @@ def parse_args():
     p.add_argument(
         '--lof', action='store_true',
         help="LOF tabanlı gray sheep kullan (default: sabit 80. percentile)"
+    )
+    p.add_argument(
+        '--zscore', action='store_true',
+        help='Clustering matrisine kullanıcı bazlı Z-score normalizasyon uygula'
+    )
+    p.add_argument(
+        '--wnmf-features', type=int, default=None,
+        metavar='K',
+        help='WNMF ile K boyutlu kullanıcı latent matris çıkar. '
+             'Bu matris metasezgisel clustering girişi olur. '
+             'Öneri için ham rating kullanılır. (örn: --wnmf-features 20)'
     )
     p.add_argument(
         '--k', nargs='+', type=int, default=None, metavar='K',
@@ -764,9 +862,26 @@ if __name__ == '__main__':
             return None
         return args.jobs
 
+    zscore_suffix = '_zscore' if args.zscore else ''
+    wnmf_suffix = (
+        f'_wnmf{args.wnmf_features}'
+        if args.wnmf_features is not None else ''
+    )
+    out_suffix = zscore_suffix + wnmf_suffix
+
     if args.dataset in ('100k', 'both'):
         print(f"\nML-100K yükleniyor: {args.data_100k}")
         matrix_100k = load_movielens(args.data_100k)
+        if args.zscore:
+            matrix_100k = zscore_normalize(matrix_100k)
+            print("  Z-score normalizasyon uygulandı")
+        if args.wnmf_features is not None:
+            matrix_100k = wnmf_feature_extract(
+                matrix_100k,
+                n_components=args.wnmf_features,
+                n_epochs=50,
+                random_seed=42
+            )
         if k_multi is not None:
             for K in k_multi:
                 run_dataset(
@@ -776,6 +891,7 @@ if __name__ == '__main__':
                     lof_n_neighbors=args.n_neighbors,
                     lof_contamination=contamination,
                     max_workers=_pool_cap(),
+                    out_suffix=out_suffix,
                 )
         else:
             run_dataset(
@@ -785,11 +901,22 @@ if __name__ == '__main__':
                 lof_n_neighbors=args.n_neighbors,
                 lof_contamination=contamination,
                 max_workers=_pool_cap(),
+                out_suffix=out_suffix,
             )
 
     if args.dataset in ('1m', 'both'):
         print(f"\nML-1M yükleniyor: {args.data_1m}")
         matrix_1m = load_movielens_1m(args.data_1m)
+        if args.zscore:
+            matrix_1m = zscore_normalize(matrix_1m)
+            print("  Z-score normalizasyon uygulandı")
+        if args.wnmf_features is not None:
+            matrix_1m = wnmf_feature_extract(
+                matrix_1m,
+                n_components=args.wnmf_features,
+                n_epochs=50,
+                random_seed=42
+            )
         if k_multi is not None:
             for K in k_multi:
                 run_dataset(
@@ -799,6 +926,7 @@ if __name__ == '__main__':
                     lof_n_neighbors=args.n_neighbors,
                     lof_contamination=contamination,
                     max_workers=_pool_cap(),
+                    out_suffix=out_suffix,
                 )
         else:
             run_dataset(
@@ -808,6 +936,7 @@ if __name__ == '__main__':
                 lof_n_neighbors=args.n_neighbors,
                 lof_contamination=contamination,
                 max_workers=_pool_cap(),
+                out_suffix=out_suffix,
             )
 
     print(f"\n{'='*60}")

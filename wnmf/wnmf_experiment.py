@@ -170,14 +170,16 @@ def _algo_assignment_dir(
     dataset_name: str,
     label: str,
     k_used: int,
+    assign_suffix: str = '',
 ) -> str:
     """
     Örnek: k_used=70, default 90 ise → .../ml100k/B1_HHO_k70
     k_used=90, default 90 ise → .../ml100k/B1_HHO
+    assign_suffix: örn. _wnmf20, _zscore (generate_assignments ile aynı klasör adları)
     """
     default_k = ASSIGN_K_DEFAULT_100K if dataset_name == 'ml100k' else ASSIGN_K_DEFAULT_1M
     suffix    = '' if k_used == default_k else f'_k{k_used}'
-    return os.path.join(assign_root, dataset_name, f'{label}{suffix}')
+    return os.path.join(assign_root, dataset_name, f'{label}{suffix}{assign_suffix}')
 
 
 def _next_run_index(k_dir: str) -> int:
@@ -737,6 +739,192 @@ def run_cluster_average(train, test, assignments, gray_mask,
     }
 
 
+def run_cluster_knn(train, test, assignments, gray_mask,
+                    n_items, algo_label,
+                    similarity: str = 'pearson',
+                    min_common: int = 3,
+                    k_neighbors: int = 30):
+    t0 = time.time()
+    k_neighbors = max(1, int(k_neighbors))
+
+    global_mean = float(train[:, 2].mean())
+    user_ratings = {}
+    for row in train:
+        u, i, r = int(row[0]), int(row[1]), float(row[2])
+        if u not in user_ratings:
+            user_ratings[u] = {}
+        user_ratings[u][i] = r
+    user_means = {
+        u: float(np.mean(list(d.values())))
+        for u, d in user_ratings.items()
+    }
+
+    n_users = len(assignments)
+    cluster_users = {}
+    for u in range(n_users):
+        cid = int(assignments[u])
+        cluster_users.setdefault(cid, []).append(u)
+
+    def pearson_sim(u, v, min_common=3):
+        """
+        Pearson Korelasyon Katsayısı (PCC).
+        Sadece iki kullanıcının ortak izlediği filmler üzerinden.
+
+        sim(u,v) = Σ(r_ui - mean_u)(r_vi - mean_v) /
+                   √[Σ(r_ui - mean_u)² × Σ(r_vi - mean_v)²]
+
+        Ortak film < min_common ise 0 döndür (güvenilmez).
+        """
+        u_items = set(user_ratings.get(u, {}).keys())
+        v_items = set(user_ratings.get(v, {}).keys())
+        common = list(u_items & v_items)
+
+        if len(common) < min_common:
+            return 0.0
+
+        u_c = np.array([user_ratings[u][i] - user_means[u]
+                        for i in common], dtype=np.float32)
+        v_c = np.array([user_ratings[v][i] - user_means[v]
+                        for i in common], dtype=np.float32)
+
+        norm_u = np.sqrt((u_c**2).sum())
+        norm_v = np.sqrt((v_c**2).sum())
+
+        if norm_u < 1e-8 or norm_v < 1e-8:
+            return 0.0
+
+        return float(np.clip(np.dot(u_c, v_c) / (norm_u * norm_v),
+                             -1.0, 1.0))
+
+    def cosine_sim(u, v, min_common=3):
+        """
+        Kosinüs Benzerliği.
+        Sadece ortak filmler üzerinden (PCC'den farkı:
+        mean çıkarılmaz, ham rating kullanılır).
+
+        sim(u,v) = Σ r_ui*r_vi /
+                   √[Σ r_ui² × Σ r_vi²]
+        """
+        u_items = set(user_ratings.get(u, {}).keys())
+        v_items = set(user_ratings.get(v, {}).keys())
+        common = list(u_items & v_items)
+
+        if len(common) < min_common:
+            return 0.0
+
+        u_r = np.array([user_ratings[u][i] for i in common],
+                       dtype=np.float32)
+        v_r = np.array([user_ratings[v][i] for i in common],
+                       dtype=np.float32)
+
+        denom = np.sqrt((u_r**2).sum()) * np.sqrt((v_r**2).sum())
+        if denom < 1e-8:
+            return 0.0
+
+        return float(np.clip(np.dot(u_r, v_r) / denom,
+                             0.0, 1.0))
+
+    def predict(u, i, similarity='pearson', min_common=3):
+        """
+        Mean-Centered kNN tahmin formülü:
+        pred(u,i) = mean_u +
+                    Σ sim(u,v)*(r_vi - mean_v) / Σ|sim(u,v)|
+
+        Pearson için mean-centered kullan.
+        Cosine için ham rating ortalaması kullan.
+        """
+        cid = int(assignments[u])
+        neighbors = cluster_users.get(cid, [])
+
+        # i'yi değerlendiren komşuları bul ve benzerlik hesapla
+        sims = []
+        for v in neighbors:
+            if v == u:
+                continue
+            if i not in user_ratings.get(v, {}):
+                continue
+
+            if similarity == 'pearson':
+                s = pearson_sim(u, v, min_common)
+            else:
+                s = cosine_sim(u, v, min_common)
+
+            if abs(s) > 0.0:
+                sims.append((s, v))
+
+        if not sims:
+            return float(user_means.get(u, global_mean))
+
+        # En yakın k komşu seç
+        sims.sort(key=lambda x: -abs(x[0]))
+        top_k = sims[:k_neighbors]
+
+        # Mean-centered ağırlıklı ortalama
+        num = sum(s * (user_ratings[v][i] - user_means.get(v, global_mean))
+                  for s, v in top_k)
+        den = sum(abs(s) for s, v in top_k)
+
+        if den < 1e-8:
+            return float(user_means.get(u, global_mean))
+
+        pred = user_means.get(u, global_mean) + num / den
+        return float(np.clip(pred, 1.0, 5.0))
+
+    true_vals, pred_vals = [], []
+    gray_true, gray_pred = [], []
+
+    for row in test:
+        u, i, r = int(row[0]), int(row[1]), float(row[2])
+        pr = predict(u, i, similarity=similarity, min_common=min_common)
+
+        if gray_mask[u]:
+            gray_true.append(r)
+            gray_pred.append(pr)
+        else:
+            true_vals.append(r)
+            pred_vals.append(pr)
+
+    all_true = true_vals + gray_true
+    all_pred = pred_vals + gray_pred
+    mae, rmse = _compute_metrics(all_true, all_pred)
+
+    gray_mae, gray_rmse = float('nan'), float('nan')
+    if gray_true:
+        gray_errors = np.array(gray_true) - np.array(gray_pred)
+        gray_mae  = float(np.mean(np.abs(gray_errors)))
+        gray_rmse = float(np.sqrt(np.mean(gray_errors**2)))
+
+    white_mae, white_rmse = _compute_metrics(true_vals, pred_vals)
+
+    elapsed = time.time() - t0
+    print(f"  [{algo_label} | ClusterKNN|{similarity}|k={k_neighbors}] MAE={mae:.4f} "
+          f"RMSE={rmse:.4f} | Gray MAE={gray_mae:.4f} ({elapsed:.1f}s)")
+
+    return {
+        'scenario'    : 'cluster_knn',
+        'algo_label'  : algo_label,
+        'mae'         : mae,
+        'rmse'        : rmse,
+        'gray_mae'    : gray_mae,
+        'gray_rmse'   : gray_rmse,
+        'white_mae'   : white_mae,
+        'white_rmse'  : white_rmse,
+        'n_clusters'  : int(assignments.max()) + 1,
+        'n_train'     : len(train),
+        'n_test'      : len(test),
+        'time_seconds': elapsed,
+        'cluster_mae_std' : float('nan'),
+        'cluster_mae_mean': float('nan'),
+        'cluster_mae_min' : float('nan'),
+        'cluster_mae_max' : float('nan'),
+        'precision_at_10' : float('nan'),
+        'recall_at_10'    : float('nan'),
+        'f1_at_10'        : float('nan'),
+        'similarity'      : similarity,
+        'k_neighbors'     : k_neighbors,
+    }
+
+
 # ============================================================
 # GRAY SHEEP YARDIMCILAR
 # ============================================================
@@ -803,6 +991,7 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
                 run_global=True, mode='sharedV',
                 cluster_workers: Optional[int] = None,
                 assign_root: Optional[str] = None,
+                assign_suffix: str = '',
                 assignment_k: Optional[int] = None,
                 assignment_k_100k: Optional[int] = None,
                 assignment_k_1m: Optional[int] = None,
@@ -812,6 +1001,8 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
                 run_cluster_avg: bool = True,
                 top_n: int = 10,
                 relevance_threshold: float = 3.5,
+                similarity: str = 'pearson',
+                knn: int = 30,
                 use_svdpp: bool = False,
                 run_command: Optional[str] = None,
                 fold: Optional[int] = None):
@@ -862,7 +1053,9 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
             print(f"\n  [{label}] atlandı (filtre)")
             continue
 
-        assign_dir = _algo_assignment_dir(root, dataset_name, label, k_used)
+        assign_dir = _algo_assignment_dir(
+            root, dataset_name, label, k_used, assign_suffix=assign_suffix,
+        )
         if not os.path.exists(assign_dir):
             print(f"\n  [{label}] ATLANDI — assignment bulunamadı: {assign_dir}")
             continue
@@ -874,6 +1067,15 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
                 train, test, assignments, gray_mask, n_items, label,
                 top_n=top_n,
                 relevance_threshold=relevance_threshold,
+            )
+            row['dataset'] = dataset_name
+            results.append(row)
+
+            row = run_cluster_knn(
+                train, test, assignments, gray_mask, n_items, label,
+                similarity=similarity,
+                min_common=3,
+                k_neighbors=knn,
             )
             row['dataset'] = dataset_name
             results.append(row)
@@ -1096,6 +1298,10 @@ def parse_args():
         help='Assignment kök dizini (varsayılan: mealpy/results/assignments_lof)',
     )
     p.add_argument(
+        '--assign-suffix', type=str, default='',
+        help='Assignment klasör adına ek suffix (örn: _wnmf20, _zscore)',
+    )
+    p.add_argument(
         '--weighted-v', action='store_true',
         help='SharedV global V eğitiminde gray sheep rating ağırlığı 0.1',
     )
@@ -1118,6 +1324,16 @@ def parse_args():
     p.add_argument(
         '--relevance-threshold', type=float, default=3.5,
         help='Test rating >= bu değer relevant sayılır (cluster_avg P/R)',
+    )
+    p.add_argument(
+        '--similarity',
+        choices=['pearson', 'cosine'],
+        default='pearson',
+        help='kNN benzerlik metriği: pearson (default) veya cosine'
+    )
+    p.add_argument(
+        '--knn', type=int, default=30, metavar='K',
+        help='ClusterKNN: küme içi en fazla K komşu (varsayılan: 30)',
     )
     p.add_argument(
         '--svdpp', action='store_true',
@@ -1145,6 +1361,8 @@ def parse_args():
         help='Birikim CSV’sinde accum_label sütunu; verilmezse zaman damgası (YYYYMMDD_HHMMSS).',
     )
     args = p.parse_args()
+    if args.knn < 1:
+        p.error('--knn en az 1 olmalı')
     if args.assignment_k is not None and (
         args.assignment_k_100k is not None or args.assignment_k_1m is not None
     ):
@@ -1300,6 +1518,7 @@ if __name__ == '__main__':
                         mode=args.mode,
                         cluster_workers=args.jobs,
                         assign_root=args.assign_root,
+                        assign_suffix=args.assign_suffix,
                         assignment_k=K,
                         assignment_k_100k=None,
                         assignment_k_1m=None,
@@ -1309,6 +1528,8 @@ if __name__ == '__main__':
                         run_cluster_avg=not args.no_cluster_avg,
                         top_n=args.top_n,
                         relevance_threshold=args.relevance_threshold,
+                        similarity=args.similarity,
+                        knn=args.knn,
                         use_svdpp=use_sp,
                         run_command=RUN_COMMAND,
                         fold=args.fold,
@@ -1324,6 +1545,7 @@ if __name__ == '__main__':
                         mode=args.mode,
                         cluster_workers=args.jobs,
                         assign_root=args.assign_root,
+                        assign_suffix=args.assign_suffix,
                         assignment_k=K,
                         assignment_k_100k=None,
                         assignment_k_1m=None,
@@ -1333,6 +1555,8 @@ if __name__ == '__main__':
                         run_cluster_avg=not args.no_cluster_avg,
                         top_n=args.top_n,
                         relevance_threshold=args.relevance_threshold,
+                        similarity=args.similarity,
+                        knn=args.knn,
                         use_svdpp=use_sp,
                         run_command=RUN_COMMAND,
                         fold=args.fold,

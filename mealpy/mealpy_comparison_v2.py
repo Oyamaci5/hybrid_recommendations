@@ -17,6 +17,7 @@ assert _spec.loader is not None
 _spec.loader.exec_module(_mod)
 
 load_movielens = _mod.load_movielens
+load_movielens_1m = _mod.load_movielens_1m
 mkmeans_plus_plus_init = _mod.mkmeans_plus_plus_init
 compute_wcss_fast = _mod.compute_wcss_fast
 detect_gray_sheep = _mod.detect_gray_sheep
@@ -28,6 +29,7 @@ get_special_params = _mod.get_special_params
 
 __all__ = [
     "load_movielens",
+    "load_movielens_1m",
     "mkmeans_plus_plus_init",
     "compute_wcss_fast",
     "detect_gray_sheep",
