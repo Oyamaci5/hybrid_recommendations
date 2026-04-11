@@ -1028,55 +1028,60 @@ def _mp_run_algo_job(job):
     N_EPOCHS_GLOBAL  = eg
     N_EPOCHS_CLUSTER = ec
 
-    if not os.path.exists(assign_dir):
-        print(f"\n  [{label}] ATLANDI — assignment bulunamadı: {assign_dir}")
+    try:
+        assignments, gray_mask = load_assignment(assign_dir)
+        rows: List[dict] = []
+
+        if run_cluster_avg_flag:
+            row = run_cluster_average(
+                train, test, assignments, gray_mask, n_items, label,
+                top_n=top_n,
+                relevance_threshold=relevance_threshold,
+            )
+            row['dataset'] = dataset_name
+            rows.append(row)
+
+            row = run_cluster_knn(
+                train, test, assignments, gray_mask, n_items, label,
+                similarity=similarity,
+                min_common=3,
+                k_neighbors=knn,
+            )
+            row['dataset'] = dataset_name
+            rows.append(row)
+
+        if mode in ('full', 'all'):
+            row = run_cluster_full(
+                train, test, assignments, gray_mask, n_items, label,
+                max_workers=eff_cluster_workers,
+                use_svdpp=use_svdpp,
+            )
+            row['dataset'] = dataset_name
+            rows.append(row)
+
+        if mode in ('sharedV', 'all'):
+            row = run_cluster_sharedV(
+                train, test, assignments, gray_mask, n_items, label,
+                max_workers=eff_cluster_workers,
+                out_dir=out_dir,
+                weighted_v=weighted_v,
+                use_bias=use_bias,
+                use_cluster_bias=use_cluster_bias,
+                use_svdpp=use_svdpp,
+                run_command=run_command,
+            )
+            row['dataset'] = dataset_name
+            rows.append(row)
+
+        return label, rows
+
+    except Exception as exc:
+        import traceback
+        print(f"\n  [{label}] HATA — paralel worker başarısız:\n"
+              f"    {type(exc).__name__}: {exc}\n"
+              + "".join(f"    {l}" for l in traceback.format_exc().splitlines(keepends=True)),
+              flush=True)
         return label, []
-
-    assignments, gray_mask = load_assignment(assign_dir)
-    rows: List[dict] = []
-
-    if run_cluster_avg_flag:
-        row = run_cluster_average(
-            train, test, assignments, gray_mask, n_items, label,
-            top_n=top_n,
-            relevance_threshold=relevance_threshold,
-        )
-        row['dataset'] = dataset_name
-        rows.append(row)
-
-        row = run_cluster_knn(
-            train, test, assignments, gray_mask, n_items, label,
-            similarity=similarity,
-            min_common=3,
-            k_neighbors=knn,
-        )
-        row['dataset'] = dataset_name
-        rows.append(row)
-
-    if mode in ('full', 'all'):
-        row = run_cluster_full(
-            train, test, assignments, gray_mask, n_items, label,
-            max_workers=eff_cluster_workers,
-            use_svdpp=use_svdpp,
-        )
-        row['dataset'] = dataset_name
-        rows.append(row)
-
-    if mode in ('sharedV', 'all'):
-        row = run_cluster_sharedV(
-            train, test, assignments, gray_mask, n_items, label,
-            max_workers=eff_cluster_workers,
-            out_dir=out_dir,
-            weighted_v=weighted_v,
-            use_bias=use_bias,
-            use_cluster_bias=use_cluster_bias,
-            use_svdpp=use_svdpp,
-            run_command=run_command,
-        )
-        row['dataset'] = dataset_name
-        rows.append(row)
-
-    return label, rows
 
 
 
