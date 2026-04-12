@@ -79,6 +79,10 @@ def load_ratings_1m(ratings_path: str, test_ratio: float = 0.2,
     fold=2..5: KFold(n_splits=5, shuffle=True, random_state=random_seed) parçası splits[fold-1].
     Dosya formatı: UserID::MovieID::Rating::Timestamp
 
+    Kullanıcı ve film ID'leri yalnızca 1 çıkarılarak 0-indexed yapılır (ML-100K ile tutarlı).
+    Bu şekilde ID'ler, generate_assignments.py'nin ürettiği assignments.npy dizisiyle
+    doğrudan uyumlu olur — ek yeniden numaralandırma yapılmaz.
+
     Parametreler
     ------------
     ratings_path : str   — ratings.dat dosya yolu
@@ -88,7 +92,8 @@ def load_ratings_1m(ratings_path: str, test_ratio: float = 0.2,
 
     Döndürür
     --------
-    (train_ratings, test_ratings)
+    (train_ratings, test_ratings) : her biri shape (n, 3) array
+        sütunlar: [user_id, item_id, rating], user_id ve item_id 0-indexed
     """
     if fold is not None and not (1 <= fold <= 5):
         raise ValueError(f"load_ratings_1m: fold None veya 1..5 olmalı, gelen: {fold}")
@@ -102,8 +107,8 @@ def load_ratings_1m(ratings_path: str, test_ratio: float = 0.2,
             parts = line.split('::')
             if len(parts) >= 3:
                 rows.append((
-                    int(parts[0]) - 1,   # 0-indexed
-                    int(parts[1]) - 1,
+                    int(parts[0]) - 1,   # 1-indexed → 0-indexed
+                    int(parts[1]) - 1,   # 1-indexed → 0-indexed
                     float(parts[2]),
                 ))
 
@@ -123,26 +128,13 @@ def load_ratings_1m(ratings_path: str, test_ratio: float = 0.2,
         train_df = df.iloc[train_idx]
         test_df = df.iloc[test_idx]
 
-    combo = pd.concat([train_df, test_df], axis=0)
-    unique_users = np.sort(combo['user_id'].unique())
-    unique_items = np.sort(combo['item_id'].unique())
-    u_map = {int(u): i for i, u in enumerate(unique_users)}
-    i_map = {int(i): j for j, i in enumerate(unique_items)}
-
-    train_df = train_df.copy()
-    test_df = test_df.copy()
-    train_df['user_id'] = train_df['user_id'].map(u_map)
-    train_df['item_id'] = train_df['item_id'].map(i_map)
-    test_df['user_id'] = test_df['user_id'].map(u_map)
-    test_df['item_id'] = test_df['item_id'].map(i_map)
-
     train = train_df[['user_id', 'item_id', 'rating']].values.astype(np.float32)
     test = test_df[['user_id', 'item_id', 'rating']].values.astype(np.float32)
 
     print(f"ML-1M yüklendi")
     print(f"  Train: {len(train):,} rating")
     print(f"  Test : {len(test):,} rating")
-    print(f"  Kullanıcı: {int(train[:,0].max())+1}, Film: {int(train[:,1].max())+1}")
+    print(f"  Kullanıcı: {int(train[:,0].max())+1}, Film: {int(max(train[:,1].max(), test[:,1].max()))+1}")
 
     return train, test
 

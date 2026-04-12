@@ -1127,7 +1127,7 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
     print(f"Assignment K  : {k_used} (klasör eki: {'yok' if k_used == dk else f'_k{k_used}'})")
     print(f"Assignment kök: {root}")
 
-    n_items = int(train[:, 1].max()) + 1
+    n_items = int(max(train[:, 1].max(), test[:, 1].max())) + 1
     results = []
     if fold is None:
         k_dir = os.path.join(OUT_ROOT, dataset_name, f'k{k_used}')
