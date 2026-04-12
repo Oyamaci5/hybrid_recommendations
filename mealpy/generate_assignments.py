@@ -775,8 +775,8 @@ def parse_args():
     p.add_argument('--data-1m',   default=DATA_1M)
     p.add_argument(
         '--jobs', type=int, default=None,
-        help='Paralel algoritma süreç sayısı (varsayılan: 1 = sıralı; '
-             '2+ veya 0=CPU ile sınırlandırılmış havuz)',
+        help='Paralel algoritma süreç sayısı (varsayılan: otomatik = CPU sayısına göre; '
+             '1=sıralı, 2+=belirtilen sayıda süreç, 0=CPU ile sınırlandırılmış havuz)',
     )
     args = p.parse_args()
     if args.k is not None and (args.k_100k is not None or args.k_1m is not None):
@@ -845,7 +845,9 @@ if __name__ == '__main__':
     print(f"Epoch       : baseline={BASELINE_EPOCH}, global={GLOBAL_EPOCH}, local={LOCAL_EPOCH}")
     print(f"Pop size    : {POP_SIZE}  |  Seed: {SEED}")
     print(f"Çıktı kökü  : {out_root}")
-    if args.jobs is None or args.jobs == 1:
+    if args.jobs is None:
+        print("Paralellik    : otomatik (CPU sayısına göre; --jobs 1 ile sıralı mod)")
+    elif args.jobs == 1:
         print("Paralellik    : sıralı (tek süreç)")
     elif args.jobs <= 0:
         print("Paralellik    : süreç havuzu (iş ve CPU sayısına göre)")
@@ -856,10 +858,10 @@ if __name__ == '__main__':
     t_total = time.time()
 
     def _pool_cap():
-        if args.jobs is None or args.jobs == 1:
+        if args.jobs == 1:
             return 1
-        if args.jobs <= 0:
-            return None
+        if args.jobs is None or args.jobs <= 0:
+            return None  # otomatik: _resolve_pool_workers CPU sayısını kullanır
         return args.jobs
 
     zscore_suffix = '_zscore' if args.zscore else ''

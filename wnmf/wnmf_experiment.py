@@ -18,6 +18,8 @@ Kullanım:
     python wnmf_experiment.py --dataset 100k --mode sharedV   # sadece sharedV
     python wnmf_experiment.py --dataset 100k --mode all       # her iki mod
     python wnmf_experiment.py --dataset 100k --jobs 4        # küme başına 4 süreç (-j 4)
+    python wnmf_experiment.py --dataset 100k --algo-jobs 4   # algo başına 4 süreç (yeni)
+    python wnmf_experiment.py --dataset 100k --algo-jobs 0   # algo-düzeyinde otomatik paralel (yeni)
     python wnmf_experiment.py --dataset 100k --k 70        # assignment ..._k70 ile aynı K
     python wnmf_experiment.py --dataset 100k --k 20 30 50 90  # birden fazla K sırayla (tek komut)
     python wnmf_experiment.py --dataset 100k --k 30 --no-global --latent-dim 10 20 50 100 --algo H4_MFO+HHO
@@ -984,12 +986,109 @@ def _compute_metrics(true_list, pred_list):
 
 
 # ============================================================
-# DATASET ÇALIŞTIRICI
+# ALGO-DÜZEYİNDE PARALEL WORKER
 # ============================================================
+
+def _mp_run_algo_job(job):
+    """
+    Pickle edilebilir modül-düzeyinde worker — bir algoritma etiketinin
+    tüm senaryolarını çalıştırır (--algo-jobs ile açılan ProcessPoolExecutor için).
+
+    Çocuk süreçler modülü sıfırdan yükler ve modül globallerini varsayılan
+    değerlerle başlatır; hiperparametre değerleri job tuple'ından aktarılır.
+    """
+    (
+        label,
+        assign_dir,
+        train,
+        test,
+        n_items,
+        dataset_name,
+        mode,
+        eff_cluster_workers,
+        weighted_v,
+        use_bias,
+        use_cluster_bias,
+        use_svdpp,
+        run_cluster_avg_flag,
+        top_n,
+        relevance_threshold,
+        similarity,
+        knn,
+        out_dir,
+        run_command,
+        ld, lr, reg, eg, ec,
+    ) = job
+
+    # Çocuk süreçte hiperparametre globallerini geçerli değerlere ayarla
+    global LATENT_DIM, LEARNING_RATE, REGULARIZATION, N_EPOCHS_GLOBAL, N_EPOCHS_CLUSTER
+    LATENT_DIM       = ld
+    LEARNING_RATE    = lr
+    REGULARIZATION   = reg
+    N_EPOCHS_GLOBAL  = eg
+    N_EPOCHS_CLUSTER = ec
+
+    try:
+        assignments, gray_mask = load_assignment(assign_dir)
+        rows: List[dict] = []
+
+        if run_cluster_avg_flag:
+            row = run_cluster_average(
+                train, test, assignments, gray_mask, n_items, label,
+                top_n=top_n,
+                relevance_threshold=relevance_threshold,
+            )
+            row['dataset'] = dataset_name
+            rows.append(row)
+
+            row = run_cluster_knn(
+                train, test, assignments, gray_mask, n_items, label,
+                similarity=similarity,
+                min_common=3,
+                k_neighbors=knn,
+            )
+            row['dataset'] = dataset_name
+            rows.append(row)
+
+        if mode in ('full', 'all'):
+            row = run_cluster_full(
+                train, test, assignments, gray_mask, n_items, label,
+                max_workers=eff_cluster_workers,
+                use_svdpp=use_svdpp,
+            )
+            row['dataset'] = dataset_name
+            rows.append(row)
+
+        if mode in ('sharedV', 'all'):
+            row = run_cluster_sharedV(
+                train, test, assignments, gray_mask, n_items, label,
+                max_workers=eff_cluster_workers,
+                out_dir=out_dir,
+                weighted_v=weighted_v,
+                use_bias=use_bias,
+                use_cluster_bias=use_cluster_bias,
+                use_svdpp=use_svdpp,
+                run_command=run_command,
+            )
+            row['dataset'] = dataset_name
+            rows.append(row)
+
+        return label, rows
+
+    except Exception as exc:
+        import traceback
+        print(f"\n  [{label}] HATA — paralel worker başarısız:\n"
+              f"    {type(exc).__name__}: {exc}\n"
+              + "".join(f"    {l}" for l in traceback.format_exc().splitlines(keepends=True)),
+              flush=True)
+        return label, []
+
+
 
 def run_dataset(dataset_name, train, test, algo_filter=None,
                 run_global=True, mode='sharedV',
                 cluster_workers: Optional[int] = None,
+                algo_workers: Optional[int] = None,
                 assign_root: Optional[str] = None,
                 assign_suffix: str = '',
                 assignment_k: Optional[int] = None,
@@ -1039,6 +1138,20 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
     os.makedirs(out_dir, exist_ok=True)
     print(f"Sonuç klasörü  : {out_dir}")
 
+    # Mevcut hiperparametre değerlerini yakala (worker süreçlerde kullanılır)
+    _ld  = LATENT_DIM
+    _lr  = LEARNING_RATE
+    _reg = REGULARIZATION
+    _eg  = N_EPOCHS_GLOBAL
+    _ec  = N_EPOCHS_CLUSTER
+
+    # Algo-düzeyinde paralel iş sayısını belirle
+    _n_candidate = len(algo_filter) if algo_filter else len(ALGO_LABELS)
+    nw_algo = _resolve_pool_workers(algo_workers, _n_candidate)
+    # İç içe ProcessPoolExecutor CPU'yu aşırı yükler; algo paralelse küme içi
+    # paralelliği kapat.
+    eff_cluster_workers = 1 if nw_algo > 1 else cluster_workers
+
     # Global WNMF baseline
     if run_global:
         row = run_global_wnmf(
@@ -1047,7 +1160,8 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
         row['dataset'] = dataset_name
         results.append(row)
 
-    # Her algoritma
+    # Her algoritma — önce geçerli etiket/dizin çiftlerini topla
+    active_algos: List[Tuple[str, str]] = []
     for label in ALGO_LABELS:
         if algo_filter and label not in algo_filter:
             print(f"\n  [{label}] atlandı (filtre)")
@@ -1060,48 +1174,73 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
             print(f"\n  [{label}] ATLANDI — assignment bulunamadı: {assign_dir}")
             continue
 
-        assignments, gray_mask = load_assignment(assign_dir)
+        active_algos.append((label, assign_dir))
 
-        if run_cluster_avg:
-            row = run_cluster_average(
-                train, test, assignments, gray_mask, n_items, label,
-                top_n=top_n,
-                relevance_threshold=relevance_threshold,
+    if nw_algo > 1 and len(active_algos) > 1:
+        print(f"\n  Algoritmalar paralel çalıştırılıyor: "
+              f"{len(active_algos)} iş, en fazla {nw_algo} süreç "
+              f"(küme içi paralellik: kapalı)")
+        jobs = [
+            (
+                label, assign_dir,
+                train, test, n_items, dataset_name, mode,
+                eff_cluster_workers, weighted_v, use_bias, use_cluster_bias, use_svdpp,
+                run_cluster_avg, top_n, relevance_threshold, similarity, knn,
+                out_dir, run_command,
+                _ld, _lr, _reg, _eg, _ec,
             )
-            row['dataset'] = dataset_name
-            results.append(row)
+            for label, assign_dir in active_algos
+        ]
+        with ProcessPoolExecutor(max_workers=nw_algo) as pool:
+            algo_results = list(pool.map(_mp_run_algo_job, jobs))
+        # ALGO_LABELS sırasını koru
+        label_to_rows = {lbl: rows for lbl, rows in algo_results}
+        for label, _ in active_algos:
+            results.extend(label_to_rows.get(label, []))
+    else:
+        for label, assign_dir in active_algos:
+            assignments, gray_mask = load_assignment(assign_dir)
 
-            row = run_cluster_knn(
-                train, test, assignments, gray_mask, n_items, label,
-                similarity=similarity,
-                min_common=3,
-                k_neighbors=knn,
-            )
-            row['dataset'] = dataset_name
-            results.append(row)
+            if run_cluster_avg:
+                row = run_cluster_average(
+                    train, test, assignments, gray_mask, n_items, label,
+                    top_n=top_n,
+                    relevance_threshold=relevance_threshold,
+                )
+                row['dataset'] = dataset_name
+                results.append(row)
 
-        if mode in ('full', 'all'):
-            row = run_cluster_full(
-                train, test, assignments, gray_mask, n_items, label,
-                max_workers=cluster_workers,
-                use_svdpp=use_svdpp,
-            )
-            row['dataset'] = dataset_name
-            results.append(row)
+                row = run_cluster_knn(
+                    train, test, assignments, gray_mask, n_items, label,
+                    similarity=similarity,
+                    min_common=3,
+                    k_neighbors=knn,
+                )
+                row['dataset'] = dataset_name
+                results.append(row)
 
-        if mode in ('sharedV', 'all'):
-            row = run_cluster_sharedV(
-                train, test, assignments, gray_mask, n_items, label,
-                max_workers=cluster_workers,
-                out_dir=out_dir,
-                weighted_v=weighted_v,
-                use_bias=use_bias,
-                use_cluster_bias=use_cluster_bias,
-                use_svdpp=use_svdpp,
-                run_command=run_command,
-            )
-            row['dataset'] = dataset_name
-            results.append(row)
+            if mode in ('full', 'all'):
+                row = run_cluster_full(
+                    train, test, assignments, gray_mask, n_items, label,
+                    max_workers=cluster_workers,
+                    use_svdpp=use_svdpp,
+                )
+                row['dataset'] = dataset_name
+                results.append(row)
+
+            if mode in ('sharedV', 'all'):
+                row = run_cluster_sharedV(
+                    train, test, assignments, gray_mask, n_items, label,
+                    max_workers=cluster_workers,
+                    out_dir=out_dir,
+                    weighted_v=weighted_v,
+                    use_bias=use_bias,
+                    use_cluster_bias=use_cluster_bias,
+                    use_svdpp=use_svdpp,
+                    run_command=run_command,
+                )
+                row['dataset'] = dataset_name
+                results.append(row)
 
     meta = _result_row_meta(k_used)
     sub = os.path.basename(out_dir)
@@ -1276,6 +1415,14 @@ def parse_args():
         help='Küme eğitiminde paralel süreç sayısı; verilmezse CPU çekirdek sayısı',
     )
     p.add_argument(
+        '--algo-jobs', type=int, default=None,
+        dest='algo_jobs',
+        metavar='N',
+        help='Algoritma düzeyinde paralel süreç sayısı; verilmezse sıralı (1). '
+             '0=CPU sayısına göre otomatik. Her algoritmayı ayrı süreçte çalıştırır; '
+             '--algo-jobs etkinken --jobs (küme içi) otomatik 1 olur.',
+    )
+    p.add_argument(
         '--k', nargs='+', type=int, default=None,
         dest='assignment_k',
         metavar='K',
@@ -1429,6 +1576,7 @@ if __name__ == '__main__':
     print(f"  lr            : {lr_list}")
     print(f"  reg           : {reg_list}")
     print(f"Küme işçileri : {args.jobs or 'otomatik (CPU)'}")
+    print(f"Algo işçileri : {args.algo_jobs if args.algo_jobs else 'sıralı (1)'}")
     if args.assignment_k is not None:
         print(f"Assignment K  : {list(args.assignment_k)}")
     else:
@@ -1517,6 +1665,7 @@ if __name__ == '__main__':
                         run_global=not args.no_global,
                         mode=args.mode,
                         cluster_workers=args.jobs,
+                        algo_workers=args.algo_jobs,
                         assign_root=args.assign_root,
                         assign_suffix=args.assign_suffix,
                         assignment_k=K,
@@ -1544,6 +1693,7 @@ if __name__ == '__main__':
                         run_global=not args.no_global,
                         mode=args.mode,
                         cluster_workers=args.jobs,
+                        algo_workers=args.algo_jobs,
                         assign_root=args.assign_root,
                         assign_suffix=args.assign_suffix,
                         assignment_k=K,
