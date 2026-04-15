@@ -605,6 +605,7 @@ def run_cluster_sharedV(train, test, assignments, gray_mask,
         'cluster_mae_mean': cluster_mae_mean,
         'cluster_mae_min' : cluster_mae_min,
         'cluster_mae_max' : cluster_mae_max,
+        'accuracy'        : float('nan'),
         'precision_at_10' : float('nan'),
         'recall_at_10'    : float('nan'),
         'f1_at_10'        : float('nan'),
@@ -661,6 +662,14 @@ def compute_precision_recall(train, test, assignments,
     return p, r, f1
 
 
+def _compute_binary_accuracy(true_vals, pred_vals, threshold=3.5):
+    if not true_vals:
+        return float('nan')
+    true_bin = np.array(true_vals, dtype=np.float32) >= float(threshold)
+    pred_bin = np.array(pred_vals, dtype=np.float32) >= float(threshold)
+    return float(np.mean(true_bin == pred_bin))
+
+
 def run_cluster_average(train, test, assignments, gray_mask,
                         n_items, algo_label, top_n: int = 10,
                         relevance_threshold: float = 3.5):
@@ -709,6 +718,9 @@ def run_cluster_average(train, test, assignments, gray_mask,
     all_true = true_vals + gray_true
     all_pred = pred_vals + gray_pred
     mae, rmse = _compute_metrics(all_true, all_pred)
+    accuracy = _compute_binary_accuracy(
+        all_true, all_pred, threshold=relevance_threshold
+    )
 
     gray_mae, gray_rmse = float('nan'), float('nan')
     if gray_true:
@@ -739,6 +751,7 @@ def run_cluster_average(train, test, assignments, gray_mask,
         'cluster_mae_mean': float('nan'),
         'cluster_mae_min' : float('nan'),
         'cluster_mae_max' : float('nan'),
+        'accuracy'        : accuracy,
         'precision_at_10' : precision,
         'recall_at_10'    : recall,
         'f1_at_10'        : f1,
@@ -923,6 +936,7 @@ def run_cluster_knn(train, test, assignments, gray_mask,
         'cluster_mae_mean': float('nan'),
         'cluster_mae_min' : float('nan'),
         'cluster_mae_max' : float('nan'),
+        'accuracy'        : float('nan'),
         'precision_at_10' : float('nan'),
         'recall_at_10'    : float('nan'),
         'f1_at_10'        : float('nan'),
@@ -1455,16 +1469,16 @@ def _print_summary(results, dataset_name):
         print(
             f"{'tag':<36} {'Algoritma':<16} {'Senaryo':<14} {'MAE':>8} {'RMSE':>8} "
             f"{'ClStd':>8} {'GS MAE':>8} {'Wh MAE':>8} "
-            f"{'P@10':>8} {'R@10':>8} {'F1':>8}"
+            f"{'Acc':>8} {'Prec':>8} {'Rec':>8} {'F1':>8}"
         )
-        w = 36 + 16 + 14 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 6
+        w = 36 + 16 + 14 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 6
     else:
         print(
             f"{'Algoritma':<20} {'Senaryo':<16} {'MAE':>8} {'RMSE':>8} "
             f"{'ClStd':>8} {'GS MAE':>8} {'Wh MAE':>8} "
-            f"{'P@10':>8} {'R@10':>8} {'F1':>8}"
+            f"{'Acc':>8} {'Prec':>8} {'Rec':>8} {'F1':>8}"
         )
-        w = 72 + 8 + 8 + 8 + 8
+        w = 72 + 8 + 8 + 8 + 8 + 8
     print("-" * max(w, 72))
 
     for r in results:
@@ -1472,6 +1486,8 @@ def _print_summary(results, dataset_name):
         gs_str = f"{gs:.4f}" if not (isinstance(gs, float) and np.isnan(gs)) else "  —  "
         wh = r.get('white_mae', float('nan'))
         wh_str = f"{wh:.4f}" if not (isinstance(wh, float) and np.isnan(wh)) else "  —  "
+        acc = r.get('accuracy', float('nan'))
+        acc_str = f"{acc:.4f}" if not (isinstance(acc, float) and np.isnan(acc)) else "  —  "
         pr = r.get('precision_at_10', float('nan'))
         pr_str = f"{pr:.4f}" if not (isinstance(pr, float) and np.isnan(pr)) else "  —  "
         rc = r.get('recall_at_10', float('nan'))
@@ -1495,6 +1511,7 @@ def _print_summary(results, dataset_name):
                 f"{cms_str:>8} "
                 f"{gs_str:>8} "
                 f"{wh_str:>8} "
+                f"{acc_str:>8} "
                 f"{pr_str:>8} "
                 f"{rc_str:>8} "
                 f"{f1_str:>8}"
@@ -1508,6 +1525,7 @@ def _print_summary(results, dataset_name):
                 f"{cms_str:>8} "
                 f"{gs_str:>8} "
                 f"{wh_str:>8} "
+                f"{acc_str:>8} "
                 f"{pr_str:>8} "
                 f"{rc_str:>8} "
                 f"{f1_str:>8}"
