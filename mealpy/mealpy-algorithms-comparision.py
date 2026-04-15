@@ -88,6 +88,7 @@ def load_movielens_1m(path):
         path, sep='::',
         names=['user_id', 'item_id', 'rating', 'timestamp'],
         engine='python',
+        encoding='latin-1',
     )
     matrix = df.pivot_table(
         index='user_id',
@@ -266,7 +267,9 @@ def get_special_params(algo_name, epoch, pop_size):
             'ST': 0.8, 'PD': 0.2, 'SD': 0.1
         },
     }
-    return special.get(algo_name, None)
+    return special.get(
+        algo_name, {'epoch': epoch, 'pop_size': pop_size}
+    )
 
 
 def get_all_algorithms_v3():

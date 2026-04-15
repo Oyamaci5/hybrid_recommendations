@@ -47,7 +47,7 @@ def prepare_ml1m_split(data_dir: str = "data/ml-1m", output_dir: str = "data/ml-
         for rating in train_ratings:
             user_id = int(rating[0]) + 1  # Convert back to 1-indexed
             item_id = int(rating[1]) + 1  # Convert back to 1-indexed
-            rating_val = int(rating[2])
+            rating_val = float(rating[2])
             timestamp = 978300000  # Placeholder timestamp
             f.write(f"{user_id}::{item_id}::{rating_val}::{timestamp}\n")
     
@@ -57,7 +57,7 @@ def prepare_ml1m_split(data_dir: str = "data/ml-1m", output_dir: str = "data/ml-
         for rating in test_ratings:
             user_id = int(rating[0]) + 1  # Convert back to 1-indexed
             item_id = int(rating[1]) + 1  # Convert back to 1-indexed
-            rating_val = int(rating[2])
+            rating_val = float(rating[2])
             timestamp = 978300000  # Placeholder timestamp
             f.write(f"{user_id}::{item_id}::{rating_val}::{timestamp}\n")
     

@@ -26,10 +26,8 @@ Kullanım:
     python wnmf_experiment.py --dataset 100k --k 30 --no-global --reg 0.001 0.01 0.1 --lr 0.001 0.01
     python wnmf_experiment.py --dataset 100k --k 30 --epochs-global 50 100 150 200 --epochs-cluster 25 50 75 100
     python wnmf_experiment.py --dataset 1m --k 30 --algo H4_MFO+HHO --epochs-grid \\
-        --epochs-global 50 100 150 --epochs-cluster 50 75 100 150 200 \\
-        --accum-csv results/wnmf/ml1m/k30/accum_hyper_sweep.csv --accum-label sweep_apr10
-    python wnmf_experiment.py --dataset both --k 30 70 --algo H4_MFO+HHO --compare-mf-svdpp \\
-        --accum-csv results/wnmf/compare_mf_svdpp_k30_k70.csv --accum-label full_table
+        --epochs-global 50 100 150 --epochs-cluster 50 75 100 150 200
+    python wnmf_experiment.py --dataset both --k 30 70 --algo H4_MFO+HHO --compare-mf-svdpp
     python wnmf_experiment.py --dataset 1m --k 70            # .../B1_HHO_k70/ vb.
     python wnmf_experiment.py --k-100k 90 --k-1m 70        # dataset başına ayrı K (--k çoklu ile birlikte kullanılmaz)
 
@@ -45,6 +43,7 @@ import os
 import re
 import shlex
 import sys
+import sys as _sys
 import time
 from concurrent.futures import ProcessPoolExecutor
 from itertools import product
@@ -54,7 +53,18 @@ import numpy as np
 import pandas as pd
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(BASE_DIR)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 sys.path.insert(0, BASE_DIR)
+
+try:
+    from assignment_db import start_run, finish_run, save_wnmf_result, init_db
+    init_db()
+    _DB_AVAILABLE = True
+except ImportError:
+    _DB_AVAILABLE = False
+_CURRENT_RUN_ID = None
 
 from wnmf_model import ClusterWNMF, WNMFModel, WNMFSharedV
 from wnmf_utils import (
@@ -63,7 +73,6 @@ from wnmf_utils import (
     load_assignment,
     split_by_cluster,
     remap_user_ids,
-    append_rows_to_accum_csv,
     save_dataframe_csv,
     save_results,
 )
@@ -92,7 +101,7 @@ RANDOM_SEED      = 42
 ALGO_LABELS = [
     'B0_KMEANS',
     'B1_HHO', 'B2_HGS', 'H1_HHO+HGS', 'H4_MFO+HHO',
-    'H9_QSA+CDO', 'H12_MFO+CDO',
+    'H9_QSA+CDO', 'H12_MFO+CDO', 'H13_HHO+GAop',
     # generate_assignments.py ALGO_CONFIG — önce --lof ile atama üretin
     'LIT_GOA', 'LIT_GWO', 'LIT_SSA',
 ]
@@ -127,11 +136,6 @@ def _expand_epoch_pairs(
 def _epoch_cartesian_pairs(eg: List[int], ec: List[int]) -> List[Tuple[int, int]]:
     """Tüm (epochs_global, epochs_cluster) kombinasyonları."""
     return list(product(eg, ec))
-
-
-def _hyperparam_line(eg: int, ec: int, ld: int, lr: float, reg: float) -> str:
-    """Özet dosyada arama için tek satırlık etiket."""
-    return f"eg{eg}_ec{ec}_ld{ld}_lr{lr:g}_r{reg:g}"
 
 
 def _format_hyperparam_tag(k_used: int) -> str:
@@ -1104,14 +1108,17 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
                 knn: int = 30,
                 use_svdpp: bool = False,
                 run_command: Optional[str] = None,
+                args=None,
                 fold: Optional[int] = None):
     """
     Bir dataset üzerinde tüm senaryoları çalıştır.
 
     mode parametresi:
-        'sharedV' — sadece SharedV (önerilen, hızlı)
-        'full'    — sadece her küme U+V (eski versiyon)
-        'all'     — her ikisi de (karşılaştırma için)
+        'baselines' — küme ortalaması + küme içi kNN CF (+ isteğe bağlı global WNMF);
+                      WNMF küme modeli (full/sharedV) çalışmaz. Tüm --assign-suffix ile uyumlu.
+        'sharedV'   — baselines (varsayılan açık) + SharedV WNMF (önerilen)
+        'full'      — baselines + her küme ayrı U+V WNMF
+        'all'       — baselines + full + sharedV
 
     Assignment klasörü: mealpy/results/assignments_lof/{dataset}/{label} veya
     K ≠ varsayılan ise {label}_k{K} (generate_assignments ile aynı kural).
@@ -1160,6 +1167,32 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
         row['dataset'] = dataset_name
         results.append(row)
 
+        if _DB_AVAILABLE:
+            save_wnmf_result(
+                dataset=dataset_name,
+                algo=row['algo_label'],
+                k=k_used,
+                preprocessing=getattr(args, 'assign_suffix', '').lstrip('_') or 'none',
+                scenario=row['scenario'],
+                mae=row['mae'],
+                rmse=row['rmse'],
+                gray_mae=row.get('gray_mae'),
+                gray_rmse=row.get('gray_rmse'),
+                white_mae=row.get('white_mae'),
+                white_rmse=row.get('white_rmse'),
+                precision_at_10=row.get('precision_at_10'),
+                recall_at_10=row.get('recall_at_10'),
+                f1_at_10=row.get('f1_at_10'),
+                n_train=row['n_train'],
+                n_test=row['n_test'],
+                latent_dim=args.latent_dim,
+                epochs_global=args.epochs_global,
+                epochs_cluster=args.epochs_cluster,
+                reg=args.reg,
+                lr=args.lr,
+                time_seconds=row['time_seconds'],
+            )
+
     # Her algoritma — önce geçerli etiket/dizin çiftlerini topla
     active_algos: List[Tuple[str, str]] = []
     for label in ALGO_LABELS:
@@ -1196,7 +1229,34 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
         # ALGO_LABELS sırasını koru
         label_to_rows = {lbl: rows for lbl, rows in algo_results}
         for label, _ in active_algos:
-            results.extend(label_to_rows.get(label, []))
+            chunk = label_to_rows.get(label, [])
+            results.extend(chunk)
+            for row in chunk:
+                if _DB_AVAILABLE:
+                    save_wnmf_result(
+                        dataset=dataset_name,
+                        algo=row['algo_label'],
+                        k=k_used,
+                        preprocessing=getattr(args, 'assign_suffix', '').lstrip('_') or 'none',
+                        scenario=row['scenario'],
+                        mae=row['mae'],
+                        rmse=row['rmse'],
+                        gray_mae=row.get('gray_mae'),
+                        gray_rmse=row.get('gray_rmse'),
+                        white_mae=row.get('white_mae'),
+                        white_rmse=row.get('white_rmse'),
+                        precision_at_10=row.get('precision_at_10'),
+                        recall_at_10=row.get('recall_at_10'),
+                        f1_at_10=row.get('f1_at_10'),
+                        n_train=row['n_train'],
+                        n_test=row['n_test'],
+                        latent_dim=args.latent_dim,
+                        epochs_global=args.epochs_global,
+                        epochs_cluster=args.epochs_cluster,
+                        reg=args.reg,
+                        lr=args.lr,
+                        time_seconds=row['time_seconds'],
+                    )
     else:
         for label, assign_dir in active_algos:
             assignments, gray_mask = load_assignment(assign_dir)
@@ -1210,6 +1270,32 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
                 row['dataset'] = dataset_name
                 results.append(row)
 
+                if _DB_AVAILABLE:
+                    save_wnmf_result(
+                        dataset=dataset_name,
+                        algo=row['algo_label'],
+                        k=k_used,
+                        preprocessing=getattr(args, 'assign_suffix', '').lstrip('_') or 'none',
+                        scenario=row['scenario'],
+                        mae=row['mae'],
+                        rmse=row['rmse'],
+                        gray_mae=row.get('gray_mae'),
+                        gray_rmse=row.get('gray_rmse'),
+                        white_mae=row.get('white_mae'),
+                        white_rmse=row.get('white_rmse'),
+                        precision_at_10=row.get('precision_at_10'),
+                        recall_at_10=row.get('recall_at_10'),
+                        f1_at_10=row.get('f1_at_10'),
+                        n_train=row['n_train'],
+                        n_test=row['n_test'],
+                        latent_dim=args.latent_dim,
+                        epochs_global=args.epochs_global,
+                        epochs_cluster=args.epochs_cluster,
+                        reg=args.reg,
+                        lr=args.lr,
+                        time_seconds=row['time_seconds'],
+                    )
+
                 row = run_cluster_knn(
                     train, test, assignments, gray_mask, n_items, label,
                     similarity=similarity,
@@ -1219,6 +1305,32 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
                 row['dataset'] = dataset_name
                 results.append(row)
 
+                if _DB_AVAILABLE:
+                    save_wnmf_result(
+                        dataset=dataset_name,
+                        algo=row['algo_label'],
+                        k=k_used,
+                        preprocessing=getattr(args, 'assign_suffix', '').lstrip('_') or 'none',
+                        scenario=row['scenario'],
+                        mae=row['mae'],
+                        rmse=row['rmse'],
+                        gray_mae=row.get('gray_mae'),
+                        gray_rmse=row.get('gray_rmse'),
+                        white_mae=row.get('white_mae'),
+                        white_rmse=row.get('white_rmse'),
+                        precision_at_10=row.get('precision_at_10'),
+                        recall_at_10=row.get('recall_at_10'),
+                        f1_at_10=row.get('f1_at_10'),
+                        n_train=row['n_train'],
+                        n_test=row['n_test'],
+                        latent_dim=args.latent_dim,
+                        epochs_global=args.epochs_global,
+                        epochs_cluster=args.epochs_cluster,
+                        reg=args.reg,
+                        lr=args.lr,
+                        time_seconds=row['time_seconds'],
+                    )
+
             if mode in ('full', 'all'):
                 row = run_cluster_full(
                     train, test, assignments, gray_mask, n_items, label,
@@ -1227,6 +1339,32 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
                 )
                 row['dataset'] = dataset_name
                 results.append(row)
+
+                if _DB_AVAILABLE:
+                    save_wnmf_result(
+                        dataset=dataset_name,
+                        algo=row['algo_label'],
+                        k=k_used,
+                        preprocessing=getattr(args, 'assign_suffix', '').lstrip('_') or 'none',
+                        scenario=row['scenario'],
+                        mae=row['mae'],
+                        rmse=row['rmse'],
+                        gray_mae=row.get('gray_mae'),
+                        gray_rmse=row.get('gray_rmse'),
+                        white_mae=row.get('white_mae'),
+                        white_rmse=row.get('white_rmse'),
+                        precision_at_10=row.get('precision_at_10'),
+                        recall_at_10=row.get('recall_at_10'),
+                        f1_at_10=row.get('f1_at_10'),
+                        n_train=row['n_train'],
+                        n_test=row['n_test'],
+                        latent_dim=args.latent_dim,
+                        epochs_global=args.epochs_global,
+                        epochs_cluster=args.epochs_cluster,
+                        reg=args.reg,
+                        lr=args.lr,
+                        time_seconds=row['time_seconds'],
+                    )
 
             if mode in ('sharedV', 'all'):
                 row = run_cluster_sharedV(
@@ -1241,6 +1379,32 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
                 )
                 row['dataset'] = dataset_name
                 results.append(row)
+
+                if _DB_AVAILABLE:
+                    save_wnmf_result(
+                        dataset=dataset_name,
+                        algo=row['algo_label'],
+                        k=k_used,
+                        preprocessing=getattr(args, 'assign_suffix', '').lstrip('_') or 'none',
+                        scenario=row['scenario'],
+                        mae=row['mae'],
+                        rmse=row['rmse'],
+                        gray_mae=row.get('gray_mae'),
+                        gray_rmse=row.get('gray_rmse'),
+                        white_mae=row.get('white_mae'),
+                        white_rmse=row.get('white_rmse'),
+                        precision_at_10=row.get('precision_at_10'),
+                        recall_at_10=row.get('recall_at_10'),
+                        f1_at_10=row.get('f1_at_10'),
+                        n_train=row['n_train'],
+                        n_test=row['n_test'],
+                        latent_dim=args.latent_dim,
+                        epochs_global=args.epochs_global,
+                        epochs_cluster=args.epochs_cluster,
+                        reg=args.reg,
+                        lr=args.lr,
+                        time_seconds=row['time_seconds'],
+                    )
 
     meta = _result_row_meta(k_used)
     sub = os.path.basename(out_dir)
@@ -1373,8 +1537,10 @@ def parse_args():
     )
     p.add_argument('--no-global', action='store_true')
     p.add_argument(
-        '--mode', choices=['sharedV', 'full', 'all'], default='sharedV',
-        help="sharedV=önerilen, full=eski versiyon, all=ikisi birden"
+        '--mode',
+        choices=['baselines', 'sharedV', 'full', 'all'],
+        default='sharedV',
+        help="baselines=küme ort.+kNN CF (+global), WNMF küme yok; sharedV=önerilen; full; all=hepsi",
     )
     p.add_argument(
         '--epochs-global', nargs='+', type=int, default=None,
@@ -1493,19 +1659,8 @@ def parse_args():
              'CSV’de use_svdpp sütunu ile ayrışır; --svdpp ile birlikte verilirse bu bayrak önceliklidir.',
     )
     p.add_argument(
-        '--accum-csv',
-        type=str,
-        default=None,
-        metavar='PATH',
-        help='Her hiperparametre kombinasyonundan sonra sonuç satırlarını bu CSV’ye ekler '
-             '(reg / lr / latent / epoch taramaları tek dosyada birikir).',
-    )
-    p.add_argument(
-        '--accum-label',
-        type=str,
-        default=None,
-        metavar='TAG',
-        help='Birikim CSV’sinde accum_label sütunu; verilmezse zaman damgası (YYYYMMDD_HHMMSS).',
+        '--note', type=str, default=None,
+        help='Bu run için açıklama notu (örn: "zscore karşılaştırma")',
     )
     args = p.parse_args()
     if args.knn < 1:
@@ -1539,6 +1694,24 @@ if __name__ == '__main__':
     args        = parse_args()
     RUN_COMMAND = shlex.join(sys.argv)
 
+    if _DB_AVAILABLE:
+        import sys as _sys
+        args.k = args.assignment_k[0] if args.assignment_k else None
+        args.reg = args.regularization[0] if args.regularization is not None else REGULARIZATION
+        args.lr = args.learning_rate[0] if args.learning_rate is not None else LEARNING_RATE
+        _CURRENT_RUN_ID = start_run(
+            command=' '.join(_sys.argv),
+            dataset=args.dataset,
+            k=args.k,
+            preprocessing=getattr(args, 'assign_suffix', '').lstrip('_') or 'none',
+            latent_dim=(args.latent_dim[0] if args.latent_dim is not None else LATENT_DIM),
+            epochs_global=(args.epochs_global[0] if args.epochs_global is not None else N_EPOCHS_GLOBAL),
+            epochs_cluster=(args.epochs_cluster[0] if args.epochs_cluster is not None else N_EPOCHS_CLUSTER),
+            reg=args.reg,
+            lr=args.lr,
+            note=getattr(args, 'note', None),
+        )
+
     ld_list  = args.latent_dim if args.latent_dim is not None else [LATENT_DIM]
     reg_list = args.regularization if args.regularization is not None else [REGULARIZATION]
     lr_list  = args.learning_rate if args.learning_rate is not None else [LEARNING_RATE]
@@ -1556,7 +1729,6 @@ if __name__ == '__main__':
 
     combos      = list(product(epoch_pairs, ld_list, lr_list, reg_list))
     multi_hyper = len(combos) > 1
-    accum_lbl   = args.accum_label if args.accum_label is not None else time.strftime('%Y%m%d_%H%M%S')
 
     os.makedirs(OUT_ROOT, exist_ok=True)
 
@@ -1584,8 +1756,6 @@ if __name__ == '__main__':
               f"(veya varsayılan 90/150)")
     if args.assign_root:
         print(f"Assignment kök: {args.assign_root}")
-    if args.accum_csv:
-        print(f"Birikim CSV   : {os.path.abspath(args.accum_csv)}  (etiket={accum_lbl})")
     if args.compare_mf_svdpp:
         print("MF vs SVD++   : --compare-mf-svdpp (her hiperparametre seti iki kez: MF sonra SVD++)")
     elif args.svdpp:
@@ -1653,6 +1823,11 @@ if __name__ == '__main__':
             LATENT_DIM       = ld
             LEARNING_RATE    = lr
             REGULARIZATION   = reg
+            args.reg = reg
+            args.lr = lr
+            args.latent_dim = ld
+            args.epochs_global = eg
+            args.epochs_cluster = ec
             print(f"\n>>> [{tag_sp}] Hiperparametre seti: ld={ld} lr={lr} reg={reg} eg={eg} ec={ec}")
 
             combo_rows: List[dict] = []
@@ -1678,10 +1853,11 @@ if __name__ == '__main__':
                         top_n=args.top_n,
                         relevance_threshold=args.relevance_threshold,
                         similarity=args.similarity,
-                        knn=args.knn,
-                        use_svdpp=use_sp,
-                        run_command=RUN_COMMAND,
-                        fold=args.fold,
+                knn=args.knn,
+                use_svdpp=use_sp,
+                run_command=RUN_COMMAND,
+                args=args,
+                fold=args.fold,
                     )
                     combo_rows.extend(rows)
 
@@ -1709,25 +1885,12 @@ if __name__ == '__main__':
                         knn=args.knn,
                         use_svdpp=use_sp,
                         run_command=RUN_COMMAND,
+                        args=args,
                         fold=args.fold,
                     )
                     combo_rows.extend(rows)
 
             all_rows.extend(combo_rows)
-
-            if args.accum_csv and combo_rows:
-                hp_line = _hyperparam_line(eg, ec, ld, lr, reg)
-                stamped = [
-                    {
-                        **r,
-                        'accum_label': accum_lbl,
-                        'hyperparam_line': hp_line,
-                        'model_variant': tag_sp,
-                        'cli_command': RUN_COMMAND,
-                    }
-                    for r in combo_rows
-                ]
-                append_rows_to_accum_csv(stamped, args.accum_csv)
 
     if all_rows and len(all_tags) > 1 and not multi_k and not multi_hyper:
         mode_tag     = f"mode-{args.mode}"
@@ -1737,6 +1900,9 @@ if __name__ == '__main__':
         combo_dir    = os.path.join(combo_base, f'run{combo_run}')
         fname        = f"wnmf_all_results_{combined_key}.csv"
         save_results(all_rows, combo_dir, fname, run_command=RUN_COMMAND)
+
+    if _DB_AVAILABLE and _CURRENT_RUN_ID:
+        finish_run(_CURRENT_RUN_ID, status='done')
 
     print(f"\n{'='*60}")
     print(f"TAMAMLANDI — {(time.time()-t_total)/60:.1f} dakika")

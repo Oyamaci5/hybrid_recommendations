@@ -43,10 +43,27 @@ import numpy as np
 import pandas as pd
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(BASE_DIR)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 sys.path.insert(0, BASE_DIR)
 _OPT_DIR = os.path.join(os.path.dirname(BASE_DIR), 'optimizers')
 if _OPT_DIR not in sys.path:
     sys.path.insert(0, _OPT_DIR)
+
+try:
+    from assignment_db import (
+        finish_run,
+        init_db,
+        save_assignment as db_save,
+        start_run,
+    )
+    init_db()
+    _DB_AVAILABLE = True
+except ImportError:
+    _DB_AVAILABLE = False
+    finish_run = None
+    start_run = None
 
 from mealpy_comparison_v2 import (
     load_movielens,
@@ -90,14 +107,17 @@ ALGO_CONFIG = [
     ('H1_HHO+HGS', 'HHO.OriginalHHO', 'HGS.OriginalHGS'),
     ('H4_MFO+HHO', 'MFO.OriginalMFO', 'HHO.OriginalHHO'),
     ('B3_MFO',     'MFO.OriginalMFO', None),
-    ('H9_QSA+CDO',  'QSA.LevyQSA',     'CDO.OriginalCDO'),
-    ('H12_MFO+CDO', 'MFO.OriginalMFO', 'CDO.OriginalCDO'),
+    ('H9_QSA+CDO',  'QSA.OriginalQSA',  'CDO.OriginalCDO'),
+    ('H12_MFO+CDO', 'MFO.OriginalMFO',  'CDO.OriginalCDO'),
+    ('H13_HHO+GAop', 'HHO.OriginalHHO', 'GAop'),
     ('H5_GAHHO',   'GAHHO.OriginalGAHHO', None),
     ('H5_EliteGA+HHO', 'GA.EliteMultiGA', 'HHO.OriginalHHO'),
     ('LIT_GOA', 'GOA.OriginalGOA', None),
     ('LIT_GWO', 'GWO.OriginalGWO', None),
     ('LIT_SSA', 'SSA.DevSSA', None),
 ]
+
+ALGO_LABELS = [c[0] for c in ALGO_CONFIG]
 
 # hybrid_test / rapor ile aynı etiketler; Wilcoxon çiftleri (klasör adı = ilk sütun)
 WILCOXON_PAIRS = [
@@ -293,7 +313,139 @@ def run_hybrid(g_info, l_info, matrix, K, init, g_epoch, l_epoch, pop_size):
         best_sol, best_fit, improved = l_model.g_best.solution, best_l_fit, True
     else:
         best_sol, best_fit, improved = best_g_sol, best_g_fit, False
-    print(f"    Lokal iyileştirdi: {improved}  →  Final WCSS: {best_fit:.4f}")
+    print(f"    Lokal iyilestirdi: {improved}  ->  Final WCSS: {best_fit:.4f}")
+    return best_sol, best_fit
+
+
+def run_parallel_hybrid(g_info, l_info, matrix, K, init, g_epoch, l_epoch, pop_size):
+    """Etikette '||' geçen hibrit: iki algoritmayı ayrı çalıştırıp en iyi WCSS'yi seçer."""
+    sol_g, fit_g = run_single(g_info, matrix, K, init, g_epoch, pop_size)
+    sol_l, fit_l = run_single(l_info, matrix, K, init, l_epoch, pop_size)
+    if fit_l < fit_g:
+        return sol_l, fit_l
+    return sol_g, fit_g
+
+
+def run_memetic_hybrid(base_info, matrix, K, init,
+                       total_epoch, pop_size,
+                       ga_inject_interval=10,
+                       ga_crossover_rate=0.3,
+                       ga_mutation_rate=0.1):
+    """
+    Memetic hibrit: Sürü algoritması + GA operatör enjeksiyonu.
+
+    Her ga_inject_interval epoch'ta:
+    - Popülasyonun ga_crossover_rate kadarına crossover uygulanır
+    - Popülasyonun ga_mutation_rate kadarına mutation uygulanır
+    - Çeşitlilik korunur, erken yakınsama önlenir
+
+    Literatür: "Hybrid Swarm-GA" / "Memetic Algorithm"
+
+    base_info: ana sürü algoritması (HHO önerilen)
+    """
+    import numpy as np
+
+    problem = _make_problem(matrix, K)
+    lb = np.array(problem["bounds"].lb)
+    ub = np.array(problem["bounds"].ub)
+    rng = np.random.default_rng(seed=42)
+    dim = len(lb)
+
+    # Başlangıç popülasyonu
+    current_pop = list(init[:pop_size])
+    best_sol = current_pop[0].copy()
+    best_fit = float('inf')
+
+    # Fitness hesapla
+    obj_fn = problem["obj_func"]
+    fits = [float(obj_fn(s)) for s in current_pop]
+    best_idx = int(np.argmin(fits))
+    best_fit = fits[best_idx]
+    best_sol = current_pop[best_idx].copy()
+
+    print(f"    Memetic hibrit: {total_epoch} epoch, "
+          f"GA enjeksiyonu her {ga_inject_interval} epoch")
+
+    epochs_done = 0
+    round_num = 0
+
+    while epochs_done < total_epoch:
+        # Bu round'da kaç epoch çalışacak
+        ep = min(ga_inject_interval, total_epoch - epochs_done)
+
+        # Sürü algoritmasını ep epoch çalıştır
+        sp = get_special_params(base_info['full_name'], ep, pop_size)
+        model = base_info['class'](
+            **(sp or {'epoch': ep, 'pop_size': pop_size})
+        )
+        try:
+            model.solve(problem, starting_solutions=current_pop)
+        except TypeError:
+            model.solve(problem)
+
+        # En iyiyi güncelle
+        new_fit = float(model.g_best.target.fitness)
+        if new_fit < best_fit:
+            best_fit = new_fit
+            best_sol = model.g_best.solution.copy()
+
+        # Mevcut popülasyonu al (mealpy: Optimizer.pop, Agent.solution)
+        pop = getattr(model, 'pop', None)
+        if not pop:
+            raise RuntimeError(
+                f"{base_info['full_name']}: solve sonrası popülasyon yok; "
+                'memetic hibrit bu optimizasyon sınıfı ile uyumlu değil.'
+            )
+        current_pop = [np.asarray(agent.solution, dtype=np.float64).copy() for agent in pop]
+        fits = [float(obj_fn(s)) for s in current_pop]
+
+        epochs_done += ep
+        round_num += 1
+
+        # GA operatör enjeksiyonu
+        if epochs_done < total_epoch:
+            n_cross = max(1, int(pop_size * ga_crossover_rate))
+            n_mut   = max(1, int(pop_size * ga_mutation_rate))
+
+            # Arithmetic Crossover
+            cross_idx = rng.choice(pop_size, size=n_cross * 2,
+                                   replace=False)
+            for i in range(0, len(cross_idx) - 1, 2):
+                p1 = current_pop[cross_idx[i]]
+                p2 = current_pop[cross_idx[i+1]]
+                alpha = rng.uniform(0.3, 0.7)
+                child = np.clip(alpha * p1 + (1-alpha) * p2, lb, ub)
+                child_fit = float(obj_fn(child))
+                # Daha kötü ebeveynin yerine koy
+                worse_idx = cross_idx[i] \
+                    if fits[cross_idx[i]] > fits[cross_idx[i+1]] \
+                    else cross_idx[i+1]
+                if child_fit < fits[worse_idx]:
+                    current_pop[worse_idx] = child
+                    fits[worse_idx] = child_fit
+
+            # Gaussian Mutation
+            mut_idx = rng.choice(pop_size, size=n_mut, replace=False)
+            scale = 0.05 * (ub - lb)
+            for idx in mut_idx:
+                mutant = np.clip(
+                    current_pop[idx] + rng.normal(0, scale), lb, ub
+                )
+                mutant_fit = float(obj_fn(mutant))
+                if mutant_fit < fits[idx]:
+                    current_pop[idx] = mutant
+                    fits[idx] = mutant_fit
+
+            # En iyiyi güncelle
+            round_best_idx = int(np.argmin(fits))
+            if fits[round_best_idx] < best_fit:
+                best_fit = fits[round_best_idx]
+                best_sol = current_pop[round_best_idx].copy()
+
+            print(f"    Round {round_num}: swarm={new_fit:.4f} "
+                  f"GA_inject → best={best_fit:.4f}")
+
+    print(f"    Final WCSS: {best_fit:.4f}")
     return best_sol, best_fit
 
 
@@ -302,7 +454,8 @@ def run_hybrid(g_info, l_info, matrix, K, init, g_epoch, l_epoch, pop_size):
 # ============================================================
 
 def save_assignment(assignments, gray_mask, best_sol, best_fit,
-                    save_dir, extra_data=None):
+                    save_dir, extra_data=None, label=None, K=None, args=None,
+                    run_id=None, seed=None):
     """
     Assignment dosyalarını kaydet.
     extra_data: LOF modunda lof_scores gibi ek veriler dict olarak geçilir.
@@ -334,7 +487,7 @@ def save_assignment(assignments, gray_mask, best_sol, best_fit,
 
     threshold = extra_data.get('threshold', '—') if extra_data else '—'
 
-    print(f"    ✓ Kaydedildi → {save_dir}")
+    print(f"    OK Kaydedildi -> {save_dir}")
     print(f"      WCSS          : {best_fit:.4f}")
     print(f"      Kullanıcı     : {len(assignments)}")
     print(f"      Gray sheep    : {gray_mask.sum()} ({gray_mask.mean()*100:.1f}%)")
@@ -342,6 +495,47 @@ def save_assignment(assignments, gray_mask, best_sol, best_fit,
           else f"      GS threshold  : {threshold}")
     print(f"      Küme boyutu   : min={active.min()}, "
           f"max={active.max()}, ort={active.mean():.1f}")
+
+    if _DB_AVAILABLE:
+        # preprocessing label belirle
+        prep_parts = []
+        if getattr(args, 'zscore', False):
+            prep_parts.append('zscore')
+        if getattr(args, 'pca', None):
+            if args.pca < 1.0:
+                prep_parts.append(f'pca{int(args.pca*100)}pct')
+            else:
+                prep_parts.append(f'pca{int(args.pca)}')
+        if getattr(args, 'wnmf_features', None):
+            prep_parts.append(f'wnmf{args.wnmf_features}')
+        preprocessing = '_'.join(prep_parts) if prep_parts else 'none'
+
+        # dataset adını belirle
+        ds = 'ml100k' if 'ml100k' in save_dir else 'ml1m'
+
+        lof_scores_arr = extra_data.get('lof_scores') if extra_data else None
+
+        db_save(
+            dataset=ds,
+            algo=label,
+            k=K,
+            preprocessing=preprocessing,
+            wcss=float(best_fit),
+            gray_count=int(gray_mask.sum()),
+            gray_ratio=float(gray_mask.mean()),
+            lof_threshold=float(extra_data.get('threshold', 0))
+                          if extra_data else 0.0,
+            n_users=len(assignments),
+            cluster_min=int(active.min()),
+            cluster_max=int(active.max()),
+            cluster_avg=float(active.mean()),
+            # best_sol_arr YOK
+            assignments_arr=assignments,
+            gray_mask_arr=gray_mask,
+            lof_scores_arr=lof_scores_arr,
+            run_id=run_id,
+            seed=seed,
+        )
 
 
 # ============================================================
@@ -364,6 +558,8 @@ def _run_one_core(
     global_epoch,
     local_epoch,
     pop_size,
+    args=None,
+    run_id=None,
 ):
     """Ortak gövde: algo_map ana süreçte veya worker’da bir kez oluşturulur."""
     mode_str = 'LOF' if use_lof else 'percentile'
@@ -393,9 +589,23 @@ def _run_one_core(
         best_sol = kmeans.cluster_centers_.flatten()
         best_fit = float(kmeans.inertia_)
         assignments = assignments_km
+    elif l_name == 'GAop':
+        best_sol, best_fit = run_memetic_hybrid(
+            algo_map[g_name], matrix, K, init,
+            total_epoch=global_epoch + local_epoch,
+            pop_size=pop_size,
+            ga_inject_interval=10,
+            ga_crossover_rate=0.3,
+            ga_mutation_rate=0.1,
+        )
     elif l_name is None:
         best_sol, best_fit = run_single(
             algo_map[g_name], matrix, K, init, baseline_epoch, pop_size
+        )
+    elif '||' in label:
+        best_sol, best_fit = run_parallel_hybrid(
+            algo_map[g_name], algo_map[l_name],
+            matrix, K, init, global_epoch, local_epoch, pop_size
         )
     else:
         best_sol, best_fit = run_hybrid(
@@ -421,8 +631,11 @@ def _run_one_core(
         gray_mask  = gs_info['gray_sheep_mask']
         extra_data = {'threshold': gs_info['threshold']}
 
-    save_assignment(assignments, gray_mask, best_sol, best_fit,
-                    save_dir, extra_data)
+    save_assignment(
+        assignments, gray_mask, best_sol, best_fit,
+        save_dir, extra_data, label=label, K=K, args=args,
+        run_id=run_id, seed=seed,
+    )
     print(f"  [{label}] tamamlandı — {time.time()-t0:.1f}s")
 
 
@@ -446,6 +659,8 @@ def _mp_run_assignment_job(job):
         global_epoch,
         local_epoch,
         pop_size,
+        args,
+        run_id,
     ) = job
     algo_map = {a['full_name']: a for a in get_all_algorithms_v3()}
     algo_map['GAHHO.OriginalGAHHO'] = {
@@ -476,12 +691,14 @@ def _mp_run_assignment_job(job):
         global_epoch,
         local_epoch,
         pop_size,
+        args,
+        run_id,
     )
 
 
 def run_one(label, g_name, l_name, matrix, K, seed, save_dir, algo_map,
             use_lof=False, lof_n_neighbors=LOF_N_NEIGHBORS,
-            lof_contamination=LOF_CONTAMINATION):
+            lof_contamination=LOF_CONTAMINATION, args=None, run_id=None):
     """
     Bir algoritma için assignment üret ve kaydet.
 
@@ -504,6 +721,8 @@ def run_one(label, g_name, l_name, matrix, K, seed, save_dir, algo_map,
         GLOBAL_EPOCH,
         LOCAL_EPOCH,
         POP_SIZE,
+        args,
+        run_id=run_id,
     )
 
 
@@ -594,7 +813,7 @@ def wnmf_feature_extract(matrix, n_components,
     n = len(ratings)
 
     print(f"  WNMF feature extraction başlıyor...")
-    print(f"  Matris: {n_users}×{n_items} → U: {n_users}×{n_components}")
+    print(f"  Matris: {n_users}x{n_items} -> U: {n_users}x{n_components}")
     print(f"  Gözlemlenen rating: {n}, epoch: {n_epochs}")
 
     for epoch in range(n_epochs):
@@ -620,6 +839,40 @@ def wnmf_feature_extract(matrix, n_components,
     return U  # (n_users × n_components) dense
 
 
+def pca_variance_reduce(matrix, variance_ratio, random_state=42):
+    """
+    sklearn PCA: n_components in (0,1) → birikimli açıklanan varyans ≥ oran olacak kadar bileşen.
+    """
+    from sklearn.decomposition import PCA
+
+    n_samples, n_features = matrix.shape
+    pca = PCA(n_components=variance_ratio, random_state=random_state)
+    out = pca.fit_transform(matrix)
+    cum = float(np.sum(pca.explained_variance_ratio_))
+    print(
+        f"  PCA: {n_features} -> {out.shape[1]} components "
+        f"(target >={variance_ratio:.0%} variance, cumulative: {cum:.4f})"
+    )
+    return out.astype(np.float32)
+
+
+def prepare_matrix_for_clustering(matrix, zscore, pca_var, wnmf_k):
+    """Sıra: z-score → PCA → WNMF (--pca ile --wnmf-features birlikte CLI’de yasak)."""
+    if zscore:
+        matrix = zscore_normalize(matrix)
+        print("  Z-score normalizasyon uygulandı")
+    if pca_var is not None:
+        matrix = pca_variance_reduce(matrix, pca_var)
+    if wnmf_k is not None:
+        matrix = wnmf_feature_extract(
+            matrix,
+            n_components=wnmf_k,
+            n_epochs=50,
+            random_seed=42,
+        )
+    return matrix
+
+
 # ============================================================
 # DATASET ÇALIŞTIRICI
 # ============================================================
@@ -627,7 +880,8 @@ def wnmf_feature_extract(matrix, n_components,
 def run_dataset(dataset_name, matrix, K, out_root, algo_filter=None,
                 use_lof=False, lof_n_neighbors=LOF_N_NEIGHBORS,
                 lof_contamination=LOF_CONTAMINATION,
-                max_workers: Optional[int] = None, out_suffix: str = ''):
+                max_workers: Optional[int] = None, out_suffix: str = '',
+                args=None, run_id=None):
     print(f"\n{'='*60}")
     print(f"DATASET: {dataset_name.upper()}  |  K={K}  |  Seed={SEED}")
     mode_str = f'LOF (n={lof_n_neighbors}, cont={lof_contamination})' \
@@ -681,6 +935,8 @@ def run_dataset(dataset_name, matrix, K, out_root, algo_filter=None,
                 use_lof=use_lof,
                 lof_n_neighbors=lof_n_neighbors,
                 lof_contamination=lof_contamination,
+                args=args,
+                run_id=run_id,
             )
     else:
         print(
@@ -703,13 +959,15 @@ def run_dataset(dataset_name, matrix, K, out_root, algo_filter=None,
                 GLOBAL_EPOCH,
                 LOCAL_EPOCH,
                 POP_SIZE,
+                args,
+                run_id,
             )
             for label, g_name, l_name, save_dir in jobs_meta
         ]
         with ProcessPoolExecutor(max_workers=nw) as pool:
             list(pool.map(_mp_run_assignment_job, jobs))
 
-    print(f"\n{dataset_name.upper()} tamamlandı → {os.path.join(out_root, dataset_name)}/")
+    print(f"\n{dataset_name.upper()} tamamlandi -> {os.path.join(out_root, dataset_name)}/")
 
 
 # ============================================================
@@ -717,7 +975,7 @@ def run_dataset(dataset_name, matrix, K, out_root, algo_filter=None,
 # ============================================================
 
 def parse_args():
-    labels = [c[0] for c in ALGO_CONFIG]
+    labels = ALGO_LABELS
     p = argparse.ArgumentParser(
         description="Assignment üretici — percentile veya LOF gray sheep"
     )
@@ -748,6 +1006,12 @@ def parse_args():
         help='WNMF ile K boyutlu kullanıcı latent matris çıkar. '
              'Bu matris metasezgisel clustering girişi olur. '
              'Öneri için ham rating kullanılır. (örn: --wnmf-features 20)'
+    )
+    p.add_argument(
+        '--pca', type=float, default=None, metavar='VAR',
+        dest='pca_variance',
+        help='PCA: birikimli açıklanan varyans eşiği (0–1, örn: 0.80). '
+             '--wnmf-features ile birlikte kullanılamaz.',
     )
     p.add_argument(
         '--k', nargs='+', type=int, default=None, metavar='K',
@@ -781,6 +1045,12 @@ def parse_args():
     args = p.parse_args()
     if args.k is not None and (args.k_100k is not None or args.k_1m is not None):
         p.error('--k (tek veya çoklu) ile --k-100k / --k-1m birlikte kullanılamaz')
+    if args.pca_variance is not None:
+        if not (0 < args.pca_variance <= 1):
+            p.error('--pca (0, 1] aralığında olmalı (örn. 0.80)')
+    if args.pca_variance is not None and args.wnmf_features is not None:
+        p.error('--pca ile --wnmf-features birlikte kullanılamaz')
+    args.pca = args.pca_variance
     return args
 
 def _multi_start_init(matrix, K, pop_size, seed, n_restarts=10):
@@ -801,7 +1071,7 @@ def _multi_start_init(matrix, K, pop_size, seed, n_restarts=10):
     # WCSS'e göre sırala, en iyi pop_size tanesini al
     candidates.sort(key=lambda x: x[0])
     best = [c[1] for c in candidates[:pop_size + 10]]
-    print(f"    Init: {n_restarts*3} aday → en iyi {pop_size} seçildi  "
+    print(f"    Init: {n_restarts*3} aday -> en iyi {pop_size} secildi  "
           f"(WCSS aralığı: {candidates[0][0]:.1f} – {candidates[pop_size-1][0]:.1f})")
     return best
 # ============================================================
@@ -810,6 +1080,32 @@ def _multi_start_init(matrix, K, pop_size, seed, n_restarts=10):
 
 if __name__ == '__main__':
     args = parse_args()
+
+    db_run_id = None
+    if _DB_AVAILABLE and start_run is not None:
+        try:
+            prep_parts = []
+            if getattr(args, 'zscore', False):
+                prep_parts.append('zscore')
+            if getattr(args, 'pca', None):
+                if args.pca < 1.0:
+                    prep_parts.append(f'pca{int(args.pca * 100)}pct')
+                else:
+                    prep_parts.append(f'pca{int(args.pca)}')
+            if getattr(args, 'wnmf_features', None):
+                prep_parts.append(f'wnmf{args.wnmf_features}')
+            preprocessing_run = '_'.join(prep_parts) if prep_parts else 'none'
+            db_run_id = start_run(
+                command=' '.join(sys.argv),
+                dataset=args.dataset,
+                k=None,
+                preprocessing=preprocessing_run,
+                note='gray_sheep=LOF' if args.lof else 'gray_sheep=percentile',
+            )
+            print(f"  DB run_id: {db_run_id}")
+        except Exception as exc:
+            print(f"  Uyari: start_run basarisiz ({exc})", file=sys.stderr)
+
     selected_algos = [ALGO_CONFIG[-1][0]] if args.last_only else args.algo
 
     # Contamination dönüşümü
@@ -844,6 +1140,15 @@ if __name__ == '__main__':
         print(f"LOF         : n_neighbors={args.n_neighbors}, contamination={contamination}")
     print(f"Epoch       : baseline={BASELINE_EPOCH}, global={GLOBAL_EPOCH}, local={LOCAL_EPOCH}")
     print(f"Pop size    : {POP_SIZE}  |  Seed: {SEED}")
+    feat_bits = []
+    if args.zscore:
+        feat_bits.append('Z-score')
+    if args.pca_variance is not None:
+        feat_bits.append(f"PCA >={args.pca_variance:.0%} var.")
+    if args.wnmf_features is not None:
+        feat_bits.append(f'WNMF k={args.wnmf_features}')
+    if feat_bits:
+        print(f"Matris      : ham + " + ' + '.join(feat_bits))
     print(f"Çıktı kökü  : {out_root}")
     if args.jobs is None:
         print("Paralellik    : otomatik (CPU sayısına göre; --jobs 1 ile sıralı mod)")
@@ -857,6 +1162,13 @@ if __name__ == '__main__':
 
     t_total = time.time()
 
+    def _finish_db_run():
+        if db_run_id is not None and _DB_AVAILABLE and finish_run is not None:
+            try:
+                finish_run(db_run_id)
+            except Exception as exc:
+                print(f"  Uyari: finish_run basarisiz ({exc})", file=sys.stderr)
+
     def _pool_cap():
         if args.jobs == 1:
             return 1
@@ -865,83 +1177,84 @@ if __name__ == '__main__':
         return args.jobs
 
     zscore_suffix = '_zscore' if args.zscore else ''
+    pca_suffix = (
+        f'_pca{int(round(args.pca_variance * 100))}pct'
+        if args.pca_variance is not None else ''
+    )
     wnmf_suffix = (
         f'_wnmf{args.wnmf_features}'
         if args.wnmf_features is not None else ''
     )
-    out_suffix = zscore_suffix + wnmf_suffix
+    out_suffix = zscore_suffix + pca_suffix + wnmf_suffix
 
-    if args.dataset in ('100k', 'both'):
-        print(f"\nML-100K yükleniyor: {args.data_100k}")
-        matrix_100k = load_movielens(args.data_100k)
-        if args.zscore:
-            matrix_100k = zscore_normalize(matrix_100k)
-            print("  Z-score normalizasyon uygulandı")
-        if args.wnmf_features is not None:
-            matrix_100k = wnmf_feature_extract(
-                matrix_100k,
-                n_components=args.wnmf_features,
-                n_epochs=50,
-                random_seed=42
+    try:
+        if args.dataset in ('100k', 'both'):
+            print(f"\nML-100K yükleniyor: {args.data_100k}")
+            matrix_100k = load_movielens(args.data_100k)
+            matrix_100k = prepare_matrix_for_clustering(
+                matrix_100k, args.zscore, args.pca_variance, args.wnmf_features,
             )
-        if k_multi is not None:
-            for K in k_multi:
+            if k_multi is not None:
+                for K in k_multi:
+                    run_dataset(
+                        'ml100k', matrix_100k, K, out_root,
+                        algo_filter=selected_algos,
+                        use_lof=args.lof,
+                        lof_n_neighbors=args.n_neighbors,
+                        lof_contamination=contamination,
+                        max_workers=_pool_cap(),
+                        out_suffix=out_suffix,
+                        args=args,
+                        run_id=db_run_id,
+                    )
+            else:
                 run_dataset(
-                    'ml100k', matrix_100k, K, out_root,
+                    'ml100k', matrix_100k, k_100k, out_root,
                     algo_filter=selected_algos,
                     use_lof=args.lof,
                     lof_n_neighbors=args.n_neighbors,
                     lof_contamination=contamination,
                     max_workers=_pool_cap(),
                     out_suffix=out_suffix,
+                    args=args,
+                    run_id=db_run_id,
                 )
-        else:
-            run_dataset(
-                'ml100k', matrix_100k, k_100k, out_root,
-                algo_filter=selected_algos,
-                use_lof=args.lof,
-                lof_n_neighbors=args.n_neighbors,
-                lof_contamination=contamination,
-                max_workers=_pool_cap(),
-                out_suffix=out_suffix,
-            )
 
-    if args.dataset in ('1m', 'both'):
-        print(f"\nML-1M yükleniyor: {args.data_1m}")
-        matrix_1m = load_movielens_1m(args.data_1m)
-        if args.zscore:
-            matrix_1m = zscore_normalize(matrix_1m)
-            print("  Z-score normalizasyon uygulandı")
-        if args.wnmf_features is not None:
-            matrix_1m = wnmf_feature_extract(
-                matrix_1m,
-                n_components=args.wnmf_features,
-                n_epochs=50,
-                random_seed=42
+        if args.dataset in ('1m', 'both'):
+            print(f"\nML-1M yükleniyor: {args.data_1m}")
+            matrix_1m = load_movielens_1m(args.data_1m)
+            matrix_1m = prepare_matrix_for_clustering(
+                matrix_1m, args.zscore, args.pca_variance, args.wnmf_features,
             )
-        if k_multi is not None:
-            for K in k_multi:
+            if k_multi is not None:
+                for K in k_multi:
+                    run_dataset(
+                        'ml1m', matrix_1m, K, out_root,
+                        algo_filter=selected_algos,
+                        use_lof=args.lof,
+                        lof_n_neighbors=args.n_neighbors,
+                        lof_contamination=contamination,
+                        max_workers=_pool_cap(),
+                        out_suffix=out_suffix,
+                        args=args,
+                        run_id=db_run_id,
+                    )
+            else:
                 run_dataset(
-                    'ml1m', matrix_1m, K, out_root,
+                    'ml1m', matrix_1m, k_1m, out_root,
                     algo_filter=selected_algos,
                     use_lof=args.lof,
                     lof_n_neighbors=args.n_neighbors,
                     lof_contamination=contamination,
                     max_workers=_pool_cap(),
                     out_suffix=out_suffix,
+                    args=args,
+                    run_id=db_run_id,
                 )
-        else:
-            run_dataset(
-                'ml1m', matrix_1m, k_1m, out_root,
-                algo_filter=selected_algos,
-                use_lof=args.lof,
-                lof_n_neighbors=args.n_neighbors,
-                lof_contamination=contamination,
-                max_workers=_pool_cap(),
-                out_suffix=out_suffix,
-            )
 
-    print(f"\n{'='*60}")
-    print(f"TAMAMLANDI — toplam {(time.time()-t_total)/60:.1f} dakika")
-    print(f"Çıktı: {out_root}/")
-    print("=" * 60)
+        print(f"\n{'='*60}")
+        print(f"TAMAMLANDI — toplam {(time.time()-t_total)/60:.1f} dakika")
+        print(f"Çıktı: {out_root}/")
+        print("=" * 60)
+    finally:
+        _finish_db_run()

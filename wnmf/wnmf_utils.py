@@ -124,16 +124,28 @@ def load_ratings_1m(ratings_path: str, test_ratio: float = 0.2,
         test_df = df.iloc[test_idx]
 
     combo = pd.concat([train_df, test_df], axis=0)
+
+    # User IDs: ML-1M has contiguous 1-indexed users (1..6040); after the -1
+    # subtraction above they are 0..6039.  No remapping is applied so that
+    # ratings[:, 0] == i  ↔  assignments[i] (position in the pivot-table
+    # produced by generate_assignments.py).  Guard against accidental gaps.
     unique_users = np.sort(combo['user_id'].unique())
+    if unique_users[-1] - unique_users[0] + 1 != len(unique_users):
+        raise ValueError(
+            f"load_ratings_1m: non-contiguous user IDs detected "
+            f"(expected {unique_users[-1] - unique_users[0] + 1} IDs, "
+            f"found {len(unique_users)}).  User remapping would misalign "
+            "with assignments.npy — update the pipeline if you subset the data."
+        )
+
+    # Item IDs: ML-1M movie IDs have gaps (1..3952 with ~246 missing entries).
+    # Compress to 0..n_unique_items-1 so the WNMF V matrix is the right size.
     unique_items = np.sort(combo['item_id'].unique())
-    u_map = {int(u): i for i, u in enumerate(unique_users)}
-    i_map = {int(i): j for j, i in enumerate(unique_items)}
+    i_map = {int(it): j for j, it in enumerate(unique_items)}
 
     train_df = train_df.copy()
     test_df = test_df.copy()
-    train_df['user_id'] = train_df['user_id'].map(u_map)
     train_df['item_id'] = train_df['item_id'].map(i_map)
-    test_df['user_id'] = test_df['user_id'].map(u_map)
     test_df['item_id'] = test_df['item_id'].map(i_map)
 
     train = train_df[['user_id', 'item_id', 'rating']].values.astype(np.float32)
@@ -168,11 +180,19 @@ def load_assignment(assignment_dir: str) -> Tuple[np.ndarray, np.ndarray]:
     assignments = np.load(os.path.join(assignment_dir, 'assignments.npy'))
     gray_mask   = np.load(os.path.join(assignment_dir, 'gray_sheep_mask.npy'))
 
+    if len(gray_mask) != len(assignments):
+        raise ValueError(
+            f"load_assignment: assignments.npy ({len(assignments)}) ve "
+            f"gray_sheep_mask.npy ({len(gray_mask)}) uzunlukları eşleşmiyor."
+        )
+
     n_gray    = gray_mask.sum()
     n_users   = len(assignments)
     n_clusters = len(np.unique(assignments[~gray_mask]))
+    a_min, a_max = int(assignments.min()), int(assignments.max())
 
     print(f"Assignment yüklendi: {assignment_dir}")
+    print(f"  cluster_id  : min={a_min}, max={a_max}, len={n_users}")
     print(f"  Kullanıcı   : {n_users}")
     print(f"  Gray sheep  : {n_gray} ({n_gray/n_users*100:.1f}%)")
     print(f"  Aktif küme  : {n_clusters}")

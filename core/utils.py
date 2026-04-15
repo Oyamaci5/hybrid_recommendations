@@ -110,12 +110,13 @@ def create_train_test_split(ratings: np.ndarray, test_ratio: float = 0.2,
         n_ratings = len(user_ratings_list)
         n_test = max(1, int(n_ratings * test_ratio))
         
-        # Randomly select test ratings
-        indices = np.random.permutation(n_ratings)
-        test_indices = set(indices[:n_test])
-        
+        # perm is a shuffled list of positions (0..n_ratings-1); the first
+        # n_test positions are designated as test.
+        perm = np.random.permutation(n_ratings)
+        test_positions = set(perm[:n_test].tolist())
+
         for i, rating in enumerate(user_ratings_list):
-            if i in test_indices:
+            if i in test_positions:
                 test_data.append(rating)
             else:
                 train_data.append(rating)
