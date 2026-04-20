@@ -154,17 +154,40 @@ def pearson_distance_batch(users, centroids):
     return 1 - corr
 
 
-def compute_wcss_fast(matrix, solution, K):
-    centroids    = solution.reshape(K, matrix.shape[1])
-    dist_matrix  = pearson_distance_batch(matrix, centroids)
-    assignments  = np.argmin(dist_matrix, axis=1)
+def euclidean_distance_batch(users, centroids):
+    """
+    Squared Euclidean distances: users (n, d), centroids (K, d) -> (n, K).
+    ||u - c||^2 = ||u||^2 + ||c||^2 - 2 u·c
+    """
+    users = np.asarray(users, dtype=np.float64)
+    centroids = np.asarray(centroids, dtype=np.float64)
+    u2 = (users ** 2).sum(axis=1, keepdims=True)
+    c2 = (centroids ** 2).sum(axis=1, keepdims=True).T
+    cross = users @ centroids.T
+    d2 = u2 + c2 - 2.0 * cross
+    return np.maximum(d2, 0.0)
+
+
+def compute_wcss_fast(matrix, solution, K, metric='pearson'):
+    """
+    metric='pearson' : rating/latent için Pearson mesafesi (1-corr) toplamı.
+    metric='euclidean' : k-means tarzı SSE — atanan merkeze squared L2 toplamı.
+    """
+    centroids = solution.reshape(K, matrix.shape[1])
+    if metric == 'euclidean':
+        dist_matrix = euclidean_distance_batch(matrix, centroids)
+    elif metric == 'pearson':
+        dist_matrix = pearson_distance_batch(matrix, centroids)
+    else:
+        raise ValueError(f"Unknown metric: {metric}")
+    assignments = np.argmin(dist_matrix, axis=1)
     min_distances = dist_matrix[np.arange(len(matrix)), assignments]
     return float(min_distances.sum()), assignments
 
 
-def make_fitness_function(matrix, K):
+def make_fitness_function(matrix, K, metric='pearson'):
     def fitness(solution):
-        wcss, _ = compute_wcss_fast(matrix, solution, K)
+        wcss, _ = compute_wcss_fast(matrix, solution, K, metric=metric)
         return float(wcss)
     return fitness
 
@@ -173,15 +196,21 @@ def make_fitness_function(matrix, K):
 # BÖLÜM 3: MKMEANS++ BAŞLANGIÇ POPÜLASYONU
 # ============================================================
 
-def mkmeans_plus_plus_init(matrix, K, n_solutions=30, seed=42):
+def mkmeans_plus_plus_init(matrix, K, n_solutions=30, seed=42, metric='pearson'):
     np.random.seed(seed)
     n_users, _ = matrix.shape
     solutions  = []
 
+    def _pairwise_dists(rows_idx):
+        sub = matrix[rows_idx]
+        if metric == 'euclidean':
+            return euclidean_distance_batch(matrix, sub)
+        return pearson_distance_batch(matrix, sub)
+
     for _ in range(n_solutions):
         idx = [np.random.randint(0, n_users)]
         for k in range(1, K):
-            dists = pearson_distance_batch(matrix, matrix[idx]).min(axis=1)
+            dists = _pairwise_dists(idx).min(axis=1)
             dists = np.maximum(dists, 0)
             probs = dists ** 2
             total = probs.sum()
@@ -189,7 +218,7 @@ def mkmeans_plus_plus_init(matrix, K, n_solutions=30, seed=42):
             idx.append(np.random.choice(n_users, p=probs))
         solutions.append(matrix[idx].flatten())
 
-    print(f"MkMeans++ ile {n_solutions} başlangıç çözümü oluşturuldu")
+    print(f"MkMeans++ ile {n_solutions} başlangıç çözümü oluşturuldu ({metric})")
     return solutions
 
 
@@ -197,26 +226,33 @@ def mkmeans_plus_plus_init(matrix, K, n_solutions=30, seed=42):
 # BÖLÜM 4: GRAY SHEEP TESPİTİ
 # ============================================================
 
-def detect_gray_sheep(matrix, assignments, solution, K, threshold=None):
+def detect_gray_sheep(matrix, assignments, solution, K, threshold=None,
+                      metric='pearson'):
     centroids      = solution.reshape(K, matrix.shape[1])
     n_users        = len(matrix)
     user_distances = np.zeros(n_users)
 
-    for i in range(n_users):
-        user     = matrix[i]
-        centroid = centroids[assignments[i]]
-        mask     = (user != 0) | (centroid != 0)
+    if metric == 'euclidean':
+        for i in range(n_users):
+            user_distances[i] = float(
+                np.sum((matrix[i].astype(np.float64) - centroids[assignments[i]]) ** 2)
+            )
+    else:
+        for i in range(n_users):
+            user     = matrix[i]
+            centroid = centroids[assignments[i]]
+            mask     = (user != 0) | (centroid != 0)
 
-        if mask.sum() < 2:
-            user_distances[i] = 1.0
-            continue
+            if mask.sum() < 2:
+                user_distances[i] = 1.0
+                continue
 
-        u_f, c_f = user[mask], centroid[mask]
-        if np.std(u_f) == 0 or np.std(c_f) == 0:
-            user_distances[i] = 1.0
-        else:
-            corr = float(np.nan_to_num(np.corrcoef(u_f, c_f)[0, 1], nan=0.0))
-            user_distances[i] = 1 - np.clip(corr, -1, 1)
+            u_f, c_f = user[mask], centroid[mask]
+            if np.std(u_f) == 0 or np.std(c_f) == 0:
+                user_distances[i] = 1.0
+            else:
+                corr = float(np.nan_to_num(np.corrcoef(u_f, c_f)[0, 1], nan=0.0))
+                user_distances[i] = 1 - np.clip(corr, -1, 1)
 
     if threshold is None:
         threshold = np.percentile(user_distances, 80)

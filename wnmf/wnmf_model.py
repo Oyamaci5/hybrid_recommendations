@@ -67,6 +67,9 @@ class WNMFModel:
         random_seed    : int   = 42,
         use_bias       : bool  = True,
         use_svdpp      : bool  = False,
+        init_method    : str   = "random",
+        inmed_trim     : tuple = (5.0, 95.0),
+        inmed_jitter   : float = 0.01,
     ):
         self.n_users        = n_users
         self.n_items        = n_items
@@ -77,6 +80,9 @@ class WNMFModel:
         self.random_seed    = random_seed
         self.use_bias       = use_bias
         self.use_svdpp      = use_svdpp
+        self.init_method    = str(init_method).lower()
+        self.inmed_trim     = inmed_trim
+        self.inmed_jitter   = float(inmed_jitter)
         self.is_fitted      = False
         self.user_implicit  = None
         self._svdpp_train_items: Optional[dict] = None
@@ -94,6 +100,37 @@ class WNMFModel:
             self.Y = rng2.uniform(0, scale, (n_items, latent_dim)).astype(np.float32)
         else:
             self.Y = None
+
+    def _initialize_inmed_factors(self, ratings: np.ndarray) -> None:
+        """
+        INMED: gözlenen rating dağılımının trimmed mean'i ile U/V başlat.
+        """
+        if ratings.size == 0:
+            return
+
+        low, high = self.inmed_trim
+        low = float(max(0.0, min(100.0, low)))
+        high = float(max(0.0, min(100.0, high)))
+        if high <= low:
+            low, high = 5.0, 95.0
+
+        trimmed_mean = float(np.mean(ratings))
+        if ratings.size >= 5:
+            q_low, q_high = np.percentile(ratings, [low, high])
+            keep = (ratings >= q_low) & (ratings <= q_high)
+            if np.any(keep):
+                trimmed_mean = float(np.mean(ratings[keep]))
+
+        base_val = float(np.sqrt(max(trimmed_mean, 1e-6) / max(self.latent_dim, 1)))
+        rng = np.random.RandomState(self.random_seed)
+        jitter_u = rng.uniform(
+            -self.inmed_jitter, self.inmed_jitter, size=self.U.shape
+        ).astype(np.float32)
+        jitter_v = rng.uniform(
+            -self.inmed_jitter, self.inmed_jitter, size=self.V.shape
+        ).astype(np.float32)
+        self.U[:] = np.maximum(base_val + jitter_u, 0.0).astype(np.float32)
+        self.V[:] = np.maximum(base_val + jitter_v, 0.0).astype(np.float32)
 
     def fit(
         self,
@@ -118,6 +155,9 @@ class WNMFModel:
         n        = len(ratings)
         lr       = self.learning_rate
         reg      = self.regularization
+
+        if self.init_method == "inmed":
+            self._initialize_inmed_factors(ratings)
 
         user_items: dict = {}
         user_implicit: dict = {}

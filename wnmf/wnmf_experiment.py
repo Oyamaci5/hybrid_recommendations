@@ -1015,10 +1015,12 @@ def _mp_run_algo_job(job):
         use_cluster_bias,
         use_svdpp,
         run_cluster_avg_flag,
+        do_cluster_knn_flag,
         top_n,
         relevance_threshold,
         similarity,
         knn,
+        min_common,
         out_dir,
         run_command,
         ld, lr, reg, eg, ec,
@@ -1045,10 +1047,11 @@ def _mp_run_algo_job(job):
             row['dataset'] = dataset_name
             rows.append(row)
 
+        if do_cluster_knn_flag:
             row = run_cluster_knn(
                 train, test, assignments, gray_mask, n_items, label,
                 similarity=similarity,
-                min_common=3,
+                min_common=min_common,
                 k_neighbors=knn,
             )
             row['dataset'] = dataset_name
@@ -1102,10 +1105,12 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
                 use_bias: bool = True,
                 use_cluster_bias: bool = False,
                 run_cluster_avg: bool = True,
+                do_cluster_knn: bool = True,
                 top_n: int = 10,
                 relevance_threshold: float = 3.5,
                 similarity: str = 'pearson',
                 knn: int = 30,
+                min_common: int = 3,
                 use_svdpp: bool = False,
                 run_command: Optional[str] = None,
                 args=None,
@@ -1116,6 +1121,7 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
     mode parametresi:
         'baselines' — küme ortalaması + küme içi kNN CF (+ isteğe bağlı global WNMF);
                       WNMF küme modeli (full/sharedV) çalışmaz. Tüm --assign-suffix ile uyumlu.
+                      --no-cluster-avg / --no-cluster-knn ile parça parça kapatılabilir.
         'sharedV'   — baselines (varsayılan açık) + SharedV WNMF (önerilen)
         'full'      — baselines + her küme ayrı U+V WNMF
         'all'       — baselines + full + sharedV
@@ -1218,7 +1224,8 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
                 label, assign_dir,
                 train, test, n_items, dataset_name, mode,
                 eff_cluster_workers, weighted_v, use_bias, use_cluster_bias, use_svdpp,
-                run_cluster_avg, top_n, relevance_threshold, similarity, knn,
+                run_cluster_avg, do_cluster_knn, top_n, relevance_threshold, similarity, knn,
+                min_common,
                 out_dir, run_command,
                 _ld, _lr, _reg, _eg, _ec,
             )
@@ -1296,10 +1303,11 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
                         time_seconds=row['time_seconds'],
                     )
 
+            if do_cluster_knn:
                 row = run_cluster_knn(
                     train, test, assignments, gray_mask, n_items, label,
                     similarity=similarity,
-                    min_common=3,
+                    min_common=min_common,
                     k_neighbors=knn,
                 )
                 row['dataset'] = dataset_name
@@ -1631,6 +1639,10 @@ def parse_args():
         help='ClusterAvg senaryosunu çalıştırma',
     )
     p.add_argument(
+        '--no-cluster-knn', action='store_true',
+        help='ClusterKNN (küme içi CF) senaryosunu çalıştırma',
+    )
+    p.add_argument(
         '--top-n', type=int, default=10,
         help='Precision/recall Top-N (cluster_avg)',
     )
@@ -1649,6 +1661,10 @@ def parse_args():
         help='ClusterKNN: küme içi en fazla K komşu (varsayılan: 30)',
     )
     p.add_argument(
+        '--min-common', type=int, default=3, metavar='N',
+        help='ClusterKNN: benzerlik için minimum ortak film sayısı (varsayılan: 3)',
+    )
+    p.add_argument(
         '--svdpp', action='store_true',
         help='WNMFModel / global WNMFSharedV için SVD++ (implicit Y) kullan',
     )
@@ -1665,6 +1681,8 @@ def parse_args():
     args = p.parse_args()
     if args.knn < 1:
         p.error('--knn en az 1 olmalı')
+    if args.min_common < 1:
+        p.error('--min-common en az 1 olmalı')
     if args.assignment_k is not None and (
         args.assignment_k_100k is not None or args.assignment_k_1m is not None
     ):
@@ -1850,14 +1868,16 @@ if __name__ == '__main__':
                         use_bias=not args.no_bias,
                         use_cluster_bias=args.cluster_bias,
                         run_cluster_avg=not args.no_cluster_avg,
+                        do_cluster_knn=not args.no_cluster_knn,
                         top_n=args.top_n,
                         relevance_threshold=args.relevance_threshold,
                         similarity=args.similarity,
-                knn=args.knn,
-                use_svdpp=use_sp,
-                run_command=RUN_COMMAND,
-                args=args,
-                fold=args.fold,
+                        knn=args.knn,
+                        min_common=args.min_common,
+                        use_svdpp=use_sp,
+                        run_command=RUN_COMMAND,
+                        args=args,
+                        fold=args.fold,
                     )
                     combo_rows.extend(rows)
 
@@ -1879,10 +1899,12 @@ if __name__ == '__main__':
                         use_bias=not args.no_bias,
                         use_cluster_bias=args.cluster_bias,
                         run_cluster_avg=not args.no_cluster_avg,
+                        do_cluster_knn=not args.no_cluster_knn,
                         top_n=args.top_n,
                         relevance_threshold=args.relevance_threshold,
                         similarity=args.similarity,
                         knn=args.knn,
+                        min_common=args.min_common,
                         use_svdpp=use_sp,
                         run_command=RUN_COMMAND,
                         args=args,

@@ -142,13 +142,14 @@ def _resolve_pool_workers(requested: Optional[int], n_tasks: int) -> int:
 # GRAY SHEEP TESPİTİ — İKİ MOD
 # ============================================================
 
-def detect_gray_sheep_percentile(matrix, assignments, solution, K):
+def detect_gray_sheep_percentile(matrix, assignments, solution, K,
+                                 metric: str = 'pearson'):
     """
     Sabit 80. percentile ile gray sheep tespiti.
     Her zaman ~%20 gray sheep üretir.
     Orijinal detect_gray_sheep fonksiyonunu çağırır.
     """
-    return detect_gray_sheep(matrix, assignments, solution, K)
+    return detect_gray_sheep(matrix, assignments, solution, K, metric=metric)
 
 
 def detect_gray_sheep_lof(matrix, assignments, n_neighbors=LOF_N_NEIGHBORS,
@@ -245,13 +246,19 @@ def _build_lof_features(matrix, assignments):
 # ALGORİTMA ÇALIŞTIRICILAR
 # ============================================================
 
-def _make_problem(matrix, K):
+def _centroid_value_upper_bound(matrix: np.ndarray) -> float:
+    """Rating veya latent uzayında merkez bileşenleri için üst sınır (alt 0)."""
+    return float(max(5.0, float(np.max(matrix)) * 1.5 + 1e-6))
+
+
+def _make_problem(matrix, K, metric: str = 'pearson'):
     n_items = matrix.shape[1]
+    ub = _centroid_value_upper_bound(matrix)
     return {
-        "obj_func"       : make_fitness_function(matrix, K),
+        "obj_func"       : make_fitness_function(matrix, K, metric=metric),
         "bounds"         : FloatVar(
                                lb=[0.0] * (K * n_items),
-                               ub=[5.0] * (K * n_items),
+                               ub=[ub] * (K * n_items),
                                name="centroids"
                            ),
         "minmax"         : "min",
@@ -260,8 +267,8 @@ def _make_problem(matrix, K):
     }
 
 
-def run_single(algo_info, matrix, K, init, epoch, pop_size):
-    problem = _make_problem(matrix, K)
+def run_single(algo_info, matrix, K, init, epoch, pop_size, metric: str = 'pearson'):
+    problem = _make_problem(matrix, K, metric=metric)
     sp      = get_special_params(algo_info['full_name'], epoch, pop_size)
     model   = algo_info['class'](**(sp or {'epoch': epoch, 'pop_size': pop_size}))
     try:
@@ -273,8 +280,9 @@ def run_single(algo_info, matrix, K, init, epoch, pop_size):
     return model.g_best.solution, best_fit
 
 
-def run_hybrid(g_info, l_info, matrix, K, init, g_epoch, l_epoch, pop_size):
-    problem = _make_problem(matrix, K)
+def run_hybrid(g_info, l_info, matrix, K, init, g_epoch, l_epoch, pop_size,
+               metric: str = 'pearson'):
+    problem = _make_problem(matrix, K, metric=metric)
 
     sp_g    = get_special_params(g_info['full_name'], g_epoch, pop_size)
     g_model = g_info['class'](**(sp_g or {'epoch': g_epoch, 'pop_size': pop_size}))
@@ -317,10 +325,11 @@ def run_hybrid(g_info, l_info, matrix, K, init, g_epoch, l_epoch, pop_size):
     return best_sol, best_fit
 
 
-def run_parallel_hybrid(g_info, l_info, matrix, K, init, g_epoch, l_epoch, pop_size):
+def run_parallel_hybrid(g_info, l_info, matrix, K, init, g_epoch, l_epoch, pop_size,
+                        metric: str = 'pearson'):
     """Etikette '||' geçen hibrit: iki algoritmayı ayrı çalıştırıp en iyi WCSS'yi seçer."""
-    sol_g, fit_g = run_single(g_info, matrix, K, init, g_epoch, pop_size)
-    sol_l, fit_l = run_single(l_info, matrix, K, init, l_epoch, pop_size)
+    sol_g, fit_g = run_single(g_info, matrix, K, init, g_epoch, pop_size, metric=metric)
+    sol_l, fit_l = run_single(l_info, matrix, K, init, l_epoch, pop_size, metric=metric)
     if fit_l < fit_g:
         return sol_l, fit_l
     return sol_g, fit_g
@@ -330,7 +339,8 @@ def run_memetic_hybrid(base_info, matrix, K, init,
                        total_epoch, pop_size,
                        ga_inject_interval=10,
                        ga_crossover_rate=0.3,
-                       ga_mutation_rate=0.1):
+                       ga_mutation_rate=0.1,
+                       metric: str = 'pearson'):
     """
     Memetic hibrit: Sürü algoritması + GA operatör enjeksiyonu.
 
@@ -345,7 +355,7 @@ def run_memetic_hybrid(base_info, matrix, K, init,
     """
     import numpy as np
 
-    problem = _make_problem(matrix, K)
+    problem = _make_problem(matrix, K, metric=metric)
     lb = np.array(problem["bounds"].lb)
     ub = np.array(problem["bounds"].ub)
     rng = np.random.default_rng(seed=42)
@@ -499,6 +509,9 @@ def save_assignment(assignments, gray_mask, best_sol, best_fit,
     if _DB_AVAILABLE:
         # preprocessing label belirle
         prep_parts = []
+        prep_parts.append(
+            f"prune_u{getattr(args, 'min_user_ratings', 5)}_i{getattr(args, 'min_item_ratings', 10)}"
+        )
         if getattr(args, 'zscore', False):
             prep_parts.append('zscore')
         if getattr(args, 'pca', None):
@@ -508,6 +521,10 @@ def save_assignment(assignments, gray_mask, best_sol, best_fit,
                 prep_parts.append(f'pca{int(args.pca)}')
         if getattr(args, 'wnmf_features', None):
             prep_parts.append(f'wnmf{args.wnmf_features}')
+            prep_parts.append(
+                f"{getattr(args, 'wnmf_init', 'inmed')}_trim"
+                f"{getattr(args, 'inmed_trim_low', 5.0):g}_{getattr(args, 'inmed_trim_high', 95.0):g}"
+            )
         preprocessing = '_'.join(prep_parts) if prep_parts else 'none'
 
         # dataset adını belirle
@@ -560,13 +577,17 @@ def _run_one_core(
     pop_size,
     args=None,
     run_id=None,
+    cluster_metric: str = 'pearson',
 ):
     """Ortak gövde: algo_map ana süreçte veya worker’da bir kez oluşturulur."""
     mode_str = 'LOF' if use_lof else 'percentile'
-    print(f"\n  [{label}] başlıyor (gray sheep: {mode_str})...")
+    print(f"\n  [{label}] başlıyor (gray sheep: {mode_str}, küme metrik: {cluster_metric})...")
     t0   = time.time()
     #init = mkmeans_plus_plus_init(matrix, K=K, n_solutions=50, seed=seed)
-    init = _multi_start_init(matrix, K=K, pop_size=POP_SIZE, seed=seed, n_restarts=10)
+    init = _multi_start_init(
+        matrix, K=K, pop_size=POP_SIZE, seed=seed, n_restarts=10,
+        metric=cluster_metric,
+    )
 
     if g_name == 'KMEANS':
         from sklearn.cluster import KMeans
@@ -597,24 +618,30 @@ def _run_one_core(
             ga_inject_interval=10,
             ga_crossover_rate=0.3,
             ga_mutation_rate=0.1,
+            metric=cluster_metric,
         )
     elif l_name is None:
         best_sol, best_fit = run_single(
-            algo_map[g_name], matrix, K, init, baseline_epoch, pop_size
+            algo_map[g_name], matrix, K, init, baseline_epoch, pop_size,
+            metric=cluster_metric,
         )
     elif '||' in label:
         best_sol, best_fit = run_parallel_hybrid(
             algo_map[g_name], algo_map[l_name],
-            matrix, K, init, global_epoch, local_epoch, pop_size
+            matrix, K, init, global_epoch, local_epoch, pop_size,
+            metric=cluster_metric,
         )
     else:
         best_sol, best_fit = run_hybrid(
             algo_map[g_name], algo_map[l_name],
-            matrix, K, init, global_epoch, local_epoch, pop_size
+            matrix, K, init, global_epoch, local_epoch, pop_size,
+            metric=cluster_metric,
         )
 
     if g_name != 'KMEANS':
-        _, assignments = compute_wcss_fast(matrix, best_sol, K)
+        _, assignments = compute_wcss_fast(
+            matrix, best_sol, K, metric=cluster_metric,
+        )
 
     if use_lof:
         print(f"    LOF hesaplanıyor (n_neighbors={lof_n_neighbors})...")
@@ -627,7 +654,9 @@ def _run_one_core(
             'threshold' : gs_info['threshold'],
         }
     else:
-        gs_info    = detect_gray_sheep_percentile(matrix, assignments, best_sol, K)
+        gs_info    = detect_gray_sheep_percentile(
+            matrix, assignments, best_sol, K, metric=cluster_metric,
+        )
         gray_mask  = gs_info['gray_sheep_mask']
         extra_data = {'threshold': gs_info['threshold']}
 
@@ -661,6 +690,7 @@ def _mp_run_assignment_job(job):
         pop_size,
         args,
         run_id,
+        cluster_metric,
     ) = job
     algo_map = {a['full_name']: a for a in get_all_algorithms_v3()}
     algo_map['GAHHO.OriginalGAHHO'] = {
@@ -693,12 +723,14 @@ def _mp_run_assignment_job(job):
         pop_size,
         args,
         run_id,
+        cluster_metric,
     )
 
 
 def run_one(label, g_name, l_name, matrix, K, seed, save_dir, algo_map,
             use_lof=False, lof_n_neighbors=LOF_N_NEIGHBORS,
-            lof_contamination=LOF_CONTAMINATION, args=None, run_id=None):
+            lof_contamination=LOF_CONTAMINATION, args=None, run_id=None,
+            cluster_metric: str = 'pearson'):
     """
     Bir algoritma için assignment üret ve kaydet.
 
@@ -723,6 +755,7 @@ def run_one(label, g_name, l_name, matrix, K, seed, save_dir, algo_map,
         POP_SIZE,
         args,
         run_id=run_id,
+        cluster_metric=cluster_metric,
     )
 
 
@@ -752,6 +785,44 @@ def load_movielens_1m(path):
     return matrix
 
 
+def prune_sparse_matrix(matrix, min_user_ratings=5, min_item_ratings=10):
+    """
+    İteratif seyreklik budama:
+    - min_user_ratings'ten az oylayan kullanıcıları kaldır
+    - min_item_ratings'ten az oy alan filmleri kaldır
+    Koşullar sabitlenene kadar döngü sürer.
+    """
+    if min_user_ratings <= 0 and min_item_ratings <= 0:
+        return matrix
+
+    pruned = matrix
+    prev_shape = None
+    iteration = 0
+
+    while prev_shape != pruned.shape:
+        prev_shape = pruned.shape
+        iteration += 1
+
+        if min_user_ratings > 0:
+            user_counts = np.count_nonzero(pruned, axis=1)
+            keep_users = user_counts >= int(min_user_ratings)
+            pruned = pruned[keep_users]
+
+        if min_item_ratings > 0:
+            item_counts = np.count_nonzero(pruned, axis=0)
+            keep_items = item_counts >= int(min_item_ratings)
+            pruned = pruned[:, keep_items]
+
+    total = pruned.size
+    nonzero = np.count_nonzero(pruned)
+    sparsity = 1 - (nonzero / total if total > 0 else 0.0)
+    print(
+        f"  Prune tamamlandı ({iteration} iter): "
+        f"shape={pruned.shape}, sparsity={sparsity:.3f}"
+    )
+    return pruned.astype(np.float32, copy=False)
+
+
 def zscore_normalize(matrix):
     """
     Kullanıcı bazlı Z-score normalizasyon.
@@ -777,66 +848,56 @@ def zscore_normalize(matrix):
 
 def wnmf_feature_extract(matrix, n_components,
                          n_epochs=50, lr=0.01,
-                         reg=0.01, random_seed=42):
+                         reg=0.01, random_seed=42,
+                         init_method='inmed',
+                         inmed_trim=(5.0, 95.0)):
     """
     Ham rating matrisini WNMF ile ayrıştır.
     Sadece kullanıcı latent matrisini (U) döndür.
+
+    Uygulama: [wnmf/wnmf_model.py](wnmf_model.WNMFModel) — wnmf_experiment ile aynı
+    çekirdek (tekrarlanabilirlik).
 
     Neden WNMF: Sıfır hücreler 'rating yok' anlamına gelir,
     standart NMF bunları sıfır rating olarak işler (hatalı).
     WNMF sadece gözlemlenen rating'leri kullanır.
 
-    Çıktı: (n_users × n_components) dense matris
-    Bu matris üzerinde metasezgisel çok daha iyi çalışır:
-    - Sparse değil, dense
-    - Gürültüsüz, anlamlı latent özellikler
-    - Kullanıcıların zevk profili özet vektörleri
+    Çıktı: (n_users × n_components) dense, nonnegative U.
     """
-    import numpy as np
+    wnmf_dir = os.path.join(_REPO_ROOT, 'wnmf')
+    if wnmf_dir not in sys.path:
+        sys.path.insert(0, wnmf_dir)
+    from wnmf_model import WNMFModel
 
     n_users, n_items = matrix.shape
-    rng = np.random.RandomState(random_seed)
-
-    # Başlangıç değerleri
-    rated = matrix > 0
-    mean_rating = matrix[rated].mean() if rated.any() else 3.0
-    scale = np.sqrt(mean_rating / n_components)
-
-    U = rng.uniform(0, scale,
-                    (n_users, n_components)).astype(np.float32)
-    V = rng.uniform(0, scale,
-                    (n_items, n_components)).astype(np.float32)
-
-    # Sadece gözlemlenen rating'leri al
     rows, cols = np.where(matrix > 0)
-    ratings = matrix[rows, cols].astype(np.float32)
-    n = len(ratings)
+    if len(rows) == 0:
+        raise ValueError('wnmf_feature_extract: hiç gözlemlenen rating yok')
 
-    print(f"  WNMF feature extraction başlıyor...")
+    train_ratings = np.column_stack(
+        [rows.astype(np.float32), cols.astype(np.float32), matrix[rows, cols].astype(np.float32)]
+    )
+
+    print(f"  WNMF feature extraction (WNMFModel)...")
     print(f"  Matris: {n_users}x{n_items} -> U: {n_users}x{n_components}")
-    print(f"  Gözlemlenen rating: {n}, epoch: {n_epochs}")
+    print(f"  Gözlemlenen rating: {len(rows)}, epoch: {n_epochs}")
 
-    for epoch in range(n_epochs):
-        idx = np.random.permutation(n)
-        for k in idx:
-            u = rows[k]
-            i = cols[k]
-            r = ratings[k]
-
-            pred = float(np.dot(U[u], V[i]))
-            error = r - pred
-
-            grad_u = -error * V[i] + reg * U[u]
-            grad_v = -error * U[u] + reg * V[i]
-
-            U[u] -= lr * grad_u
-            V[i] -= lr * grad_v
-
-            np.maximum(U[u], 0, out=U[u])
-            np.maximum(V[i], 0, out=V[i])
-
-    print(f"  WNMF tamamlandı. U shape: {U.shape}")
-    return U  # (n_users × n_components) dense
+    model = WNMFModel(
+        n_users        = n_users,
+        n_items        = n_items,
+        latent_dim     = n_components,
+        learning_rate  = lr,
+        regularization = reg,
+        n_epochs       = n_epochs,
+        random_seed    = random_seed,
+        use_bias       = True,
+        use_svdpp      = False,
+        init_method    = init_method,
+        inmed_trim     = inmed_trim,
+    )
+    model.fit(train_ratings, verbose=False)
+    print(f"  WNMF tamamlandı. U shape: {model.U.shape}")
+    return model.U.astype(np.float32)
 
 
 def pca_variance_reduce(matrix, variance_ratio, random_state=42):
@@ -856,8 +917,22 @@ def pca_variance_reduce(matrix, variance_ratio, random_state=42):
     return out.astype(np.float32)
 
 
-def prepare_matrix_for_clustering(matrix, zscore, pca_var, wnmf_k):
-    """Sıra: z-score → PCA → WNMF (--pca ile --wnmf-features birlikte CLI’de yasak)."""
+def prepare_matrix_for_clustering(
+    matrix,
+    zscore,
+    pca_var,
+    wnmf_k,
+    min_user_ratings=5,
+    min_item_ratings=10,
+    wnmf_init_method='inmed',
+    inmed_trim=(5.0, 95.0),
+):
+    """Sıra: prune → z-score → PCA → WNMF (--pca ile --wnmf-features birlikte CLI’de yasak)."""
+    matrix = prune_sparse_matrix(
+        matrix,
+        min_user_ratings=min_user_ratings,
+        min_item_ratings=min_item_ratings,
+    )
     if zscore:
         matrix = zscore_normalize(matrix)
         print("  Z-score normalizasyon uygulandı")
@@ -869,6 +944,8 @@ def prepare_matrix_for_clustering(matrix, zscore, pca_var, wnmf_k):
             n_components=wnmf_k,
             n_epochs=50,
             random_seed=42,
+            init_method=wnmf_init_method,
+            inmed_trim=inmed_trim,
         )
     return matrix
 
@@ -881,12 +958,13 @@ def run_dataset(dataset_name, matrix, K, out_root, algo_filter=None,
                 use_lof=False, lof_n_neighbors=LOF_N_NEIGHBORS,
                 lof_contamination=LOF_CONTAMINATION,
                 max_workers: Optional[int] = None, out_suffix: str = '',
-                args=None, run_id=None):
+                args=None, run_id=None, cluster_metric: str = 'pearson'):
     print(f"\n{'='*60}")
     print(f"DATASET: {dataset_name.upper()}  |  K={K}  |  Seed={SEED}")
     mode_str = f'LOF (n={lof_n_neighbors}, cont={lof_contamination})' \
                if use_lof else 'percentile (80th)'
     print(f"Gray sheep  : {mode_str}")
+    print(f"Küme metrik : {cluster_metric} (pearson | euclidean)")
     print(f"{'='*60}")
 
     # K=default için suffix yok, farklı K için _k{K} eklenir
@@ -937,6 +1015,7 @@ def run_dataset(dataset_name, matrix, K, out_root, algo_filter=None,
                 lof_contamination=lof_contamination,
                 args=args,
                 run_id=run_id,
+                cluster_metric=cluster_metric,
             )
     else:
         print(
@@ -961,6 +1040,7 @@ def run_dataset(dataset_name, matrix, K, out_root, algo_filter=None,
                 POP_SIZE,
                 args,
                 run_id,
+                cluster_metric,
             )
             for label, g_name, l_name, save_dir in jobs_meta
         ]
@@ -1001,11 +1081,41 @@ def parse_args():
         help='Clustering matrisine kullanıcı bazlı Z-score normalizasyon uygula'
     )
     p.add_argument(
+        '--min-user-ratings', type=int, default=5, metavar='N',
+        help='Veri budama: kullanıcı başına minimum rating sayısı (default: 5)',
+    )
+    p.add_argument(
+        '--min-item-ratings', type=int, default=10, metavar='N',
+        help='Veri budama: film başına minimum rating sayısı (default: 10)',
+    )
+    p.add_argument(
         '--wnmf-features', type=int, default=None,
         metavar='K',
         help='WNMF ile K boyutlu kullanıcı latent matris çıkar. '
              'Bu matris metasezgisel clustering girişi olur. '
              'Öneri için ham rating kullanılır. (örn: --wnmf-features 20)'
+    )
+    p.add_argument(
+        '--wnmf-init', choices=['random', 'inmed'], default='inmed',
+        help='--wnmf-features için WNMF başlangıcı: random veya inmed (default: inmed)',
+    )
+    p.add_argument(
+        '--inmed-trim-low', type=float, default=5.0, metavar='P',
+        help='INMED trimmed mean alt yüzdelik (default: 5.0)',
+    )
+    p.add_argument(
+        '--inmed-trim-high', type=float, default=95.0, metavar='P',
+        help='INMED trimmed mean üst yüzdelik (default: 95.0)',
+    )
+    p.add_argument(
+        '--cluster-metric', choices=['auto', 'pearson', 'euclidean'],
+        default='auto',
+        help='Sürü kümeleme fitness: auto = WNMF kullanıldıysa euclidean, '
+             'aksi halde pearson (seyrek rating uzayı).',
+    )
+    p.add_argument(
+        '--save-wnmf-u', type=str, default=None, metavar='DIR',
+        help='--wnmf-features ile: U matrisini DIR içine ml100k_U.npy / ml1m_U.npy olarak kaydet.',
     )
     p.add_argument(
         '--pca', type=float, default=None, metavar='VAR',
@@ -1050,10 +1160,19 @@ def parse_args():
             p.error('--pca (0, 1] aralığında olmalı (örn. 0.80)')
     if args.pca_variance is not None and args.wnmf_features is not None:
         p.error('--pca ile --wnmf-features birlikte kullanılamaz')
+    if args.min_user_ratings < 0:
+        p.error('--min-user-ratings 0 veya daha büyük olmalı')
+    if args.min_item_ratings < 0:
+        p.error('--min-item-ratings 0 veya daha büyük olmalı')
+    if not (0 <= args.inmed_trim_low < args.inmed_trim_high <= 100):
+        p.error('--inmed-trim-low ve --inmed-trim-high için 0 <= low < high <= 100 olmalı')
     args.pca = args.pca_variance
+    if args.cluster_metric == 'auto':
+        args.cluster_metric = 'euclidean' if args.wnmf_features else 'pearson'
     return args
 
-def _multi_start_init(matrix, K, pop_size, seed, n_restarts=10):
+def _multi_start_init(matrix, K, pop_size, seed, n_restarts=10,
+                      metric: str = 'pearson'):
     """
     n_restarts farklı seed ile MkMeans++ çalıştır.
     Her seferinde 1 çözüm üret, WCSS hesapla.
@@ -1062,10 +1181,10 @@ def _multi_start_init(matrix, K, pop_size, seed, n_restarts=10):
     candidates = []
     for i in range(n_restarts * 3):   # fazla üret, en iyileri seç
         sols = mkmeans_plus_plus_init(
-            matrix, K=K, n_solutions=1, seed=seed + i * 17
+            matrix, K=K, n_solutions=1, seed=seed + i * 17, metric=metric,
         )
         sol = sols[0]
-        wcss, _ = compute_wcss_fast(matrix, sol, K)
+        wcss, _ = compute_wcss_fast(matrix, sol, K, metric=metric)
         candidates.append((wcss, sol))
 
     # WCSS'e göre sırala, en iyi pop_size tanesini al
@@ -1085,6 +1204,7 @@ if __name__ == '__main__':
     if _DB_AVAILABLE and start_run is not None:
         try:
             prep_parts = []
+            prep_parts.append(f"prune_u{args.min_user_ratings}_i{args.min_item_ratings}")
             if getattr(args, 'zscore', False):
                 prep_parts.append('zscore')
             if getattr(args, 'pca', None):
@@ -1094,6 +1214,9 @@ if __name__ == '__main__':
                     prep_parts.append(f'pca{int(args.pca)}')
             if getattr(args, 'wnmf_features', None):
                 prep_parts.append(f'wnmf{args.wnmf_features}')
+                prep_parts.append(
+                    f"{args.wnmf_init}_trim{args.inmed_trim_low:g}_{args.inmed_trim_high:g}"
+                )
             preprocessing_run = '_'.join(prep_parts) if prep_parts else 'none'
             db_run_id = start_run(
                 command=' '.join(sys.argv),
@@ -1141,14 +1264,18 @@ if __name__ == '__main__':
     print(f"Epoch       : baseline={BASELINE_EPOCH}, global={GLOBAL_EPOCH}, local={LOCAL_EPOCH}")
     print(f"Pop size    : {POP_SIZE}  |  Seed: {SEED}")
     feat_bits = []
+    feat_bits.append(f"Prune(u>={args.min_user_ratings}, i>={args.min_item_ratings})")
     if args.zscore:
         feat_bits.append('Z-score')
     if args.pca_variance is not None:
         feat_bits.append(f"PCA >={args.pca_variance:.0%} var.")
     if args.wnmf_features is not None:
-        feat_bits.append(f'WNMF k={args.wnmf_features}')
+        feat_bits.append(
+            f"WNMF k={args.wnmf_features} init={args.wnmf_init} trim=({args.inmed_trim_low:g},{args.inmed_trim_high:g})"
+        )
     if feat_bits:
         print(f"Matris      : ham + " + ' + '.join(feat_bits))
+    print(f"Küme metrik : {args.cluster_metric}")
     print(f"Çıktı kökü  : {out_root}")
     if args.jobs is None:
         print("Paralellik    : otomatik (CPU sayısına göre; --jobs 1 ile sıralı mod)")
@@ -1176,24 +1303,37 @@ if __name__ == '__main__':
             return None  # otomatik: _resolve_pool_workers CPU sayısını kullanır
         return args.jobs
 
+    prune_suffix = f"_pruneu{args.min_user_ratings}_i{args.min_item_ratings}"
     zscore_suffix = '_zscore' if args.zscore else ''
     pca_suffix = (
         f'_pca{int(round(args.pca_variance * 100))}pct'
         if args.pca_variance is not None else ''
     )
     wnmf_suffix = (
-        f'_wnmf{args.wnmf_features}'
+        f'_wnmf{args.wnmf_features}_{args.wnmf_init}_trim{args.inmed_trim_low:g}_{args.inmed_trim_high:g}'
         if args.wnmf_features is not None else ''
     )
-    out_suffix = zscore_suffix + pca_suffix + wnmf_suffix
+    out_suffix = prune_suffix + zscore_suffix + pca_suffix + wnmf_suffix
 
     try:
         if args.dataset in ('100k', 'both'):
             print(f"\nML-100K yükleniyor: {args.data_100k}")
             matrix_100k = load_movielens(args.data_100k)
             matrix_100k = prepare_matrix_for_clustering(
-                matrix_100k, args.zscore, args.pca_variance, args.wnmf_features,
+                matrix_100k,
+                args.zscore,
+                args.pca_variance,
+                args.wnmf_features,
+                min_user_ratings=args.min_user_ratings,
+                min_item_ratings=args.min_item_ratings,
+                wnmf_init_method=args.wnmf_init,
+                inmed_trim=(args.inmed_trim_low, args.inmed_trim_high),
             )
+            if args.save_wnmf_u and args.wnmf_features:
+                os.makedirs(args.save_wnmf_u, exist_ok=True)
+                u_path = os.path.join(args.save_wnmf_u, 'ml100k_U.npy')
+                np.save(u_path, matrix_100k)
+                print(f"  WNMF U kaydedildi: {u_path}")
             if k_multi is not None:
                 for K in k_multi:
                     run_dataset(
@@ -1206,6 +1346,7 @@ if __name__ == '__main__':
                         out_suffix=out_suffix,
                         args=args,
                         run_id=db_run_id,
+                        cluster_metric=args.cluster_metric,
                     )
             else:
                 run_dataset(
@@ -1218,14 +1359,27 @@ if __name__ == '__main__':
                     out_suffix=out_suffix,
                     args=args,
                     run_id=db_run_id,
+                    cluster_metric=args.cluster_metric,
                 )
 
         if args.dataset in ('1m', 'both'):
             print(f"\nML-1M yükleniyor: {args.data_1m}")
             matrix_1m = load_movielens_1m(args.data_1m)
             matrix_1m = prepare_matrix_for_clustering(
-                matrix_1m, args.zscore, args.pca_variance, args.wnmf_features,
+                matrix_1m,
+                args.zscore,
+                args.pca_variance,
+                args.wnmf_features,
+                min_user_ratings=args.min_user_ratings,
+                min_item_ratings=args.min_item_ratings,
+                wnmf_init_method=args.wnmf_init,
+                inmed_trim=(args.inmed_trim_low, args.inmed_trim_high),
             )
+            if args.save_wnmf_u and args.wnmf_features:
+                os.makedirs(args.save_wnmf_u, exist_ok=True)
+                u_path = os.path.join(args.save_wnmf_u, 'ml1m_U.npy')
+                np.save(u_path, matrix_1m)
+                print(f"  WNMF U kaydedildi: {u_path}")
             if k_multi is not None:
                 for K in k_multi:
                     run_dataset(
@@ -1238,6 +1392,7 @@ if __name__ == '__main__':
                         out_suffix=out_suffix,
                         args=args,
                         run_id=db_run_id,
+                        cluster_metric=args.cluster_metric,
                     )
             else:
                 run_dataset(
@@ -1250,6 +1405,7 @@ if __name__ == '__main__':
                     out_suffix=out_suffix,
                     args=args,
                     run_id=db_run_id,
+                    cluster_metric=args.cluster_metric,
                 )
 
         print(f"\n{'='*60}")

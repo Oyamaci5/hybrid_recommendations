@@ -564,7 +564,8 @@ if __name__ == '__main__':
                 f"prep={r['preprocessing'] or '?':<15}"
                 f"{note}"
             )
-            print(f"         \u2192 {r['command'][:80]}")
+            # Windows cp1254 konsolunda Unicode ok karakteri encode hatası verebiliyor.
+            print(f"         -> {r['command'][:80]}")
 
     elif cmd == 'run':
         rid = int(sys.argv[2])

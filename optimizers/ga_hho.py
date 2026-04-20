@@ -210,8 +210,17 @@ class OriginalGAHHO(Optimizer):
           - pop[half : N]  → HHO operatörleri ile güncellenir
           Sonra yeni + eski birleştirilip en iyi pop_size birey seçilir.
         """
-        lb  = self.problem.bounds.lb
-        ub  = self.problem.bounds.ub
+        # mealpy sürümüne/Problem iç temsilinə göre bounds bazen list dönebiliyor.
+        # En uyumlu yol: önce Problem.lb/ub kullan, yoksa bounds üstünden fallback.
+        if hasattr(self.problem, "lb") and hasattr(self.problem, "ub"):
+            lb = np.array(self.problem.lb, dtype=np.float64)
+            ub = np.array(self.problem.ub, dtype=np.float64)
+        else:
+            b = self.problem.bounds
+            if isinstance(b, list):
+                b = b[0]
+            lb = np.array(b.lb, dtype=np.float64)
+            ub = np.array(b.ub, dtype=np.float64)
 
         rabbit_sol = self.g_best.solution  # HHO için tavşan pozisyonu
 
