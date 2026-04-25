@@ -75,12 +75,14 @@ from mealpy_comparison_v2 import (
     get_all_algorithms_v3,
     get_special_params,
 )
+from core.fitness import calculate_clustering_fitness
 from mealpy import FloatVar
 from mealpy.evolutionary_based import GA
 try:
     from ga_hho_optimizer import OriginalGAHHO  # pyright: ignore[reportMissingImports]
 except ImportError:
     from ga_hho import OriginalGAHHO  # pyright: ignore[reportMissingImports]
+from de_hho import DE_HHO  # pyright: ignore[reportMissingImports]
 
 # ============================================================
 # AYARLAR
@@ -92,10 +94,10 @@ DATA_1M   = os.path.join(os.path.dirname(BASE_DIR), 'data', 'ml-1m',   'ratings.
 K_100K_DEFAULT = 30
 K_1M_DEFAULT   = 70
 
-GLOBAL_EPOCH   = 30
-LOCAL_EPOCH    = 20
-BASELINE_EPOCH = 50
-POP_SIZE       = 30
+GLOBAL_EPOCH   = 20
+LOCAL_EPOCH    = 15
+BASELINE_EPOCH = 100
+POP_SIZE       = 15
 SEED           = 42
 
 LOF_N_NEIGHBORS   = 20
@@ -112,6 +114,7 @@ ALGO_CONFIG = [
     ('H12_MFO+CDO', 'MFO.OriginalMFO',  'CDO.OriginalCDO'),
     ('H13_HHO+GAop', 'HHO.OriginalHHO', 'GAop'),
     ('H5_GAHHO',   'GAHHO.OriginalGAHHO', None),
+    ('DE_HHO', 'DE_HHO', None),
     ('H5_EliteGA+HHO', 'GA.EliteMultiGA', 'HHO.OriginalHHO'),
     ('LIT_GOA', 'GOA.OriginalGOA', None),
     ('LIT_GWO', 'GWO.OriginalGWO', None),
@@ -268,8 +271,35 @@ def _make_problem(matrix, K, metric: str = 'pearson'):
     }
 
 
+def _make_problem_de_hho(matrix, K):
+    """
+    DE_HHO için objective: Pearson-distance tabanlı clustering fitness.
+    """
+    n_items = matrix.shape[1]
+    ub = _centroid_value_upper_bound(matrix)
+
+    def _obj(solution):
+        centroids = np.asarray(solution, dtype=np.float32).reshape((K, n_items))
+        return calculate_clustering_fitness(centroids, matrix, K)
+
+    return {
+        "obj_func": _obj,
+        "bounds": FloatVar(
+            lb=[0.0] * (K * n_items),
+            ub=[ub] * (K * n_items),
+            name="centroids",
+        ),
+        "minmax": "min",
+        "log_to": None,
+        "save_population": False,
+    }
+
+
 def run_single(algo_info, matrix, K, init, epoch, pop_size, metric: str = 'pearson'):
-    problem = _make_problem(matrix, K, metric=metric)
+    if algo_info['full_name'] == 'DE_HHO':
+        problem = _make_problem_de_hho(matrix, K)
+    else:
+        problem = _make_problem(matrix, K, metric=metric)
     sp      = get_special_params(algo_info['full_name'], epoch, pop_size)
     model   = algo_info['class'](**(sp or {'epoch': epoch, 'pop_size': pop_size}))
     try:
@@ -715,6 +745,10 @@ def _mp_run_assignment_job(job):
         'full_name': 'GAHHO.OriginalGAHHO',
         'class':     OriginalGAHHO,
     }
+    algo_map['DE_HHO'] = {
+        'full_name': 'DE_HHO',
+        'class':     DE_HHO,
+    }
     algo_map['GA.EliteMultiGA'] = {
         'full_name': 'GA.EliteMultiGA',
         'class':     GA.EliteMultiGA,
@@ -1014,6 +1048,10 @@ def run_dataset(dataset_name, matrix, K, out_root, algo_filter=None,
         algo_map['GAHHO.OriginalGAHHO'] = {
             'full_name': 'GAHHO.OriginalGAHHO',
             'class':     OriginalGAHHO,
+        }
+        algo_map['DE_HHO'] = {
+            'full_name': 'DE_HHO',
+            'class':     DE_HHO,
         }
         algo_map['GA.EliteMultiGA'] = {
             'full_name': 'GA.EliteMultiGA',

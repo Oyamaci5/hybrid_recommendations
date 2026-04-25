@@ -59,3 +59,30 @@ def evaluate_predictions(
     mae_value = mae(true_ratings, pred_ratings)
     return rmse_value, mae_value
 
+
+def pearson_distance(vector_a: np.ndarray, vector_b: np.ndarray) -> float:
+    """
+    Compute Pearson-based distance between two user vectors.
+
+    Returns:
+        0.0 -> highly similar trend
+        2.0 -> highly dissimilar/opposite trend
+    """
+    common_indices = np.where((vector_a > 0) & (vector_b > 0))[0]
+    if len(common_indices) < 2:
+        return 2.0
+
+    a_vals = vector_a[common_indices]
+    b_vals = vector_b[common_indices]
+
+    a_diff = a_vals - np.mean(a_vals)
+    b_diff = b_vals - np.mean(b_vals)
+
+    numerator = np.sum(a_diff * b_diff)
+    denominator = np.sqrt(np.sum(a_diff ** 2) * np.sum(b_diff ** 2))
+    if denominator == 0:
+        return 2.0
+
+    correlation = numerator / denominator
+    return float(1.0 - correlation)
+

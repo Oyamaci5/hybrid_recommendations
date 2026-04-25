@@ -117,6 +117,7 @@ ALGO_LABELS = [
     'B0_KMEANS',
     'B1_HHO', 'B2_HGS', 'H1_HHO+HGS', 'H4_MFO+HHO',
     'H9_QSA+CDO', 'H12_MFO+CDO', 'H13_HHO+GAop',
+    'DE_HHO',
     # generate_assignments.py ALGO_CONFIG — önce --lof ile atama üretin
     'LIT_GOA', 'LIT_GWO', 'LIT_SSA',
 ]
@@ -1354,14 +1355,23 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
         sims.sort(key=lambda x: -abs(x[0]))
         top_k = sims[:k_neighbors]
 
-        # Mean-centered ağırlıklı ortalama
-        num = sum(s * (user_ratings[v][i] - user_means.get(v, global_mean))
-                  for s, v in top_k)
-        den = sum(abs(s) for s, v in top_k)
+        # Weighted kNN: komşu etkisini Pearson benzerlik skoruyla ağırlıklandır.
+        if similarity == 'pearson':
+            weighted = [(max(0.0, float(s)), v) for s, v in top_k]
+            den = sum(w for w, _ in weighted)
+            if den < 1e-8:
+                return float(user_means.get(u, global_mean))
+            num = sum(w * float(user_ratings[v][i]) for w, v in weighted)
+            return float(np.clip(num / den, 1.0, 5.0))
 
+        # Cosine için mevcut mean-centered weighted formül.
+        num = sum(
+            s * (user_ratings[v][i] - user_means.get(v, global_mean))
+            for s, v in top_k
+        )
+        den = sum(abs(s) for s, _ in top_k)
         if den < 1e-8:
             return float(user_means.get(u, global_mean))
-
         pred = user_means.get(u, global_mean) + num / den
         return float(np.clip(pred, 1.0, 5.0))
 
@@ -2086,6 +2096,10 @@ def parse_args():
         help='Gizli boyut; birden fazla: --latent-dim 10 20 50 (tüm kombinasyonlar)',
     )
     p.add_argument(
+        '--wnmf-features', type=int, default=None, metavar='D',
+        help='Geriye dönük uyumluluk: --latent-dim için tek değerli kısayol.',
+    )
+    p.add_argument(
         '--reg', nargs='+', type=float, default=None,
         dest='regularization',
         metavar='R',
@@ -2228,6 +2242,15 @@ def parse_args():
                 print(f"not: --algo '{raw}' -> '{canon}' olarak yorumlandi", file=sys.stderr)
             resolved.append(canon)
         args.algo = resolved
+    if args.wnmf_features is not None:
+        if args.wnmf_features <= 0:
+            p.error('--wnmf-features pozitif olmalı')
+        if args.latent_dim is None:
+            args.latent_dim = [int(args.wnmf_features)]
+        elif len(args.latent_dim) == 1 and int(args.latent_dim[0]) == int(args.wnmf_features):
+            pass
+        else:
+            p.error('--wnmf-features ile --latent-dim çakışıyor; tek birini kullanın')
     return args
 
 

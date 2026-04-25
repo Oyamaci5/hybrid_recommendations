@@ -15,6 +15,8 @@ import os
 import importlib.util
 import sys
 import sqlite3
+import time
+import csv
 from datetime import datetime
 from typing import List
 import numpy as np
@@ -25,47 +27,77 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PHASE3_PARALLEL_WORKERS = max(1, min(8, (os.cpu_count() or 4)))
 RESULTS_DIR = os.path.join(BASE_DIR, "results")
 PHASE3_RUNS_ROOT = os.path.join(RESULTS_DIR, "phase3", "new_runs")
+PHASE3_OUT_NAME_DEFAULT = "new_runs"
 PHASE3_DB_PATH = os.path.join(RESULTS_DIR, "assignment_experiments.sqlite")
 PHASE3_DB_TABLE = "mealpy-comparision"
 DB_WRITE_ENABLED = True
 
-# Seçilmiş 27 algoritma (sıra: TOP10 → LİTERATÜR → MUST → ekler); Mealpy full_name
+# Phase-3 sabit algoritma listesi (Mealpy full_name)
+# Not: "BAT" için Mealpy sınıfı BA.OriginalBA kullanılır.
 PHASE3_FIXED_ALGORITHM_FULL_NAMES = (
-    # TOP10
-    "HGS.OriginalHGS",
-    "HHO.OriginalHHO",
-    "AEO.OriginalAEO",
     "CircleSA.OriginalCircleSA",
-    "MFO.OriginalMFO",
-    "SquirrelSA.OriginalSquirrelSA",
-    "INFO.OriginalINFO",
-    "NGO.OriginalNGO",
-    "BWO.OriginalBWO",
-    # LİTERATÜR
+    "BES.OriginalBES",
+    "TSO.OriginalTSO",
+    "HHO.OriginalHHO",
+    "HGS.OriginalHGS",
     "WOA.OriginalWOA",
+    "BA.OriginalBA",        # BAT
+    "GA.MultiGA",           # non-Original, _phase3_extra_mealpy_entries() ile eklenir
+    "DE.OriginalDE",
     "GWO.OriginalGWO",
+    "GOA.OriginalGOA",
     "PSO.OriginalPSO",
-    # MUST
-    "OOA.OriginalOOA",
-    "SFOA.OriginalSFOA",
-    "DOA.OriginalDOA",
-    # EK
-    "BeesA.OriginalBeesA",
-    "HBA.OriginalHBA",
-    "MPA.OriginalMPA",
+    "ABC.OriginalABC",
     "AGTO.OriginalAGTO",
-    "SA.OriginalSA",
-    "CoatiOA.OriginalCoatiOA",
-    "GBO.OriginalGBO",
-    "ASO.OriginalASO",
     "AVOA.OriginalAVOA",
-    "SA.GaussianSA",  # Gaussian Simulated Annealing (katalogda yok, aşağıda eklenir)
+    "MFO.OriginalMFO",
+    "TWO.OriginalTWO",
+    "SMA.OriginalSMA",
+    "BeesA.OriginalBeesA",
 )
+
+
+def _phase3_family_label(full_name: str) -> str:
+    """
+    Basit aile etiketi:
+      - global_local: hibrit adlar (X+Y / X||Y)
+      - memetic: GA.MultiGA
+      - global: diğer tek-algoritma yaklaşımları
+    """
+    n = str(full_name)
+    if "+" in n or "||" in n:
+        return "global_local"
+    if n == "GA.MultiGA":
+        return "memetic"
+    return "global"
+
+
+def _phase3_rationale(full_name: str) -> str:
+    fam = _phase3_family_label(full_name)
+    if fam == "global_local":
+        return "Hybrid global+local arama; kesif ve somuruyu birlikte dengeler."
+    if fam == "memetic":
+        return "Memetic GA; evrimsel arama ile yerel iyilestirmeyi birlestirir."
+    return "Tek-katman global arama; karsilastirma ve saglam baseline icin uygun."
+
+
+def _write_algorithm_notes(run_root: str, algos_phase3: List[dict]) -> None:
+    path = os.path.join(run_root, "algorithm_selection_notes.csv")
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["algorithm", "family", "rationale"])
+        for a in algos_phase3:
+            name = a["full_name"]
+            writer.writerow([name, _phase3_family_label(name), _phase3_rationale(name)])
 
 # Tekrar sayısı (ardışık klasör: start, start+1, …)
 N_PHASE3_REPEATS = 20
 # İlk tekrar klasör numarası (--start-run / ONLY_PHASE3_RUN_START yoksa kullanılır)
 PHASE3_RUN_START_DEFAULT = 17
+PHASE3_EPOCH_DEFAULT = 50
+PHASE3_POP_SIZE_DEFAULT = 30
+PHASE3_K3_DEFAULT = 30
+PHASE3_K_BEH_DEFAULT = 60
 
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
@@ -84,14 +116,7 @@ run_behavior_analysis = shared.run_behavior_analysis
 
 
 def parse_phase3_cli(argv=None):
-    """
-    Döndürür: (parallel_workers, run_start).
-
-    Workers: --workers / -j  >  ONLY_PHASE3_WORKERS  >  CPU (max 8).
-    İlk klasör no: --start-run  >  ONLY_PHASE3_RUN_START  >  PHASE3_RUN_START_DEFAULT (7).
-
-    IDE'den F5: PowerShell $env:... geçmeyebilir; o zaman --workers 6 gibi argüman kullanın.
-    """
+    """CLI argumanlarini cozer."""
     p = argparse.ArgumentParser(
         description="Sadece Aşama 3 — tekrarlı tam matris çalıştırması",
     )
@@ -111,6 +136,18 @@ def parse_phase3_cli(argv=None):
         metavar="N",
         help="İlk tekrar klasörü results/phase3/new_runs/N. "
         "Verilmezse ONLY_PHASE3_RUN_START, o da yoksa %d." % PHASE3_RUN_START_DEFAULT,
+    )
+    p.add_argument("--repeats", type=int, default=N_PHASE3_REPEATS)
+    p.add_argument("--max-minutes", type=float, default=None)
+    p.add_argument("--out-name", type=str, default=PHASE3_OUT_NAME_DEFAULT)
+    p.add_argument("--epoch", type=int, default=PHASE3_EPOCH_DEFAULT)
+    p.add_argument("--pop-size", type=int, default=PHASE3_POP_SIZE_DEFAULT)
+    p.add_argument("--k3", type=int, default=PHASE3_K3_DEFAULT)
+    p.add_argument("--k-beh", type=int, default=PHASE3_K_BEH_DEFAULT)
+    p.add_argument(
+        "--fast-5min",
+        action="store_true",
+        help="Hizli preset: epoch=8, pop_size=10, k3=20, k_beh=30, repeats<=10, max-minutes=5",
     )
     ns, _ = p.parse_known_args(argv if argv is not None else sys.argv[1:])
 
@@ -132,7 +169,24 @@ def parse_phase3_cli(argv=None):
         else:
             run_start = max(1, int(PHASE3_RUN_START_DEFAULT))
 
-    return workers, run_start
+    ns.workers = workers
+    ns.start_run = run_start
+    ns.repeats = max(1, int(ns.repeats))
+    ns.epoch = max(1, int(ns.epoch))
+    ns.pop_size = max(2, int(ns.pop_size))
+    ns.k3 = max(2, int(ns.k3))
+    ns.k_beh = max(2, int(ns.k_beh))
+
+    if ns.fast_5min:
+        ns.epoch = 8
+        ns.pop_size = 10
+        ns.k3 = 20
+        ns.k_beh = 30
+        ns.repeats = min(ns.repeats, 10)
+        if ns.max_minutes is None:
+            ns.max_minutes = 5.0
+
+    return ns
 
 
 def init_phase3_db(db_path=PHASE3_DB_PATH, table_name=PHASE3_DB_TABLE):
@@ -276,7 +330,8 @@ def _phase3_extra_mealpy_entries():
     get_all_algorithms_v3 yalnızca sınıf adı Original* olanları toplar.
     GaussianSA vb. burada tamamlanır.
     """
-    from mealpy.physics_based import SA
+    from mealpy.physics_based import SA, TWO
+    from mealpy.evolutionary_based import GA
 
     return {
         "SA.GaussianSA": {
@@ -284,6 +339,18 @@ def _phase3_extra_mealpy_entries():
             "module": "mealpy.physics_based.SA",
             "class_name": "GaussianSA",
             "class": SA.GaussianSA,
+        },
+        "GA.MultiGA": {
+            "full_name": "GA.MultiGA",
+            "module": "mealpy.evolutionary_based.GA",
+            "class_name": "MultiGA",
+            "class": GA.MultiGA,
+        },
+        "TWO.OriginalTWO": {
+            "full_name": "TWO.OriginalTWO",
+            "module": "mealpy.physics_based.TWO",
+            "class_name": "OriginalTWO",
+            "class": TWO.OriginalTWO,
         },
     }
 
@@ -392,25 +459,29 @@ Bu çalıştırmada üretilen dosyalar:
   - FINAL_RECOMMENDATIONS.csv (üst 5 öneri)
   - behavior_analysis.csv
 
-Kaynak: only-phase-3.py → PHASE3_FIXED_ALGORITHM_FULL_NAMES (25 seçilmiş)
+Kaynak: only-phase-3.py → PHASE3_FIXED_ALGORITHM_FULL_NAMES ({len(algos_phase3)} secilmis)
 Paralel Aşama 3 işçi: {PHASE3_PARALLEL_WORKERS} (--workers veya ONLY_PHASE3_WORKERS)
 Bu oturum: {run_ordinal}. tekrar / {n_repeats} | Klasör no: {run_idx}
 """
     with open(os.path.join(run_dir, "RUN_INFO.txt"), "w", encoding="utf-8") as f:
         f.write(info)
 
-    print(f"Sonuçlar: results/phase3/new_runs/{run_idx}/")
+    print(f"Sonuclar: {run_dir}")
     return run_dir
 
 
 if __name__ == "__main__":
-    PHASE3_PARALLEL_WORKERS, PHASE3_RUN_START = parse_phase3_cli()
+    ns = parse_phase3_cli()
+    PHASE3_PARALLEL_WORKERS = ns.workers
+    PHASE3_RUN_START = ns.start_run
+    N_PHASE3_REPEATS = ns.repeats
+    PHASE3_RUNS_ROOT = os.path.join(RESULTS_DIR, "phase3", ns.out_name)
     _last_run_idx = PHASE3_RUN_START + N_PHASE3_REPEATS - 1
 
     print("=" * 60)
     print("SADECE AŞAMA 3 — ÇOKLU TEKRAR")
     print(
-        f"Çıktı kökü: results/phase3/new_runs/{PHASE3_RUN_START} .. {_last_run_idx} "
+        f"Cikti koku: {PHASE3_RUNS_ROOT}/{PHASE3_RUN_START} .. {_last_run_idx} "
         f"({N_PHASE3_REPEATS} tekrar)"
     )
     _ev = os.environ.get("ONLY_PHASE3_WORKERS")
@@ -423,6 +494,10 @@ if __name__ == "__main__":
         f"  → ONLY_PHASE3_WORKERS={_ev!r} | ONLY_PHASE3_RUN_START={_evs!r} "
         f"| os.cpu_count()={os.cpu_count()}"
     )
+    print(
+        f"Parametreler: epoch={ns.epoch}, pop_size={ns.pop_size}, "
+        f"k3={ns.k3}, k_beh={ns.k_beh}, max_minutes={ns.max_minutes}"
+    )
     print("=" * 60)
 
     full_matrix_raw = load_movielens(
@@ -430,17 +505,29 @@ if __name__ == "__main__":
     )
     full_matrix = l2_normalize_users(full_matrix_raw)
     print("ML-100K matrisine satır-bazlı L2 normalization uygulandı.")
-    # Aşama 1/2 yok: sabit 25'li liste + mealpy sınıf eşlemesi
+    # Aşama 1/2 yok: sabit liste + mealpy sınıf eşlemesi
     all_algos = get_all_algorithms_v3()
     algos_phase3 = load_algorithms_by_full_names(
         PHASE3_FIXED_ALGORITHM_FULL_NAMES, all_algos
     )
 
-    print(f"Sabit alt küme → {len(algos_phase3)} algoritma:")
+    fam_counts = {"global": 0, "global_local": 0, "memetic": 0}
     for a in algos_phase3:
-        print(f"  {a['full_name']}")
+        fam = _phase3_family_label(a["full_name"])
+        fam_counts[fam] = fam_counts.get(fam, 0) + 1
+
+    print(f"Sabit alt küme → {len(algos_phase3)} algoritma:")
+    print(
+        "Aile sayilari -> "
+        f"global: {fam_counts.get('global', 0)}, "
+        f"global_local: {fam_counts.get('global_local', 0)}, "
+        f"memetic: {fam_counts.get('memetic', 0)}"
+    )
+    for a in algos_phase3:
+        print(f"  {a['full_name']}  [{_phase3_family_label(a['full_name'])}]")
 
     os.makedirs(PHASE3_RUNS_ROOT, exist_ok=True)
+    _write_algorithm_notes(PHASE3_RUNS_ROOT, algos_phase3)
     try:
         init_phase3_db()
         print(f"DB hazır: {PHASE3_DB_PATH} | tablo: {PHASE3_DB_TABLE}")
@@ -448,10 +535,19 @@ if __name__ == "__main__":
         DB_WRITE_ENABLED = False
         print(f"DB init uyarı: DB devre dışı, CSV ile devam. Hata: {e}")
 
+    t_global_start = time.time()
     for run_ordinal, run_idx in enumerate(
         range(PHASE3_RUN_START, PHASE3_RUN_START + N_PHASE3_REPEATS),
         start=1,
     ):
+        if ns.max_minutes is not None:
+            elapsed_min = (time.time() - t_global_start) / 60.0
+            if elapsed_min >= float(ns.max_minutes):
+                print(
+                    f"\nZaman limiti doldu ({elapsed_min:.2f} dk >= {ns.max_minutes} dk). "
+                    "Yeni tekrar baslatilmiyor."
+                )
+                break
         print("\n" + "=" * 60)
         print(
             f"TEKRAR klasör {run_idx} (oturum {run_ordinal}/{N_PHASE3_REPEATS})"
@@ -463,6 +559,10 @@ if __name__ == "__main__":
             algos_phase3,
             run_ordinal=run_ordinal,
             n_repeats=N_PHASE3_REPEATS,
+            K3=ns.k3,
+            K_beh=ns.k_beh,
+            epoch=ns.epoch,
+            pop_size=ns.pop_size,
         )
         aggregate_all_runs(PHASE3_RUNS_ROOT)
 
