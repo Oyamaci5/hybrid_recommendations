@@ -70,6 +70,7 @@ from mealpy_comparison_v2 import (
     mkmeans_plus_plus_init,
     make_fitness_function,
     compute_wcss_fast,
+    compute_fcm_objective,
     detect_gray_sheep,
     get_all_algorithms_v3,
     get_special_params,
@@ -88,8 +89,8 @@ except ImportError:
 DATA_100K = os.path.join(os.path.dirname(BASE_DIR), 'data', 'ml-100k', 'u.data')
 DATA_1M   = os.path.join(os.path.dirname(BASE_DIR), 'data', 'ml-1m',   'ratings.dat')
 
-K_100K_DEFAULT = 90
-K_1M_DEFAULT   = 150
+K_100K_DEFAULT = 30
+K_1M_DEFAULT   = 70
 
 GLOBAL_EPOCH   = 30
 LOCAL_EPOCH    = 20
@@ -465,7 +466,7 @@ def run_memetic_hybrid(base_info, matrix, K, init,
 
 def save_assignment(assignments, gray_mask, best_sol, best_fit,
                     save_dir, extra_data=None, label=None, K=None, args=None,
-                    run_id=None, seed=None):
+                    run_id=None, seed=None, memberships=None):
     """
     Assignment dosyalarını kaydet.
     extra_data: LOF modunda lof_scores gibi ek veriler dict olarak geçilir.
@@ -473,6 +474,8 @@ def save_assignment(assignments, gray_mask, best_sol, best_fit,
     os.makedirs(save_dir, exist_ok=True)
 
     np.save(os.path.join(save_dir, 'assignments.npy'),     assignments)
+    if memberships is not None:
+        np.save(os.path.join(save_dir, 'memberships.npy'), memberships)
     np.save(os.path.join(save_dir, 'gray_sheep_mask.npy'), gray_mask)
     np.save(os.path.join(save_dir, 'best_sol.npy'),        best_sol)
 
@@ -638,9 +641,18 @@ def _run_one_core(
             metric=cluster_metric,
         )
 
+    memberships = None
     if g_name != 'KMEANS':
         _, assignments = compute_wcss_fast(
             matrix, best_sol, K, metric=cluster_metric,
+        )
+        if cluster_metric == 'fuzzy':
+            _, assignments, memberships = compute_fcm_objective(
+                matrix, best_sol, K, m=2.0,
+            )
+    elif cluster_metric == 'fuzzy':
+        _, assignments, memberships = compute_fcm_objective(
+            matrix, best_sol, K, m=2.0,
         )
 
     if use_lof:
@@ -660,10 +672,16 @@ def _run_one_core(
         gray_mask  = gs_info['gray_sheep_mask']
         extra_data = {'threshold': gs_info['threshold']}
 
+    # DB'de WCSS kolonu her zaman gerçek kümeleme hedefini taşısın;
+    # optimizer'ın iç objective'i (kompozit vb.) ile karışmasın.
+    best_wcss, _ = compute_wcss_fast(
+        matrix, best_sol, K, metric=cluster_metric,
+    )
+
     save_assignment(
-        assignments, gray_mask, best_sol, best_fit,
+        assignments, gray_mask, best_sol, best_wcss,
         save_dir, extra_data, label=label, K=K, args=args,
-        run_id=run_id, seed=seed,
+        run_id=run_id, seed=seed, memberships=memberships,
     )
     print(f"  [{label}] tamamlandı — {time.time()-t0:.1f}s")
 
@@ -928,6 +946,8 @@ def prepare_matrix_for_clustering(
     inmed_trim=(5.0, 95.0),
 ):
     """Sıra: prune → z-score → PCA → WNMF (--pca ile --wnmf-features birlikte CLI’de yasak)."""
+    from sklearn.preprocessing import normalize
+
     matrix = prune_sparse_matrix(
         matrix,
         min_user_ratings=min_user_ratings,
@@ -936,6 +956,9 @@ def prepare_matrix_for_clustering(
     if zscore:
         matrix = zscore_normalize(matrix)
         print("  Z-score normalizasyon uygulandı")
+        # Pearson benzerliği ile K-Means (L2/Euclidean) geometrisini hizala.
+        matrix = normalize(matrix, norm='l2', axis=1).astype(np.float32, copy=False)
+        print("  L2 normalization uygulandı (axis=1)")
     if pca_var is not None:
         matrix = pca_variance_reduce(matrix, pca_var)
     if wnmf_k is not None:
@@ -1108,10 +1131,10 @@ def parse_args():
         help='INMED trimmed mean üst yüzdelik (default: 95.0)',
     )
     p.add_argument(
-        '--cluster-metric', choices=['auto', 'pearson', 'euclidean'],
+        '--cluster-metric', choices=['auto', 'pearson', 'euclidean', 'fuzzy'],
         default='auto',
         help='Sürü kümeleme fitness: auto = WNMF kullanıldıysa euclidean, '
-             'aksi halde pearson (seyrek rating uzayı).',
+             'aksi halde pearson (seyrek rating uzayı). fuzzy = FCM (m=2.0).',
     )
     p.add_argument(
         '--save-wnmf-u', type=str, default=None, metavar='DIR',
@@ -1313,7 +1336,12 @@ if __name__ == '__main__':
         f'_wnmf{args.wnmf_features}_{args.wnmf_init}_trim{args.inmed_trim_low:g}_{args.inmed_trim_high:g}'
         if args.wnmf_features is not None else ''
     )
-    out_suffix = prune_suffix + zscore_suffix + pca_suffix + wnmf_suffix
+    metric_suffix_map = {
+        'euclidean': '_euc',
+        'fuzzy': '_fuzzy',
+    }
+    metric_suffix = metric_suffix_map.get(args.cluster_metric, '')
+    out_suffix = prune_suffix + zscore_suffix + pca_suffix + wnmf_suffix + metric_suffix
 
     try:
         if args.dataset in ('100k', 'both'):

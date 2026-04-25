@@ -14,7 +14,7 @@ Kapsam:
 ## 1) Uctan Uca Akis (Kisa Ozet)
 
 1. Veri yuklenir (`ml-100k` veya `ml-1m`)
-2. Clustering matrisi hazirlanir: `prune -> zscore -> (opsiyonel) PCA -> (opsiyonel) WNMF U`
+2. Clustering matrisi hazirlanir (sira vardir): `prune -> (opsiyonel) zscore -> (opsiyonel) PCA veya (opsiyonel) WNMF U`
 3. Meta-sezgisel algoritmalar ile assignment (kume atama) uretilir
 4. Gray sheep tespiti yapilir (percentile veya LOF)
 5. Assignment dosyalari kaydedilir (`assignments.npy`, `gray_sheep_mask.npy`, vs.)
@@ -25,6 +25,14 @@ Kapsam:
    - `cluster_sharedV`
    - (opsiyonel) `global`
    senaryolari kosulur
+
+Onemli not:
+- Bu adimlar pipeline sirasini gosterir.
+- `prune` her durumda once calisir.
+- `zscore` aciksa `prune` sonrasi uygulanir.
+- `PCA` ile `WNMF` ayni kosuda birlikte acilmaz (`--pca` + `--wnmf-features` yasak).
+- Yani pratikte iki ayrik dal vardir: `... -> PCA` veya `... -> WNMF`.
+- Komut ornekleri icin: `docs/preprocess_kullanim_ornekleri.md`
 
 ---
 

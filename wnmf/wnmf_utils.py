@@ -7,6 +7,7 @@ WNMF deneyleri için yardımcı fonksiyonlar.
     load_ratings_100k()    — ML-100K train/test yükle
     load_ratings_1m()      — ML-1M train/test yükle
     load_assignment()      — assignments.npy + gray_sheep_mask.npy yükle
+    load_memberships()     — memberships.npy (opsiyonel) yükle
     split_by_cluster()     — rating'leri kümelere böl
     remap_user_ids()       — küme içi kullanıcı indekslerini sıfırdan başlat
     save_results()         — sonuçları CSV olarak kaydet (isteğe bağlı komut satırı başlığı)
@@ -198,6 +199,23 @@ def load_assignment(assignment_dir: str) -> Tuple[np.ndarray, np.ndarray]:
     print(f"  Aktif küme  : {n_clusters}")
 
     return assignments, gray_mask
+
+
+def load_memberships(assignment_dir: str) -> Optional[np.ndarray]:
+    """
+    Soft üyelik matrisi (memberships.npy) varsa yükle.
+    Yoksa None döner; eski assignment çıktılarıyla geriye uyum korunur.
+    """
+    path = os.path.join(assignment_dir, 'memberships.npy')
+    if not os.path.exists(path):
+        return None
+    memberships = np.load(path)
+    if memberships.ndim != 2:
+        raise ValueError(
+            f"load_memberships: memberships.npy 2D olmalı, gelen shape={memberships.shape}"
+        )
+    print(f"  memberships yüklendi: {memberships.shape}")
+    return memberships
 
 
 # ============================================================

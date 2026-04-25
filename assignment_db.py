@@ -106,6 +106,7 @@ CREATE TABLE IF NOT EXISTS wnmf_results (
     precision_at_10     REAL,
     recall_at_10        REAL,
     f1_at_10            REAL,
+    ndcg_at_10          REAL,
     n_train             INTEGER,
     n_test              INTEGER,
     latent_dim          INTEGER,
@@ -114,6 +115,13 @@ CREATE TABLE IF NOT EXISTS wnmf_results (
     reg                 REAL,
     lr                  REAL,
     time_seconds        REAL,
+    cv_fold             INTEGER,
+    cv_n_splits         INTEGER,
+    is_cv_mean          INTEGER DEFAULT 0,
+    mean_mae            REAL,
+    mean_rmse           REAL,
+    fold_mae_values     TEXT,
+    fold_rmse_values    TEXT,
     created_at          TEXT
 );
 """
@@ -178,6 +186,26 @@ def init_db():
             _recreate_all_tables(conn)
         else:
             conn.executescript(SCHEMA)
+        _ensure_wnmf_results_columns(conn)
+
+
+def _ensure_wnmf_results_columns(conn):
+    """CV metrikleri için geriye uyumlu kolon ekleme."""
+    rows = conn.execute('PRAGMA table_info(wnmf_results)').fetchall()
+    existing = {r[1] for r in rows}
+    needed = {
+        'cv_fold': 'ALTER TABLE wnmf_results ADD COLUMN cv_fold INTEGER',
+        'cv_n_splits': 'ALTER TABLE wnmf_results ADD COLUMN cv_n_splits INTEGER',
+        'is_cv_mean': 'ALTER TABLE wnmf_results ADD COLUMN is_cv_mean INTEGER DEFAULT 0',
+        'mean_mae': 'ALTER TABLE wnmf_results ADD COLUMN mean_mae REAL',
+        'mean_rmse': 'ALTER TABLE wnmf_results ADD COLUMN mean_rmse REAL',
+        'fold_mae_values': 'ALTER TABLE wnmf_results ADD COLUMN fold_mae_values TEXT',
+        'fold_rmse_values': 'ALTER TABLE wnmf_results ADD COLUMN fold_rmse_values TEXT',
+        'ndcg_at_10': 'ALTER TABLE wnmf_results ADD COLUMN ndcg_at_10 REAL',
+    }
+    for col, sql in needed.items():
+        if col not in existing:
+            conn.execute(sql)
 
 
 def start_run(
@@ -480,17 +508,31 @@ def save_wnmf_result(
     reg,
     lr,
     time_seconds,
+    ndcg_at_10=None,
+    cv_fold=None,
+    cv_n_splits=None,
+    is_cv_mean=0,
+    mean_mae=None,
+    mean_rmse=None,
+    fold_mae_values=None,
+    fold_rmse_values=None,
     run_id=None,
+    assignment_id_override=None,
 ):
-    assignment_id = get_assignment_id(dataset, algo, k, preprocessing)
+    assignment_id = (
+        assignment_id_override
+        if assignment_id_override is not None
+        else get_assignment_id(dataset, algo, k, preprocessing)
+    )
     now = datetime.now().isoformat()
     sql = """
     INSERT INTO wnmf_results
         (assignment_id, run_id, scenario, mae, rmse, gray_mae, gray_rmse,
-         white_mae, white_rmse, precision_at_10, recall_at_10, f1_at_10,
+         white_mae, white_rmse, precision_at_10, recall_at_10, f1_at_10, ndcg_at_10,
          n_train, n_test, latent_dim, epochs_global, epochs_cluster,
-         reg, lr, time_seconds, created_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         reg, lr, time_seconds, cv_fold, cv_n_splits, is_cv_mean,
+         mean_mae, mean_rmse, fold_mae_values, fold_rmse_values, created_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """
     with get_connection() as conn:
         conn.execute(
@@ -508,6 +550,7 @@ def save_wnmf_result(
                 precision_at_10,
                 recall_at_10,
                 f1_at_10,
+                ndcg_at_10,
                 n_train,
                 n_test,
                 latent_dim,
@@ -516,6 +559,13 @@ def save_wnmf_result(
                 reg,
                 lr,
                 time_seconds,
+                cv_fold,
+                cv_n_splits,
+                int(bool(is_cv_mean)),
+                mean_mae,
+                mean_rmse,
+                fold_mae_values,
+                fold_rmse_values,
                 now,
             ),
         )

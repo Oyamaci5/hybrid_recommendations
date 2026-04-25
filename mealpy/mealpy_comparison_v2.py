@@ -22,6 +22,7 @@ mkmeans_plus_plus_init = _mod.mkmeans_plus_plus_init
 compute_wcss_fast = _mod.compute_wcss_fast
 detect_gray_sheep = _mod.detect_gray_sheep
 make_fitness_function = _mod.make_fitness_function
+compute_fcm_objective = _mod.compute_fcm_objective
 pearson_distance_batch = _mod.pearson_distance_batch
 euclidean_distance_batch = _mod.euclidean_distance_batch
 _compute_metrics = _mod._compute_metrics
@@ -35,6 +36,7 @@ __all__ = [
     "compute_wcss_fast",
     "detect_gray_sheep",
     "make_fitness_function",
+    "compute_fcm_objective",
     "pearson_distance_batch",
     "euclidean_distance_batch",
     "_compute_metrics",

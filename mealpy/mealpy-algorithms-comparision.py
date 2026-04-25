@@ -19,7 +19,7 @@ Düzeltmeler:
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import silhouette_score, davies_bouldin_score
+from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
 import time
 import warnings
 import os
@@ -168,12 +168,59 @@ def euclidean_distance_batch(users, centroids):
     return np.maximum(d2, 0.0)
 
 
+def _fcm_memberships_from_dist(dist_matrix, m: float = 2.0, eps: float = 1e-12):
+    """
+    FCM üyelikleri: u_ij = 1 / sum_k (d_ij / d_ik)^(2/(m-1)).
+    dist_matrix shape: (n_users, K), değerler d_ij (non-negative).
+    """
+    dist = np.asarray(dist_matrix, dtype=np.float64)
+    if dist.ndim != 2:
+        raise ValueError(f"dist_matrix 2D olmalı, gelen shape={dist.shape}")
+
+    n_users, n_clusters = dist.shape
+    memberships = np.zeros((n_users, n_clusters), dtype=np.float64)
+    power = 2.0 / (float(m) - 1.0)
+
+    for i in range(n_users):
+        row = np.maximum(dist[i], 0.0)
+        zero_mask = row <= eps
+        if np.any(zero_mask):
+            # d_ij = 0 için üyelik, sıfır mesafeli kümeler arasında eşit paylaşılır.
+            zc = int(np.sum(zero_mask))
+            memberships[i, zero_mask] = 1.0 / zc
+            continue
+
+        ratio = (row[:, None] / row[None, :]) ** power
+        denom = np.sum(ratio, axis=1)
+        memberships[i] = 1.0 / np.maximum(denom, eps)
+
+    return memberships
+
+
+def compute_fcm_objective(matrix, solution, K, m: float = 2.0):
+    """
+    FCM amaç fonksiyonu:
+        J = sum_i sum_j (u_ij^m) * (d_ij^2)
+    Burada d_ij Öklid mesafesi, d_ij^2 için squared Euclidean kullanılır.
+    """
+    centroids = solution.reshape(K, matrix.shape[1])
+    d2 = euclidean_distance_batch(matrix, centroids)   # squared Euclidean
+    d = np.sqrt(np.maximum(d2, 0.0))
+    memberships = _fcm_memberships_from_dist(d, m=m)
+    j_val = float(np.sum((memberships ** float(m)) * d2))
+    hard_assignments = np.argmax(memberships, axis=1).astype(np.int32)
+    return j_val, hard_assignments, memberships
+
+
 def compute_wcss_fast(matrix, solution, K, metric='pearson'):
     """
     metric='pearson' : rating/latent için Pearson mesafesi (1-corr) toplamı.
     metric='euclidean' : k-means tarzı SSE — atanan merkeze squared L2 toplamı.
     """
     centroids = solution.reshape(K, matrix.shape[1])
+    if metric == 'fuzzy':
+        j_val, hard_assignments, _ = compute_fcm_objective(matrix, solution, K, m=2.0)
+        return float(j_val), hard_assignments
     if metric == 'euclidean':
         dist_matrix = euclidean_distance_batch(matrix, centroids)
     elif metric == 'pearson':
@@ -186,9 +233,53 @@ def compute_wcss_fast(matrix, solution, K, metric='pearson'):
 
 
 def make_fitness_function(matrix, K, metric='pearson'):
+    baseline = None
+    eps = 1e-12
+
+    def _sample_indices(n_rows, max_n=300):
+        if n_rows <= max_n:
+            return np.arange(n_rows)
+        return np.random.choice(n_rows, max_n, replace=False)
+
+    def _multiobjective_score(solution):
+        nonlocal baseline
+        wcss, assignments = compute_wcss_fast(matrix, solution, K, metric=metric)
+
+        idx = _sample_indices(len(matrix), max_n=300)
+        sub_x = matrix[idx]
+        sub_y = assignments[idx]
+
+        sil = -1.0
+        ch = 1.0
+        uniq = np.unique(sub_y)
+        if len(uniq) >= 2 and len(uniq) < len(sub_y):
+            try:
+                sil = float(silhouette_score(sub_x, sub_y, metric='cosine'))
+            except Exception:
+                sil = -1.0
+            try:
+                ch = float(calinski_harabasz_score(sub_x, sub_y))
+            except Exception:
+                ch = 1.0
+
+        obj_wcss = float(max(wcss, 0.0))
+        obj_sil = float(1.0 - sil)
+        obj_ch = float(1.0 / max(ch, eps))
+
+        if baseline is None:
+            baseline = {
+                'wcss': max(obj_wcss, eps),
+                'sil': max(obj_sil, eps),
+                'ch': max(obj_ch, eps),
+            }
+
+        norm_wcss = obj_wcss / baseline['wcss']
+        norm_sil = obj_sil / baseline['sil']
+        norm_ch = obj_ch / baseline['ch']
+        return float(0.50 * norm_wcss + 0.25 * norm_sil + 0.25 * norm_ch)
+
     def fitness(solution):
-        wcss, _ = compute_wcss_fast(matrix, solution, K, metric=metric)
-        return float(wcss)
+        return _multiobjective_score(solution)
     return fitness
 
 
@@ -451,7 +542,7 @@ def _run_algo_v3_serialized(algo_module, class_name, algo_name,
             model.solve(problem)
 
         best_sol = model.g_best.solution
-        best_fit = model.g_best.target.fitness
+        best_fit, _ = compute_wcss_fast(matrix, best_sol, K, metric='pearson')
         metrics = _compute_metrics(matrix, best_sol, K)
 
         return {
@@ -554,7 +645,7 @@ def run_algorithm_v3(algo_info, matrix, K,
             model.solve(problem)
 
         best_sol = model.g_best.solution
-        best_fit = model.g_best.target.fitness
+        best_fit, _ = compute_wcss_fast(matrix, best_sol, K, metric='pearson')
         metrics  = _compute_metrics(matrix, best_sol, K)
 
         return {
@@ -624,14 +715,26 @@ def run_algorithm_with_history(algo_info, matrix, K,
     special   = get_special_params(algo_name, epoch, pop_size)
     model     = algo_info['class'](**(special or {'epoch': epoch, 'pop_size': pop_size}))
 
+    solve_start = time.time()
     try:
         model.solve(problem, starting_solutions=initial_solutions[:pop_size])
     except TypeError:
         model.solve(problem)
+    execution_time_sec = time.time() - solve_start
 
     history    = model.history.list_global_best_fit
     conv_speed = _convergence_speed(history)
     expl_ratio = _exploration_ratio(history)
+    best_sol = model.g_best.solution
+    _, labels = compute_wcss_fast(matrix, best_sol, K)
+
+    ch_score = np.nan
+    unique_labels = np.unique(labels)
+    if len(unique_labels) >= 2 and len(unique_labels) < len(matrix):
+        try:
+            ch_score = float(calinski_harabasz_score(matrix, labels))
+        except Exception:
+            ch_score = np.nan
 
     if conv_speed <= epoch * 0.3 and expl_ratio < 0.1:
         category = 'LOCAL'
@@ -640,12 +743,16 @@ def run_algorithm_with_history(algo_info, matrix, K,
     else:
         category = 'BALANCED'
 
+    final_wcss, _ = compute_wcss_fast(matrix, best_sol, K, metric='pearson')
+
     return {
         'algorithm'      : algo_name,
-        'final_wcss'     : float(model.g_best.target.fitness),
+        'final_wcss'     : float(final_wcss),
         'history'        : history,
         'convergence_speed': conv_speed,
         'exploration_ratio': expl_ratio,
+        'execution_time_sec': float(execution_time_sec),
+        'ch_score': ch_score,
         'category'       : category,
     }
 
@@ -667,6 +774,8 @@ def run_behavior_analysis(algo_list, matrix, K,
             print(f"✓ WCSS={r['final_wcss']:.1f} | "
                   f"ConvSpeed={r['convergence_speed']} | "
                   f"ExplRatio={r['exploration_ratio']:.2f} | "
+                  f"Time={r['execution_time_sec']:.2f}s | "
+                  f"CH={r['ch_score']:.2f} | "
                   f"Kategori={r['category']}")
         except Exception as e:
             print(f"✗ {e}")
@@ -691,6 +800,8 @@ def run_behavior_analysis(algo_list, matrix, K,
         'final_wcss'       : r['final_wcss'],
         'convergence_speed': r['convergence_speed'],
         'exploration_ratio': r['exploration_ratio'],
+        'execution_time_sec': r['execution_time_sec'],
+        'ch_score'         : r['ch_score'],
         'category'         : r['category'],
     } for r in results]).to_csv(
         os.path.join(save_path, 'behavior_analysis.csv'), index=False
@@ -796,7 +907,7 @@ def run_hybrid_algorithm(global_algo_info, local_algo_info,
         hybrid.solve(problem, initial_solutions=initial_solutions)
 
         best_sol = hybrid.g_best.solution
-        best_fit = hybrid.g_best.target.fitness
+        best_fit, _ = compute_wcss_fast(matrix, best_sol, K, metric='pearson')
         metrics  = _compute_metrics(matrix, best_sol, K)
 
         return {
