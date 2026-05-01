@@ -1,9 +1,10 @@
-"""Optimizer implementations for Matrix Factorization."""
+"""Optimizers used by the active pipeline.
 
-from optimizers.base_optimizer import BaseOptimizer
-from optimizers.sgd import SGDOptimizer
-from optimizers.pso import PSOOptimizer
-from optimizers.hho import HHOOptimizer
+- DOA: clustering centroid optimizer (used by experiments/main_clustering_cf.py)
+- DE_HHO: custom hybrid for clustering assignments (used by mealpy/generate_assignments.py)
+"""
 
-__all__ = ['BaseOptimizer', 'SGDOptimizer', 'PSOOptimizer', 'HHOOptimizer']
+from optimizers.doa import DOA
+from optimizers.de_hho import DE_HHO
 
+__all__ = ["DOA", "DE_HHO"]

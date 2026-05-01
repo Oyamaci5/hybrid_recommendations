@@ -1,6 +1,5 @@
-"""Model definitions for the recommender system."""
+"""Recommendation models used by the active pipeline."""
 
-from models.mf_model import MFModel
+from models.wnmf import WNMF
 
-__all__ = ['MFModel']
-
+__all__ = ["WNMF"]
