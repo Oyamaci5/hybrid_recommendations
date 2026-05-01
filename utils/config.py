@@ -96,24 +96,6 @@ class OutputConfig:
 
 
 @dataclass
-class OfflineAssignmentsConfig:
-    """Offline-assignment akışı (pipeline_mode='offline_assignments').
-
-    Önceden mealpy/generate_assignments.py ile üretilmiş assignment .npy
-    dosyasını tüketir, ClusterManager + CFRecommender üzerinden tahmin
-    artefaktları üretir ve Evaluator ile metrik raporu çıkarır.
-    """
-    assignment_path: str = ""
-    gray_mask_path: str = ""
-    ratings_path: str = ""
-    prediction_dir: str = "results/offline_assignments/predictions"
-    evaluation_dir: str = "results/offline_assignments/evaluation"
-    n_reco: int = 10
-    relevance_threshold: float = 3.5
-    max_users: int = 0  # 0 → tüm kullanıcılar
-
-
-@dataclass
 class MFTuningConfig:
     param_bounds: dict[str, list[float]] = field(
         default_factory=lambda: {
@@ -142,7 +124,6 @@ class Config:
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
     mf_tuning: MFTuningConfig = field(default_factory=MFTuningConfig)
-    offline_assignments: OfflineAssignmentsConfig = field(default_factory=OfflineAssignmentsConfig)
 
     @classmethod
     def from_yaml(cls, path: str) -> "Config":
@@ -162,7 +143,6 @@ class Config:
             evaluation=EvaluationConfig(**data.get("evaluation", {})),
             output=OutputConfig(**data.get("output", {})),
             mf_tuning=MFTuningConfig(**data.get("mf_tuning", {})),
-            offline_assignments=OfflineAssignmentsConfig(**data.get("offline_assignments", {})),
         )
         opt_section = data.get("optimizer", {})
         algo_name = cfg.optimizer.name

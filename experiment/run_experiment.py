@@ -1,9 +1,8 @@
-"""Genel CLI giriş noktası (config + pipeline_mode dispatch)."""
+﻿"""Genel CLI giriş noktası (config + bileşen listesi veya smoke)."""
 
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
@@ -22,23 +21,10 @@ def main() -> None:
     args = ap.parse_args()
 
     runner = ExperimentRunner(config_path=args.config, overrides=args.override or None)
-
     if args.smoke:
         out = runner.run_dummy_smoke()
         print(out)
         return
-
-    cfg = runner.load()
-    mode = (cfg.pipeline_mode or "cluster").strip().lower()
-
-    if mode == "offline_assignments":
-        out = runner.run_offline_assignments()
-        print(json.dumps({"prediction_dir": out["prediction_dir"],
-                          "evaluation_dir": out["evaluation_dir"],
-                          "summary": out["summary"]}, indent=2, ensure_ascii=False))
-        return
-
-    # cluster / meta_mf_tune: bileşenleri kur, build_pipeline çalıştırılır
     c = runner.components()
     print("Pipeline bileşenleri hazır:", list(c.keys()))
 
