@@ -5,8 +5,8 @@ ALGO_CONFIG listesindeki algoritmalar için (başta B1/B2/H1/H4, sonra B3, hibri
 ML-100K ve ML-1M üzerinde tek run çalıştırır, assignment kaydeder.
 
 Gray sheep tespiti:
-    Varsayılan : Sabit 80. percentile (~%20 gray sheep)
-    --lof flag  : LOF tabanlı adaptif threshold (önerilen)
+    Varsayılan : Distance-threshold (PCC distance, default threshold=0.8)
+    --lof flag  : LOF tabanlı adaptif threshold
 
 Çıktı yapısı:
     --lof verilmezse : results/assignments/
@@ -22,6 +22,7 @@ Gray sheep tespiti:
 
 Kullanım:
     python generate_assignments.py                            # varsayılan
+    python generate_assignments.py                            # threshold gray sheep
     python generate_assignments.py --lof                      # LOF gray sheep
     python generate_assignments.py --dataset 100k --algo H4_MFO+HHO
     python generate_assignments.py --last-only               # sadece son algoritma
@@ -76,6 +77,7 @@ from mealpy_comparison_v2 import (
     get_special_params,
 )
 from core.fitness import calculate_clustering_fitness
+from core.metrics import pearson_distance
 from mealpy import FloatVar
 from mealpy.evolutionary_based import GA
 try:
@@ -94,10 +96,10 @@ DATA_1M   = os.path.join(os.path.dirname(BASE_DIR), 'data', 'ml-1m',   'ratings.
 K_100K_DEFAULT = 30
 K_1M_DEFAULT   = 70
 
-GLOBAL_EPOCH   = 20
-LOCAL_EPOCH    = 15
+GLOBAL_EPOCH   = 30
+LOCAL_EPOCH    = 40
 BASELINE_EPOCH = 100
-POP_SIZE       = 15
+POP_SIZE       = 30
 SEED           = 42
 
 LOF_N_NEIGHBORS   = 20
@@ -143,7 +145,7 @@ def _resolve_pool_workers(requested: Optional[int], n_tasks: int) -> int:
 
 
 # ============================================================
-# GRAY SHEEP TESPİTİ — İKİ MOD
+# GRAY SHEEP TESPİTİ — MODLAR
 # ============================================================
 
 def detect_gray_sheep_percentile(matrix, assignments, solution, K,
@@ -156,6 +158,53 @@ def detect_gray_sheep_percentile(matrix, assignments, solution, K,
     return detect_gray_sheep(matrix, assignments, solution, K, metric=metric)
 
 
+def detect_gray_sheep_distance_threshold(
+    matrix,
+    assignments,
+    solution,
+    K,
+    threshold: float = 0.80,
+    metric: str = 'pearson',
+):
+    """
+    Distance-threshold gray sheep tespiti.
+
+    dist(u, center[label[u]]) > threshold ise kullanıcı gray sheep kabul edilir.
+    Gray sheep kullanıcıların assignment etiketi K olarak güncellenir.
+    """
+    centers = np.asarray(solution).reshape(K, matrix.shape[1])
+    gray_mask = np.zeros(len(matrix), dtype=bool)
+    distances = np.zeros(len(matrix), dtype=np.float32)
+
+    for u in range(len(matrix)):
+        cid = int(assignments[u])
+        if cid < 0 or cid >= K:
+            continue
+        if metric == 'euclidean':
+            idx = np.where((matrix[u] != 0) & (centers[cid] != 0))[0]
+            if len(idx) == 0:
+                dist = float('inf')
+            else:
+                dist = float(np.linalg.norm(matrix[u, idx] - centers[cid, idx]))
+        else:
+            dist = float(pearson_distance(matrix[u], centers[cid]))
+        distances[u] = dist
+        if dist > threshold:
+            gray_mask[u] = True
+
+    assignments_with_gray = np.asarray(assignments).copy()
+    assignments_with_gray[gray_mask] = int(K)
+
+    return {
+        'gray_sheep_mask': gray_mask,
+        'threshold': float(threshold),
+        'gray_sheep_count': int(gray_mask.sum()),
+        'gray_sheep_ratio': float(gray_mask.mean()),
+        'distances': distances,
+        'assignments_with_gray': assignments_with_gray,
+    }
+
+
 def detect_gray_sheep_lof(matrix, assignments, n_neighbors=LOF_N_NEIGHBORS,
                           contamination=LOF_CONTAMINATION):
     """
@@ -165,7 +214,6 @@ def detect_gray_sheep_lof(matrix, assignments, n_neighbors=LOF_N_NEIGHBORS,
     - Threshold veriden otomatik belirlenir
     - Gray sheep sayısı veri yapısına göre değişir
     - Jüri sorusuna net metodolojik cevap verilebilir:
-      'Neden %20?' değil, 'LOF skoru eşiği aştığında gray sheep'
 
     Parametreler
     ------------
@@ -602,6 +650,7 @@ def _run_one_core(
     save_dir,
     algo_map,
     use_lof,
+    distance_threshold,
     lof_n_neighbors,
     lof_contamination,
     baseline_epoch,
@@ -613,7 +662,7 @@ def _run_one_core(
     cluster_metric: str = 'pearson',
 ):
     """Ortak gövde: algo_map ana süreçte veya worker’da bir kez oluşturulur."""
-    mode_str = 'LOF' if use_lof else 'percentile'
+    mode_str = 'LOF' if use_lof else f'distance-threshold({distance_threshold:.3f})'
     print(f"\n  [{label}] başlıyor (gray sheep: {mode_str}, küme metrik: {cluster_metric})...")
     t0   = time.time()
     #init = mkmeans_plus_plus_init(matrix, K=K, n_solutions=50, seed=seed)
@@ -691,15 +740,23 @@ def _run_one_core(
             matrix, assignments, lof_n_neighbors, lof_contamination
         )
         gray_mask = gs_info['gray_sheep_mask']
+        assignments_final = np.asarray(assignments).copy()
+        assignments_final[gray_mask] = int(K)
         extra_data = {
             'lof_scores': gs_info['lof_scores'],
             'threshold' : gs_info['threshold'],
         }
     else:
-        gs_info    = detect_gray_sheep_percentile(
-            matrix, assignments, best_sol, K, metric=cluster_metric,
+        gs_info    = detect_gray_sheep_distance_threshold(
+            matrix,
+            assignments,
+            best_sol,
+            K,
+            threshold=distance_threshold,
+            metric=cluster_metric,
         )
         gray_mask  = gs_info['gray_sheep_mask']
+        assignments_final = gs_info['assignments_with_gray']
         extra_data = {'threshold': gs_info['threshold']}
 
     # DB'de WCSS kolonu her zaman gerçek kümeleme hedefini taşısın;
@@ -709,7 +766,7 @@ def _run_one_core(
     )
 
     save_assignment(
-        assignments, gray_mask, best_sol, best_wcss,
+        assignments_final, gray_mask, best_sol, best_wcss,
         save_dir, extra_data, label=label, K=K, args=args,
         run_id=run_id, seed=seed, memberships=memberships,
     )
@@ -730,6 +787,7 @@ def _mp_run_assignment_job(job):
         seed,
         save_dir,
         use_lof,
+        distance_threshold,
         lof_n_neighbors,
         lof_contamination,
         baseline_epoch,
@@ -767,6 +825,7 @@ def _mp_run_assignment_job(job):
         save_dir,
         algo_map,
         use_lof,
+        distance_threshold,
         lof_n_neighbors,
         lof_contamination,
         baseline_epoch,
@@ -781,13 +840,14 @@ def _mp_run_assignment_job(job):
 
 def run_one(label, g_name, l_name, matrix, K, seed, save_dir, algo_map,
             use_lof=False, lof_n_neighbors=LOF_N_NEIGHBORS,
-            lof_contamination=LOF_CONTAMINATION, args=None, run_id=None,
+            lof_contamination=LOF_CONTAMINATION, distance_threshold: float = 0.80,
+            args=None, run_id=None,
             cluster_metric: str = 'pearson'):
     """
     Bir algoritma için assignment üret ve kaydet.
 
     use_lof=True  → LOF tabanlı gray sheep (adaptif)
-    use_lof=False → Sabit 80. percentile (~%20)
+    use_lof=False → Distance-threshold gray sheep (default: 0.80)
     """
     _run_one_core(
         label,
@@ -799,6 +859,7 @@ def run_one(label, g_name, l_name, matrix, K, seed, save_dir, algo_map,
         save_dir,
         algo_map,
         use_lof,
+        distance_threshold,
         lof_n_neighbors,
         lof_contamination,
         BASELINE_EPOCH,
@@ -907,7 +968,7 @@ def wnmf_feature_extract(matrix, n_components,
     Ham rating matrisini WNMF ile ayrıştır.
     Sadece kullanıcı latent matrisini (U) döndür.
 
-    Uygulama: [wnmf/wnmf_model.py](wnmf_model.WNMFModel) — wnmf_experiment ile aynı
+    Uygulama: [models/wnmf.py](models.wnmf.WNMFModel) — wnmf_experiment ile aynı
     çekirdek (tekrarlanabilirlik).
 
     Neden WNMF: Sıfır hücreler 'rating yok' anlamına gelir,
@@ -916,10 +977,7 @@ def wnmf_feature_extract(matrix, n_components,
 
     Çıktı: (n_users × n_components) dense, nonnegative U.
     """
-    wnmf_dir = os.path.join(_REPO_ROOT, 'wnmf')
-    if wnmf_dir not in sys.path:
-        sys.path.insert(0, wnmf_dir)
-    from wnmf_model import WNMFModel
+    from models.wnmf import WNMFModel
 
     n_users, n_items = matrix.shape
     rows, cols = np.where(matrix > 0)
@@ -1013,13 +1071,14 @@ def prepare_matrix_for_clustering(
 
 def run_dataset(dataset_name, matrix, K, out_root, algo_filter=None,
                 use_lof=False, lof_n_neighbors=LOF_N_NEIGHBORS,
+                distance_threshold: float = 0.80,
                 lof_contamination=LOF_CONTAMINATION,
                 max_workers: Optional[int] = None, out_suffix: str = '',
                 args=None, run_id=None, cluster_metric: str = 'pearson'):
     print(f"\n{'='*60}")
     print(f"DATASET: {dataset_name.upper()}  |  K={K}  |  Seed={SEED}")
     mode_str = f'LOF (n={lof_n_neighbors}, cont={lof_contamination})' \
-               if use_lof else 'percentile (80th)'
+               if use_lof else f'distance-threshold ({distance_threshold:.3f})'
     print(f"Gray sheep  : {mode_str}")
     print(f"Küme metrik : {cluster_metric} (pearson | euclidean)")
     print(f"{'='*60}")
@@ -1073,6 +1132,7 @@ def run_dataset(dataset_name, matrix, K, out_root, algo_filter=None,
                 algo_map,
                 use_lof=use_lof,
                 lof_n_neighbors=lof_n_neighbors,
+                distance_threshold=distance_threshold,
                 lof_contamination=lof_contamination,
                 args=args,
                 run_id=run_id,
@@ -1094,6 +1154,7 @@ def run_dataset(dataset_name, matrix, K, out_root, algo_filter=None,
                 save_dir,
                 use_lof,
                 lof_n_neighbors,
+                distance_threshold,
                 lof_contamination,
                 BASELINE_EPOCH,
                 GLOBAL_EPOCH,
@@ -1118,7 +1179,7 @@ def run_dataset(dataset_name, matrix, K, out_root, algo_filter=None,
 def parse_args():
     labels = ALGO_LABELS
     p = argparse.ArgumentParser(
-        description="Assignment üretici — percentile veya LOF gray sheep"
+        description="Assignment üretici — distance-threshold veya LOF gray sheep"
     )
     p.add_argument(
         '--dataset', choices=['100k', '1m', 'both'], default='both',
@@ -1135,7 +1196,11 @@ def parse_args():
     )
     p.add_argument(
         '--lof', action='store_true',
-        help="LOF tabanlı gray sheep kullan (default: sabit 80. percentile)"
+        help="LOF tabanlı gray sheep kullan (default: distance-threshold)"
+    )
+    p.add_argument(
+        '--threshold', type=float, default=0.8,
+        help="Distance-threshold gray sheep için eşik (default: 0.8)"
     )
     p.add_argument(
         '--zscore', action='store_true',
@@ -1230,6 +1295,8 @@ def parse_args():
     args.pca = args.pca_variance
     if args.cluster_metric == 'auto':
         args.cluster_metric = 'euclidean' if args.wnmf_features else 'pearson'
+    if args.threshold < 0:
+        p.error('--threshold 0 veya daha büyük olmalı')
     return args
 
 def _multi_start_init(matrix, K, pop_size, seed, n_restarts=10,
@@ -1284,7 +1351,7 @@ if __name__ == '__main__':
                 dataset=args.dataset,
                 k=None,
                 preprocessing=preprocessing_run,
-                note='gray_sheep=LOF' if args.lof else 'gray_sheep=percentile',
+                note='gray_sheep=LOF' if args.lof else f'gray_sheep=distance_threshold({args.threshold})',
             )
             print(f"  DB run_id: {db_run_id}")
         except Exception as exc:
@@ -1313,7 +1380,7 @@ if __name__ == '__main__':
     print("=" * 60)
     print("ASSIGNMENT ÜRETİCİ")
     print("=" * 60)
-    print(f"Gray sheep  : {'LOF (adaptif)' if args.lof else 'Percentile (sabit %20)'}")
+    print(f"Gray sheep  : {'LOF (adaptif)' if args.lof else f'Distance-threshold ({args.threshold:.3f})'}")
     print(f"Algoritmalar: {selected_algos or [c[0] for c in ALGO_CONFIG]}")
     print(f"Dataset     : {args.dataset}")
     if k_multi is not None:
@@ -1322,6 +1389,8 @@ if __name__ == '__main__':
         print(f"ML-100K K   : {k_100k}  |  ML-1M K: {k_1m}")
     if args.lof:
         print(f"LOF         : n_neighbors={args.n_neighbors}, contamination={contamination}")
+    else:
+        print(f"Threshold   : {args.threshold:.3f}")
     print(f"Epoch       : baseline={BASELINE_EPOCH}, global={GLOBAL_EPOCH}, local={LOCAL_EPOCH}")
     print(f"Pop size    : {POP_SIZE}  |  Seed: {SEED}")
     feat_bits = []
@@ -1407,6 +1476,7 @@ if __name__ == '__main__':
                         algo_filter=selected_algos,
                         use_lof=args.lof,
                         lof_n_neighbors=args.n_neighbors,
+                        distance_threshold=args.threshold,
                         lof_contamination=contamination,
                         max_workers=_pool_cap(),
                         out_suffix=out_suffix,
@@ -1420,6 +1490,7 @@ if __name__ == '__main__':
                     algo_filter=selected_algos,
                     use_lof=args.lof,
                     lof_n_neighbors=args.n_neighbors,
+                    distance_threshold=args.threshold,
                     lof_contamination=contamination,
                     max_workers=_pool_cap(),
                     out_suffix=out_suffix,
@@ -1453,6 +1524,7 @@ if __name__ == '__main__':
                         algo_filter=selected_algos,
                         use_lof=args.lof,
                         lof_n_neighbors=args.n_neighbors,
+                        distance_threshold=args.threshold,
                         lof_contamination=contamination,
                         max_workers=_pool_cap(),
                         out_suffix=out_suffix,
@@ -1466,6 +1538,7 @@ if __name__ == '__main__':
                     algo_filter=selected_algos,
                     use_lof=args.lof,
                     lof_n_neighbors=args.n_neighbors,
+                    distance_threshold=args.threshold,
                     lof_contamination=contamination,
                     max_workers=_pool_cap(),
                     out_suffix=out_suffix,

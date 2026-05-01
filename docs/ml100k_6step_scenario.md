@@ -32,7 +32,7 @@ Notlar:
 ## 2) Tahmin asamasi (Adim 6)
 
 ```bash
-python wnmf/wnmf_experiment.py \
+python methods/wnmf_experiment.py \
   --dataset 100k \
   --mode baselines \
   --assign-root mealpy/results/assignments_lof \
@@ -84,7 +84,7 @@ Bu bolum, "hangi dosya calisiyor, hangi fonksiyona gidiyor" sorusunu adim adim v
 
 - Fonksiyon: `wnmf_feature_extract(...)` (`mealpy/generate_assignments.py`)
 - Cagri zinciri:
-  1. `WNMFModel(...)` (`wnmf/wnmf_model.py`)
+  1. `WNMFModel(...)` (`models/wnmf.py`)
   2. `model.fit(train_ratings, ...)`
   3. `fit()` icinde, egitim dongusunden once:
      - `if init_method == "inmed": _initialize_inmed_factors(...)`
@@ -124,11 +124,11 @@ Bu bolum, "hangi dosya calisiyor, hangi fonksiyona gidiyor" sorusunu adim adim v
 
 ### Adim 6 - WNMF deney/evaluasyon asamasi
 
-- Calisan dosya: `wnmf/wnmf_experiment.py`
+- Calisan dosya: `methods/wnmf_experiment.py`
 - Baslangic:
   - `if __name__ == '__main__'`
   - `parse_args()`
-- Veri yukleme (`wnmf/wnmf_utils.py`):
+- Veri yukleme (`core/loaders.py`):
   - `load_ratings_100k(...)`
   - `load_ratings_1m(...)`
 - Ana kosucu:
@@ -136,9 +136,9 @@ Bu bolum, "hangi dosya calisiyor, hangi fonksiyona gidiyor" sorusunu adim adim v
 
 ### Adim 7 - Assignment yukle ve senaryolari calistir
 
-- `wnmf/wnmf_experiment.py::run_dataset(...)` icinde:
+- `methods/wnmf_experiment.py::run_dataset(...)` icinde:
   1. Assignment klasoru bulunur (`_algo_assignment_dir(...)`)
-  2. `load_assignment(assign_dir)` (`wnmf/wnmf_utils.py`)
+  2. `load_assignment(assign_dir)` (`core/utils.py`)
      - `assignments.npy`
      - `gray_sheep_mask.npy`
   3. Senaryo calismalari:

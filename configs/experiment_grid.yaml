@@ -1,0 +1,13 @@
+﻿sweep_cluster:
+  pipeline_mode: ["cluster"]
+  clustering.space: ["raw", "latent"]
+  clustering.algorithm: ["kmeans", "fcm", "meta_kmeans", "meta_fcm"]
+  clustering.n_clusters: [30, 50, 90]
+  model.name: ["wnmf", "svd", "pmf"]
+  optimizer.name: ["pso", "gwo", "hho", "woa", "mfo", "aeo", "avoa"]
+
+sweep_mf_tune:
+  pipeline_mode: ["meta_mf_tune"]
+  model.name: ["wnmf", "svd", "pmf"]
+  optimizer.name: ["pso", "gwo", "hho", "woa", "mfo", "aeo", "avoa"]
+  data.dataset: ["ml100k", "ml1m"]

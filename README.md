@@ -24,7 +24,7 @@ Veri setleri [MovieLens](https://grouplens.org/datasets/movielens/) kaynağında
 | Dizin / dosya | Açıklama |
 |---------------|----------|
 | `mealpy/` | Küme atama üretimi (`generate_assignments.py`), hibrit testler, `mealpy_comparison_v2` |
-| `wnmf/` | WNMF modeli ve `wnmf_experiment.py` karşılaştırma deneyleri |
+| `methods/`, `models/` | WNMF deney koşucusu (`methods/wnmf_experiment.py`) ve WNMF modelleri (`models/wnmf.py`) |
 | `optimizers/` | COA, HHO, PSO vb. sarmalayıcılar |
 | `core/`, `models/`, `methods/`, `experiments/` | MF / deney altyapısı |
 | `assignment_db.py` | Ortak SQLite API (`results/assignment_experiments.sqlite`) |
@@ -41,8 +41,8 @@ python generate_assignments.py --lof --dataset both --algo B1_HHO --k 30
 **WNMF deneyi:**
 
 ```bash
-cd wnmf
-python wnmf_experiment.py --dataset 100k --k 30 --mode sharedV
+cd hybrid_recommendations
+python methods/wnmf_experiment.py --dataset 100k --k 30 --mode sharedV
 ```
 
 **Deney veritabanı (repo kökünden):**

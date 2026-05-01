@@ -1,0 +1,80 @@
+﻿pipeline_mode: "cluster"
+
+data:
+  dataset: "ml100k"
+  path: "data"
+  min_user_ratings: 5
+  min_item_ratings: 3
+  test_size: 0.2
+  n_folds: 5
+  random_state: 42
+
+preprocess:
+  normalization: "none"
+  missing_strategy: "ignore"
+  apply_bias_removal: false
+  min_user_ratings: 5
+  min_item_ratings: 3
+
+gray_sheep:
+  enabled: false
+  method: "pcc_std"
+  threshold: 0.5
+
+model:
+  name: "wnmf"
+  n_components: 20
+  alpha: 0.01
+  beta: 0.01
+  max_iter: 200
+  tol: 0.0001
+  init: "nndsvda"
+  random_state: 42
+  lr: 0.005
+  reg: 0.02
+  n_epochs: 50
+  use_bias: true
+
+optimizer:
+  name: "pso"
+  source: "mealpy"
+  n_agents: 30
+  n_iter: 100
+  seed: 42
+  pso:
+    c1: 2.0
+    c2: 2.0
+    w: 0.9
+
+clustering:
+  algorithm: "kmeans"
+  n_clusters: 50
+  space: "latent"
+  fcm_m: 2.0
+  kmeans_inner_iter: 5
+
+recommender:
+  top_n: 10
+  gray_sheep_strategy: "multi_cluster"
+  n_neighbors: 30
+
+evaluation:
+  metrics: ["mae", "rmse", "precision", "recall", "f1", "ndcg"]
+  at_n: [5, 10]
+
+output:
+  results_dir: "results"
+  save_model: false
+  save_plots: true
+  log_level: "INFO"
+
+mf_tuning:
+  param_bounds:
+    n_components: [5, 100]
+    alpha: [0.0001, 1.0]
+    beta: [0.0001, 1.0]
+    lr: [0.0001, 0.1]
+    reg: [0.0001, 0.5]
+    sigma_sq: [0.0001, 2.0]
+    sigma_U_sq: [0.0001, 2.0]
+    sigma_V_sq: [0.0001, 2.0]

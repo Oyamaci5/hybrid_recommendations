@@ -5,7 +5,7 @@ Bu dokuman, projede su ana kadar kullandigimiz temel argumanlari, algoritmalari,
 Kapsam:
 - `mealpy/generate_assignments.py`
 - `mealpy/mealpy-algorithms-comparision.py`
-- `wnmf/wnmf_experiment.py`
+- `methods/wnmf_experiment.py`
 - `assignment_db.py`
 - `docs/ml100k_6step_scenario.md`
 
@@ -110,7 +110,7 @@ Ornek:
 
 ---
 
-## 4) WNMF Deney Asamasi Argumanlari (`wnmf_experiment.py`)
+## 4) WNMF Deney Asamasi Argumanlari (`methods/wnmf_experiment.py`)
 
 ### 4.1 Temel secimler
 - `--dataset {100k,1m,both}`
@@ -202,7 +202,7 @@ Sonra:
 
 ## 5.4 Kume ici tahmin (ClusterKNN)
 
-Kaynak: `wnmf/wnmf_experiment.py` -> `run_cluster_knn`
+Kaynak: `methods/wnmf_experiment.py` -> `run_cluster_knn`
 
 Pearson similarity:
 - `sim(u,v) = sum((r_ui-mean_u)(r_vi-mean_v)) / sqrt(sum(...) * sum(...))`
@@ -292,7 +292,7 @@ Mevcut dosya adlari ve senaryo notlarina gore en sik gorulen pattern:
   - mkmeans++ init
   - algorithm catalog ve ranking mantigi
 
-- `wnmf/wnmf_experiment.py`
+- `methods/wnmf_experiment.py`
   - assignment yukleme
   - global/full/sharedV senaryolari
   - cluster_avg ve cluster_knn baseline
@@ -314,7 +314,7 @@ python mealpy/generate_assignments.py --dataset 100k --lof --min-user-ratings 5 
 ### WNMF deneyi (sharedV + cluster_knn baseline)
 
 ```bash
-python wnmf/wnmf_experiment.py --dataset 100k --mode sharedV --assign-root mealpy/results/assignments_lof --assign-suffix _pruneu5_i10_zscore_wnmf20_inmed_trim5_95 --similarity pearson --knn 30 --min-common 3
+python methods/wnmf_experiment.py --dataset 100k --mode sharedV --assign-root mealpy/results/assignments_lof --assign-suffix _pruneu5_i10_zscore_wnmf20_inmed_trim5_95 --similarity pearson --knn 30 --min-common 3
 ```
 
 ---
@@ -334,9 +334,9 @@ Not:
 |---|---|---|---|---|
 | 1 | Assignment | _(komut satiri logda yok)_ | Basarili | - | - | `mealpy/results/assignments_lof/ml100k/` altina `k30 + _pruneu5_i10_wnmf20_inmed_trim5_95` assignment'lari yazildi; logda `TAMAMLANDI — toplam 1.9 dakika` |
 | 2 | Deneme | `--dataset 100k --mode baselines --no-global --no-cluster-knn --k 30 ...` | Hatali | - | - | PowerShell parser: `Missing expression after unary operator '--'` (komut `python` olmadan girilmis) |
-| 3 | Deneme | `python .\wnmf\wnmf_experiment.py ... --no-cluster-knn ...` | Hatali | - | - | `unrecognized arguments: --no-cluster-knn` |
-| 4 | WNMF baseline | `python .\wnmf\wnmf_experiment.py --dataset 100k --mode baselines --no-global --k 30 --assign-root mealpy/results/assignments_lof --assign-suffix _pruneu5_i10_wnmf20_inmed_trim5_95` | Basarili | 0.8614* | 1.0980* | `results/wnmf/ml100k/k30/run62` (yalnizca `cluster_avg`, 11 algoritma), sure `~0.1 dk` |
-| 5 | WNMF baseline | `python wnmf/wnmf_experiment.py --dataset 100k --mode baselines --k 30 --assign-root mealpy/results/assignments_lof --assign-suffix _pruneu5_i10_wnmf20_inmed_trim5_95 --knn 30 --min-common 3` | Basarili | 0.7793** | 1.0111** | `results/wnmf/ml100k/k30/run63` (`global + cluster_avg + cluster_knn`), sure `~3.1 dk` |
+| 3 | Deneme | `python .\methods\wnmf_experiment.py ... --no-cluster-knn ...` | Hatali | - | - | `unrecognized arguments: --no-cluster-knn` |
+| 4 | WNMF baseline | `python .\methods\wnmf_experiment.py --dataset 100k --mode baselines --no-global --k 30 --assign-root mealpy/results/assignments_lof --assign-suffix _pruneu5_i10_wnmf20_inmed_trim5_95` | Basarili | 0.8614* | 1.0980* | `results/wnmf/ml100k/k30/run62` (yalnizca `cluster_avg`, 11 algoritma), sure `~0.1 dk` |
+| 5 | WNMF baseline | `python methods/wnmf_experiment.py --dataset 100k --mode baselines --k 30 --assign-root mealpy/results/assignments_lof --assign-suffix _pruneu5_i10_wnmf20_inmed_trim5_95 --knn 30 --min-common 3` | Basarili | 0.7793** | 1.0111** | `results/wnmf/ml100k/k30/run63` (`global + cluster_avg + cluster_knn`), sure `~3.1 dk` |
 
 ### 9.2 Run63 Kisa Ozet (logdan)
 

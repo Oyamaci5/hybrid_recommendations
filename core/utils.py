@@ -3,8 +3,11 @@ Data loading and preprocessing utilities for MovieLens datasets.
 Supports both MovieLens 100K and MovieLens 1M formats.
 """
 
+import os
+
 import numpy as np
-from typing import Tuple, Optional, Dict, List
+import pandas as pd
+from typing import Any, Dict, List, Optional, Tuple
 
 # Genre lists for MovieLens (excluding 'unknown' for ML-1M compatibility)
 ML1M_GENRES = [
@@ -422,4 +425,105 @@ def compute_biases(ratings: np.ndarray, n_users: int, n_items: int
                 b_i[i] = np.mean(resid[mask])
     
     return mu, b_u, b_i
+
+
+def load_assignment(assignment_dir: str) -> Tuple[np.ndarray, np.ndarray]:
+    assignments = np.load(os.path.join(assignment_dir, "assignments.npy"))
+    gray_mask = np.load(os.path.join(assignment_dir, "gray_sheep_mask.npy"))
+    if len(gray_mask) != len(assignments):
+        raise ValueError("assignments.npy ve gray_sheep_mask.npy uzunlukları eşleşmiyor.")
+    return assignments, gray_mask
+
+
+def load_memberships(assignment_dir: str) -> Optional[np.ndarray]:
+    path = os.path.join(assignment_dir, "memberships.npy")
+    if not os.path.exists(path):
+        return None
+    memberships = np.load(path)
+    if memberships.ndim != 2:
+        raise ValueError(f"memberships.npy 2D olmalı, gelen shape={memberships.shape}")
+    return memberships
+
+
+def split_by_cluster(
+    ratings: np.ndarray, assignments: np.ndarray, gray_mask: np.ndarray
+) -> Tuple[Dict[int, np.ndarray], np.ndarray]:
+    user_ids = ratings[:, 0].astype(np.int32)
+    gray_user_set = set(np.where(gray_mask)[0])
+    gray_mask_r = np.isin(user_ids, list(gray_user_set))
+    gray_ratings = ratings[gray_mask_r]
+    normal_ratings = ratings[~gray_mask_r]
+    normal_users = normal_ratings[:, 0].astype(np.int32)
+    cluster_ratings: Dict[int, np.ndarray] = {}
+    for cid in np.unique(assignments[~gray_mask]):
+        cid = int(cid)
+        cluster_user_set = set(np.where((assignments == cid) & (~gray_mask))[0])
+        mask = np.isin(normal_users, list(cluster_user_set))
+        if mask.sum() > 0:
+            cluster_ratings[cid] = normal_ratings[mask]
+    return cluster_ratings, gray_ratings
+
+
+def remap_user_ids(
+    train: np.ndarray, test: np.ndarray, n_items: int
+) -> Tuple[np.ndarray, np.ndarray, Dict[int, int], int]:
+    _ = n_items
+    all_users = np.unique(train[:, 0].astype(np.int32))
+    uid_map = {int(u): i for i, u in enumerate(all_users)}
+    n_users_loc = len(all_users)
+
+    def remap(arr):
+        arr2 = arr.copy()
+        for old, new in uid_map.items():
+            arr2[arr[:, 0] == old, 0] = new
+        return arr2
+
+    train_r = remap(train)
+    test_mask = np.isin(test[:, 0].astype(np.int32), list(uid_map.keys()))
+    test_r = remap(test[test_mask])
+    return train_r, test_r, uid_map, n_users_loc
+
+
+def save_dataframe_csv(
+    df: pd.DataFrame, path: str, run_command: Optional[str] = None, index: bool = False
+) -> None:
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        if run_command:
+            f.write(f"# command: {run_command}\n")
+        df.to_csv(f, index=index)
+
+
+def save_results(
+    results: list, save_path: str, filename: str = "wnmf_results.csv", run_command: Optional[str] = None
+):
+    os.makedirs(save_path, exist_ok=True)
+    df = pd.DataFrame(results)
+    path = os.path.join(save_path, filename)
+    save_dataframe_csv(df, path, run_command=run_command)
+    return df
+
+
+def append_rows_to_accum_csv(rows: List[Dict[str, Any]], path: str) -> None:
+    if not rows:
+        return
+    path = os.path.abspath(path)
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    new_df = pd.DataFrame(rows)
+    if not os.path.isfile(path) or os.path.getsize(path) == 0:
+        new_df.to_csv(path, index=False, encoding="utf-8")
+        return
+    try:
+        old_df = pd.read_csv(path, encoding="utf-8", comment="#")
+    except pd.errors.EmptyDataError:
+        new_df.to_csv(path, index=False, encoding="utf-8")
+        return
+    all_cols = list(dict.fromkeys(list(old_df.columns) + list(new_df.columns)))
+    old_df = old_df.reindex(columns=all_cols)
+    new_df = new_df.reindex(columns=all_cols)
+    pd.concat([old_df, new_df], ignore_index=True).to_csv(path, index=False, encoding="utf-8")
 

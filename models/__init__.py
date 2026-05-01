@@ -1,5 +1,7 @@
-"""Recommendation models used by the active pipeline."""
+"""Recommendation models."""
 
 from models.wnmf import WNMF
+from models.svd import SVDModel
+from models.pmf import PMFModel
 
-__all__ = ["WNMF"]
+__all__ = ["WNMF", "SVDModel", "PMFModel"]
