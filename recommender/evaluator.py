@@ -8,13 +8,28 @@ from typing import Any, Dict, Iterable
 import numpy as np
 
 from core.metrics import compute_topn_metrics, evaluate_cf, evaluate_predictions, mae, predict_rating, rmse
+from utils.config import EvaluationConfig
+from utils.metrics import f1_at_n, ndcg_at_n, precision_at_n, recall_at_n
 
 
 class Evaluator:
-    def __init__(self, relevance_threshold: float = 3.5, top_neighbors: int = 30, at_n: int = 10):
-        self.relevance_threshold = float(relevance_threshold)
-        self.top_neighbors = int(top_neighbors)
-        self.at_n = int(at_n)
+    def __init__(
+        self,
+        cfg: EvaluationConfig | None = None,
+        relevance_threshold: float = 3.5,
+        top_neighbors: int = 30,
+        at_n: int = 10,
+    ):
+        if isinstance(cfg, EvaluationConfig):
+            self.cfg = cfg
+            self.relevance_threshold = float(relevance_threshold)
+            self.top_neighbors = int(top_neighbors)
+            self.at_n = int(cfg.at_n[0]) if cfg.at_n else int(at_n)
+        else:
+            self.cfg = EvaluationConfig(at_n=[int(at_n)])
+            self.relevance_threshold = float(relevance_threshold)
+            self.top_neighbors = int(top_neighbors)
+            self.at_n = int(at_n)
 
     def rating_errors(
         self,
@@ -67,6 +82,73 @@ class Evaluator:
     @staticmethod
     def regression_mae_rmse(y_true: np.ndarray, y_pred: np.ndarray) -> tuple[float, float]:
         return evaluate_predictions(np.asarray(y_true), np.asarray(y_pred))
+
+    def evaluate_fold(
+        self,
+        recommender,
+        R_test: np.ndarray,
+        mask_test: np.ndarray,
+        preprocessor,
+        bias,
+    ) -> dict:
+        test_pairs = np.argwhere(mask_test > 0)
+        y_true, y_pred = [], []
+        for u, i in test_pairs:
+            pred = recommender.predict_rating(int(u), int(i))
+            pred_orig = preprocessor.inverse_transform_single(pred, bias, int(u), int(i))
+            true_orig = preprocessor.inverse_transform_single(float(R_test[u, i]), bias, int(u), int(i))
+            pred_orig = float(np.clip(pred_orig, 1.0, 5.0))
+            true_orig = float(np.clip(true_orig, 1.0, 5.0))
+            y_true.append(true_orig)
+            y_pred.append(pred_orig)
+
+        metrics: dict[str, float] = {
+            "mae": mae(np.asarray(y_true), np.asarray(y_pred)) if y_true else 0.0,
+            "rmse": rmse(np.asarray(y_true), np.asarray(y_pred)) if y_true else 0.0,
+        }
+
+        ns = self.cfg.at_n if isinstance(self.cfg.at_n, list) else [self.at_n]
+        if len(test_pairs) == 0:
+            for n in ns:
+                metrics[f"precision@{n}"] = 0.0
+                metrics[f"recall@{n}"] = 0.0
+                metrics[f"f1@{n}"] = 0.0
+                metrics[f"ndcg@{n}"] = 0.0
+            return metrics
+
+        test_users = np.unique(test_pairs[:, 0])
+        for n in ns:
+            p_list, r_list, f_list, ndcg_list = [], [], [], []
+            for u in test_users:
+                relevant = {
+                    int(i)
+                    for i in range(R_test.shape[1])
+                    if mask_test[int(u), int(i)] > 0 and R_test[int(u), int(i)] >= self.relevance_threshold
+                }
+                if not relevant:
+                    continue
+                recs = recommender.recommend(int(u), top_n=int(n))
+                rec_items = [int(item) for item, _ in recs[: int(n)]]
+                p_list.append(precision_at_n(rec_items, relevant, int(n)))
+                r_list.append(recall_at_n(rec_items, relevant, int(n)))
+                f_list.append(f1_at_n(rec_items, relevant, int(n)))
+                ndcg_list.append(ndcg_at_n(rec_items, relevant, int(n)))
+            metrics[f"precision@{n}"] = float(np.mean(p_list)) if p_list else 0.0
+            metrics[f"recall@{n}"] = float(np.mean(r_list)) if r_list else 0.0
+            metrics[f"f1@{n}"] = float(np.mean(f_list)) if f_list else 0.0
+            metrics[f"ndcg@{n}"] = float(np.mean(ndcg_list)) if ndcg_list else 0.0
+        return metrics
+
+    def aggregate(self, fold_results: list[dict]) -> dict:
+        if not fold_results:
+            return {}
+        summary: dict[str, float] = {}
+        keys = fold_results[0].keys()
+        for k in keys:
+            vals = [float(f[k]) for f in fold_results if k in f]
+            summary[f"{k}_mean"] = float(np.mean(vals)) if vals else 0.0
+            summary[f"{k}_std"] = float(np.std(vals)) if vals else 0.0
+        return summary
 
     # ------------------------------------------------------------------
     # Offline-assignment artefakt değerlendirmesi

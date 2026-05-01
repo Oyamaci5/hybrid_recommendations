@@ -10,7 +10,7 @@ data:
   random_state: 42
 
 preprocess:
-  normalization: "none"
+  normalization: "zscore"
   missing_strategy: "ignore"
   apply_bias_removal: false
   min_user_ratings: 5
@@ -19,7 +19,7 @@ preprocess:
 gray_sheep:
   enabled: false
   method: "pcc_std"
-  threshold: 0.5
+  threshold: 0.8
 
 model:
   name: "wnmf"
@@ -49,9 +49,16 @@ optimizer:
 clustering:
   algorithm: "kmeans"
   n_clusters: 50
-  space: "latent"
+  space: "latent"       # raw | latent | pca
   fcm_m: 2.0
   kmeans_inner_iter: 5
+  init_method: "mkmeans_plus_plus_init"
+  mkmeans_init_max_iter: 50
+
+pca:
+  n_components: 20
+  whiten: false
+  random_state: 42
 
 recommender:
   top_n: 10

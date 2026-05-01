@@ -215,6 +215,37 @@ def recall_at_n(
     return hits / len(relevant)
 
 
+def f1_at_n(
+    recommended: list[int],
+    relevant: set[int],
+    N: int,
+) -> float:
+    p = precision_at_n(recommended, relevant, N)
+    r = recall_at_n(recommended, relevant, N)
+    if (p + r) <= 1e-12:
+        return 0.0
+    return float(2.0 * p * r / (p + r))
+
+
+def ndcg_at_n(
+    recommended: list[int],
+    relevant: set[int],
+    N: int,
+) -> float:
+    if N <= 0:
+        return 0.0
+    top = list(recommended[:N])
+    dcg = 0.0
+    for idx, item in enumerate(top):
+        rel = 1.0 if item in relevant else 0.0
+        dcg += (2.0**rel - 1.0) / np.log2(idx + 2.0)
+    ideal_hits = min(len(relevant), N)
+    if ideal_hits <= 0:
+        return 0.0
+    idcg = sum(1.0 / np.log2(i + 2.0) for i in range(ideal_hits))
+    return float(dcg / idcg) if idcg > 0 else 0.0
+
+
 def evaluate_cf(
     test_ratings: np.ndarray,
     train_matrix: np.ndarray,

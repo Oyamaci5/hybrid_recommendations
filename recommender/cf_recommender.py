@@ -10,7 +10,7 @@ gray-sheep akışını da destekler:
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 
@@ -40,13 +40,21 @@ class CFRecommender:
         distance_metric: str = "pearson",
         gray_mask: np.ndarray | None = None,
         gray_strategy: GrayStrategy = "same_cluster",
+        mf_model: Any | None = None,
+        pca_reducer: Any | None = None,
+        membership: np.ndarray | None = None,
+        recommend_top_n: int = 10,
     ) -> None:
         self.train_matrix = np.asarray(train_matrix, dtype=np.float32)
         self.cluster_labels = np.asarray(cluster_labels, dtype=np.int32)
         self.centroids = np.asarray(centroids, dtype=np.float32) if centroids is not None else None
         self.top_k = int(top_k)
         self.distance_metric = distance_metric
-        self.gray_strategy = gray_strategy
+        self.gray_strategy = "same_cluster" if gray_strategy == "multi_cluster" else gray_strategy
+        self.mf_model = mf_model
+        self.pca_reducer = pca_reducer
+        self.membership = membership
+        self.recommend_top_n = int(recommend_top_n)
         if gray_mask is not None:
             gm = np.asarray(gray_mask).reshape(-1).astype(bool)
             if gm.shape[0] != self.cluster_labels.shape[0]:
@@ -90,6 +98,19 @@ class CFRecommender:
             return self.predict_gray_same(u, i)
         return self.predict_white(u, i)
 
+    def predict_rating(self, user_id: int, item_id: int) -> float:
+        return self.predict(user_id, item_id)
+
+    def recommend(self, user_id: int, top_n: int | None = None) -> list[tuple[int, float]]:
+        u = int(user_id)
+        n = int(top_n) if top_n is not None else self.recommend_top_n
+        unseen = np.where(self.train_matrix[u] == 0)[0]
+        if unseen.size == 0:
+            return []
+        preds = [(int(i), float(self.predict_rating(u, int(i)))) for i in unseen]
+        preds.sort(key=lambda x: x[1], reverse=True)
+        return preds[: max(n, 1)]
+
     def predict_white(self, user_id: int, item_id: int) -> float:
         """Cluster içinde sadece white (gray olmayan) üyelerden komşu seç."""
         u = int(user_id)
@@ -117,8 +138,8 @@ class CFRecommender:
         item_vals = self.train_matrix[:, i]
         item_vals = item_vals[item_vals != 0]
         if item_vals.size > 0:
-            return float(np.clip(item_vals.mean(), 1.0, 5.0))
-        return float(np.clip(_user_mean(self.train_matrix[u]), 1.0, 5.0))
+            return float(item_vals.mean())
+        return float(_user_mean(self.train_matrix[u]))
 
     # ------------------------------------------------------------------
     # Internals
@@ -133,11 +154,11 @@ class CFRecommender:
         u_vec = self.train_matrix[user_id]
         u_mean = _user_mean(u_vec)
         if neighbor_ids.size == 0:
-            return float(np.clip(u_mean, 1.0, 5.0))
+            return float(u_mean)
 
         rated = neighbor_ids[self.train_matrix[neighbor_ids, item_id] != 0]
         if rated.size == 0:
-            return float(np.clip(u_mean, 1.0, 5.0))
+            return float(u_mean)
 
         sims = np.array(
             [pearson_similarity(u_vec, self.train_matrix[v]) for v in rated],
@@ -154,6 +175,6 @@ class CFRecommender:
 
         denom = float(np.abs(nbr_sims).sum())
         if denom <= 1e-12:
-            return float(np.clip(u_mean, 1.0, 5.0))
+            return float(u_mean)
         numer = float(np.dot(nbr_sims, nbr_r - nbr_m))
-        return float(np.clip(u_mean + numer / denom, 1.0, 5.0))
+        return float(u_mean + numer / denom)

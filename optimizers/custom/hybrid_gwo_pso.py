@@ -25,9 +25,12 @@ class HybridGWOPSO:
     ) -> OptimizeResult:
         from optimizers.mealpy_wrapper import MealPyWrapper
 
+        lb_arr = np.broadcast_to(np.asarray(lb, dtype=np.float64), (int(dim),))
+        ub_arr = np.broadcast_to(np.asarray(ub, dtype=np.float64), (int(dim),))
+
         gwo = MealPyWrapper("gwo", n_agents=self.gwo_agents, n_iter=self.gwo_iter)
-        r1 = gwo.minimize(objective, dim, np.ones(dim) * float(lb), np.ones(dim) * float(ub))
+        r1 = gwo.minimize(objective, dim, lb_arr, ub_arr)
         shifted = lambda z: objective(z) + 1e-9 * np.linalg.norm(z - r1.best_vector)
         pso = MealPyWrapper("pso", n_agents=self.pso_agents, n_iter=self.pso_iter)
-        r2 = pso.minimize(shifted, dim, np.ones(dim) * float(lb), np.ones(dim) * float(ub))
+        r2 = pso.minimize(shifted, dim, lb_arr, ub_arr)
         return r2 if r2.best_score <= r1.best_score else r1

@@ -1,7 +1,8 @@
 # Ignore everything except data and results directories
 
 .gitignore
-data/
+data/*
+!data/*.py
 results/
 google_apps_script/
 # Explicitly ignore .cursor directory

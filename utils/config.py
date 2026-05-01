@@ -72,6 +72,15 @@ class ClusteringConfig:
     space: str = "latent"
     fcm_m: float = 2.0
     kmeans_inner_iter: int = 5
+    init_method: str = "kmeans++"
+    mkmeans_init_max_iter: int = 50
+
+
+@dataclass
+class PCAConfig:
+    n_components: int = 20
+    whiten: bool = False
+    random_state: int = 42
 
 
 @dataclass
@@ -120,6 +129,7 @@ class Config:
     model: ModelConfig = field(default_factory=ModelConfig)
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
     clustering: ClusteringConfig = field(default_factory=ClusteringConfig)
+    pca: PCAConfig = field(default_factory=PCAConfig)
     recommender: RecommenderConfig = field(default_factory=RecommenderConfig)
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
@@ -139,6 +149,7 @@ class Config:
             model=ModelConfig(**data.get("model", {})),
             optimizer=OptimizerConfig(**{k: v for k, v in data.get("optimizer", {}).items() if k != data.get("optimizer", {}).get("name", "pso")}),
             clustering=ClusteringConfig(**data.get("clustering", {})),
+            pca=PCAConfig(**data.get("pca", {})),
             recommender=RecommenderConfig(**data.get("recommender", {})),
             evaluation=EvaluationConfig(**data.get("evaluation", {})),
             output=OutputConfig(**data.get("output", {})),

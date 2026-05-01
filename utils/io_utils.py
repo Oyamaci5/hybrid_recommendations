@@ -31,3 +31,7 @@ def save_csv_rows(path: str, rows: list[dict], fieldnames: list[str] | None = No
         w = csv.DictWriter(f, fieldnames=fnames)
         w.writeheader()
         w.writerows(rows)
+
+
+def save_results(obj: object, path) -> None:
+    save_json(str(path), obj)
