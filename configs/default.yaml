@@ -78,3 +78,15 @@ mf_tuning:
     sigma_sq: [0.0001, 2.0]
     sigma_U_sq: [0.0001, 2.0]
     sigma_V_sq: [0.0001, 2.0]
+
+# pipeline_mode='offline_assignments' icin: mealpy/generate_assignments.py
+# ciktilarini (assignment.npy + gray_mask.npy) tuketir.
+offline_assignments:
+  assignment_path: ""
+  gray_mask_path: ""
+  ratings_path: ""
+  prediction_dir: "results/offline_assignments/predictions"
+  evaluation_dir: "results/offline_assignments/evaluation"
+  n_reco: 10
+  relevance_threshold: 3.5
+  max_users: 0

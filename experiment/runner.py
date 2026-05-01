@@ -27,6 +27,21 @@ class ExperimentRunner:
         setup_logger(level=cfg.output.log_level)
         return build_pipeline(cfg)
 
+    def run_offline_assignments(self) -> dict:
+        """``pipeline_mode='offline_assignments'`` için kanonik akış.
+
+        Önceden üretilmiş assignment .npy dosyasını tüketir, gray-aware
+        CFRecommender + Evaluator zinciriyle tahmin + metrik raporu üretir.
+        """
+        from experiment.offline_assignments import run as run_offline
+
+        cfg = self.load()
+        log = setup_logger(level=cfg.output.log_level)
+        log.info("offline_assignments başlıyor: assignment=%s", cfg.offline_assignments.assignment_path)
+        out = run_offline(cfg)
+        log.info("offline_assignments bitti: %s", out["evaluation_dir"])
+        return out
+
     def run_dummy_smoke(self) -> dict[str, float]:
         """Küçük rastgele matris ile MF + kümeleme zincirinin import/çalışma duman testi."""
         cfg = self.load()
