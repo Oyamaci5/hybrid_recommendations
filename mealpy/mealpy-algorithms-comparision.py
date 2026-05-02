@@ -276,7 +276,11 @@ def make_fitness_function(matrix, K, metric='pearson'):
         norm_wcss = obj_wcss / baseline['wcss']
         norm_sil = obj_sil / baseline['sil']
         norm_ch = obj_ch / baseline['ch']
-        return float(0.50 * norm_wcss + 0.25 * norm_sil + 0.25 * norm_ch)
+        fitness_base = float(0.50 * norm_wcss + 0.25 * norm_sil + 0.25 * norm_ch)
+        active_clusters = len(np.unique(assignments))
+        missing_ratio = max(0.0, 1.0 - active_clusters / K)
+        penalty = fitness_base * missing_ratio * 2.0
+        return float(fitness_base + penalty)
 
     def fitness(solution):
         return _multiobjective_score(solution)

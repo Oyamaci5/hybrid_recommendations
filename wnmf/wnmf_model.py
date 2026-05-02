@@ -87,9 +87,9 @@ class WNMFModel:
         self.user_implicit  = None
         self._svdpp_train_items: Optional[dict] = None
 
-        self.mu  = 0.0
-        self.b_u = np.zeros(n_users, dtype=np.float32)
-        self.b_i = np.zeros(n_items, dtype=np.float32)
+        self.mu: float = 0.0
+        self.b_u: np.ndarray = np.zeros(n_users, dtype=np.float32)
+        self.b_i: np.ndarray = np.zeros(n_items, dtype=np.float32)
 
         rng   = np.random.RandomState(random_seed)
         scale = np.sqrt(5.0 / latent_dim)
@@ -179,6 +179,8 @@ class WNMFModel:
 
         if self.use_bias:
             self.mu = float(ratings.mean())
+            self.b_u = np.zeros(self.n_users, dtype=np.float32)
+            self.b_i = np.zeros(self.n_items, dtype=np.float32)
 
         for epoch in range(self.n_epochs):
             idx    = np.random.permutation(n)
@@ -374,6 +376,84 @@ class WNMFModel:
         return float(np.mean(errors ** 2)) + reg
 
 
+class ALSModel:
+    def __init__(self, n_users, n_items, latent_dim=20,
+                 regularization=0.01, n_epochs=100, random_seed=42):
+        self.n_users = n_users
+        self.n_items = n_items
+        self.latent_dim = latent_dim
+        self.reg = regularization
+        self.n_epochs = n_epochs
+        rng = np.random.RandomState(random_seed)
+        scale = np.sqrt(5.0 / latent_dim)
+        self.U = rng.randn(n_users, latent_dim).astype(np.float32) * scale
+        self.V = rng.randn(n_items, latent_dim).astype(np.float32) * scale
+        self.mu = 0.0
+        self.b_u = np.zeros(n_users, dtype=np.float32)
+        self.b_i = np.zeros(n_items, dtype=np.float32)
+
+    def fit(self, train_ratings):
+        # train_ratings: (n, 3) [user_id, item_id, rating]
+        users = train_ratings[:, 0].astype(np.int32)
+        items = train_ratings[:, 1].astype(np.int32)
+        ratings = train_ratings[:, 2].astype(np.float32)
+
+        self.mu = float(ratings.mean())
+
+        # Sparse rating dict
+        user_items = {}  # user → [(item, rating)]
+        item_users = {}  # item → [(user, rating)]
+        for u, i, r in zip(users, items, ratings):
+            user_items.setdefault(u, []).append((i, r - self.mu))
+            item_users.setdefault(i, []).append((u, r - self.mu))
+
+        reg = self.reg
+        d = self.latent_dim
+        VtV = self.V.T @ self.V  # (d,d)
+
+        for epoch in range(self.n_epochs):
+            # U güncelle (V sabit)
+            VtV = self.V.T @ self.V + reg * np.eye(d)
+            for u in range(self.n_users):
+                if u not in user_items:
+                    continue
+                pairs = user_items[u]
+                V_u = self.V[[i for i, r in pairs]]   # (n_u, d)
+                r_u = np.array([r for i, r in pairs])  # (n_u,)
+                A = V_u.T @ V_u + reg * np.eye(d)
+                b = V_u.T @ r_u
+                self.U[u] = np.linalg.solve(A, b)
+
+            # V güncelle (U sabit)
+            for i in range(self.n_items):
+                if i not in item_users:
+                    continue
+                pairs = item_users[i]
+                U_i = self.U[[u for u, r in pairs]]
+                r_i = np.array([r for u, r in pairs])
+                A = U_i.T @ U_i + reg * np.eye(d)
+                b = U_i.T @ r_i
+                self.V[i] = np.linalg.solve(A, b)
+
+    def predict(self, user_ids, item_ids, clip=True):
+        user_ids = np.asarray(user_ids, dtype=np.int32)
+        item_ids = np.asarray(item_ids, dtype=np.int32)
+        preds = self.mu + np.sum(
+            self.U[user_ids] * self.V[item_ids], axis=1
+        )
+        if clip:
+            np.clip(preds, 1.0, 5.0, out=preds)
+        return preds.astype(np.float32)
+
+    def evaluate(self, test_ratings):
+        u = test_ratings[:, 0].astype(np.int32)
+        i = test_ratings[:, 1].astype(np.int32)
+        r = test_ratings[:, 2].astype(np.float32)
+        p = self.predict(u, i)
+        e = r - p
+        return float(np.mean(np.abs(e))), float(np.sqrt(np.mean(e ** 2)))
+
+
 # ============================================================
 # PAYLAŞIMLI V WNMF MODELİ
 # ============================================================
@@ -425,12 +505,12 @@ class WNMFSharedV:
         self.regularization  = regularization
         self.n_epochs_global = n_epochs_global
         self.random_seed     = random_seed
-        self._use_bias       = use_bias
+        self.use_bias        = use_bias
         self._use_svdpp      = use_svdpp
         self.V               = None   # global V, fit_global_V sonrası dolar
         self.V_fitted        = False
-        self.mu              = 0.0
-        self.b_i             = np.zeros(n_items, dtype=np.float32)
+        self.mu: float = 0.0
+        self.b_i: np.ndarray = np.zeros(n_items, dtype=np.float32)
 
         # Global modeli içeride tut — V'yi buradan alacağız
         self._global_model = WNMFModel(
@@ -471,8 +551,9 @@ class WNMFSharedV:
             sample_weights = None
         self._global_model.fit(all_train, sample_weights=sample_weights, verbose=verbose)
         self.V        = self._global_model.V.copy()   # (n_items, latent_dim)
-        self.mu       = self._global_model.mu
-        self.b_i      = self._global_model.b_i.copy()
+        if self.use_bias:
+            self.mu  = self._global_model.mu
+            self.b_i = self._global_model.b_i.copy()
         self.V_fitted = True
         print(f"  [Global V] tamamlandı — V shape: {self.V.shape}")
         return self
@@ -510,7 +591,7 @@ class WNMFSharedV:
             regularization = self.regularization,
             n_epochs       = n_epochs_cluster,
             random_seed    = random_seed,
-            use_bias       = self._use_bias,
+            use_bias       = self.use_bias,
             mu             = self.mu,
             b_i_global     = self.b_i,
             cluster_ratings= cluster_ratings,
@@ -547,19 +628,19 @@ class ClusterWNMF:
         self.n_epochs       = n_epochs
         self.random_seed    = random_seed
         self.use_bias       = use_bias
-        self.mu             = mu
         if cluster_ratings is not None and len(cluster_ratings) > 0:
-            self.mu_k = float(cluster_ratings[:, 2].mean())
+            self.mu = float(cluster_ratings[:, 2].mean())
         else:
-            self.mu_k = mu
+            self.mu = float(mu)
 
         # V sabit — global modelden kopyalanmış
         self.V = V_shared.copy()
 
-        if b_i_global is not None:
-            self.b_i = b_i_global.copy()
-        else:
-            self.b_i = np.zeros(n_items, dtype=np.float32)
+        self.b_i = (
+            b_i_global.copy()
+            if b_i_global is not None
+            else np.zeros(n_items, dtype=np.float32)
+        )
         self.b_u = np.zeros(n_users, dtype=np.float32)
 
         # U sıfırdan başlar — küme özelinde öğrenilecek
@@ -602,7 +683,7 @@ class ClusterWNMF:
 
                 if self.use_bias:
                     pred = (
-                        self.mu_k
+                        self.mu
                         + self.b_u[u]
                         + self.b_i[i]
                         + float(np.dot(self.U[u], self.V[i]))
@@ -635,7 +716,7 @@ class ClusterWNMF:
         item_ids = np.asarray(item_ids, dtype=np.int32)
         if self.use_bias:
             preds = (
-                self.mu_k
+                self.mu
                 + self.b_u[user_ids]
                 + self.b_i[item_ids]
                 + np.sum(self.U[user_ids] * self.V[item_ids], axis=1)

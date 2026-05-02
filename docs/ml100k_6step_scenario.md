@@ -23,6 +23,23 @@ python mealpy/generate_assignments.py \
   --inmed-trim-high 95
 ```
 
+Paper mode (literatur preset, assignment-only):
+
+```bash
+python mealpy/generate_assignments.py \
+  --dataset 100k \
+  --paper-mode \
+  --algo LIT_GOA \
+  --k 30
+```
+
+Paper mode notlari:
+- z-score otomatik acilir.
+- PCA otomatik olarak `0.95` olur (`--pca` ile override edilebilir).
+- `cluster-metric` otomatik `euclidean` olur.
+- centroid init `random` olur.
+- gray sheep tespiti kapatilir (LOF/percentile uretilmez).
+
 Notlar:
 - `--algo` verilmezse tum algoritmalar calisir.
 - `--cluster-metric auto` varsayilaninda, `--wnmf-features` kullanildiginda `euclidean` secilir.

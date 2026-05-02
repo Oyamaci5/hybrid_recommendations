@@ -80,7 +80,7 @@ except ImportError:
     _DB_AVAILABLE = False
 _CURRENT_RUN_ID = None
 
-from wnmf_model import ClusterWNMF, WNMFModel, WNMFSharedV
+from wnmf_model import ALSModel, ClusterWNMF, WNMFModel, WNMFSharedV
 from wnmf_utils import (
     load_ratings_100k,
     load_ratings_1m,
@@ -115,10 +115,10 @@ RANDOM_SEED      = 42
 
 ALGO_LABELS = [
     'B0_KMEANS',
-    'B1_HHO', 'B2_HGS', 'H1_HHO+HGS', 'H4_MFO+HHO',
+    'B1_HHO', 'B2_HGS', 'B3_MFO', 'LF_HHO', 'SFOA', 'SFOA_06', 'H1_HHO+HGS', 'H4_MFO+HHO', 'DOA',
     'H9_QSA+CDO', 'H12_MFO+CDO', 'H13_HHO+GAop',
     # generate_assignments.py ALGO_CONFIG — önce --lof ile atama üretin
-    'LIT_GOA', 'LIT_GWO', 'LIT_SSA',
+    'LIT_CIRCLESA', 'LIT_GOA', 'LIT_GWO', 'LIT_SSA',
 ]
 
 # Yaygın yazım hatası: --algo H1_HGS+HHO → H1_HHO+HGS
@@ -549,7 +549,7 @@ def _predict_sharedv_profile(profile: dict, user_id: int, item_id: int) -> float
     mean_u = profile['mean_u']
     if model.use_bias:
         pred = (
-            float(model.mu_k)
+            float(model.mu)
             + float(model.b_i[item_id])
             + float(np.dot(mean_u, model.V[item_id]))
         )
@@ -622,6 +622,58 @@ def run_global_wnmf(train, test, n_items, verbose=False, use_bias=True,
     return {
         'scenario'    : 'global',
         'algo_label'  : 'GLOBAL_WNMF',
+        'mae'         : mae,
+        'rmse'        : rmse,
+        'gray_mae'    : float('nan'),
+        'gray_rmse'   : float('nan'),
+        'white_mae'   : mae,
+        'white_rmse'  : rmse,
+        'n_clusters'  : 1,
+        'n_train'     : len(train),
+        'n_test'      : len(test),
+        'time_seconds': time.time() - t0,
+        'accuracy'        : float('nan'),
+        'precision_at_10' : precision,
+        'recall_at_10'    : recall,
+        'f1_at_10'        : f1,
+        'ndcg_at_10'      : ndcg,
+    }
+
+
+def run_global_als(train, test, n_items, verbose=False, use_bias=True,
+                   use_svdpp: bool = False, top_n: int = 10,
+                   relevance_threshold: float = 4.0):
+    """
+    Tüm kullanıcılara tek ALS model — ablation baseline.
+    'Kümeleme eklemek ne kadar iyileştiriyor?' sorusunu cevaplar.
+    """
+    print("\n  [Global ALS] başlıyor...")
+    t0      = time.time()
+    n_users = int(train[:, 0].max()) + 1
+
+    model = ALSModel(
+        n_users        = n_users,
+        n_items        = n_items,
+        latent_dim     = LATENT_DIM,
+        regularization = REGULARIZATION,
+        n_epochs       = N_EPOCHS_GLOBAL,
+        random_seed    = RANDOM_SEED,
+    )
+    model.fit(train)
+    mae, rmse = model.evaluate(test)
+    pred = model.predict(
+        test[:, 0].astype(np.int32),
+        test[:, 1].astype(np.int32),
+    )
+    eval_rows = np.column_stack((test[:, 0], test[:, 1], test[:, 2], pred))
+    precision, recall, f1, ndcg = _compute_topn_metrics(
+        eval_rows, top_n=top_n, threshold=relevance_threshold,
+    )
+
+    print(f"  [Global ALS] MAE={mae:.4f}  RMSE={rmse:.4f}  ({time.time()-t0:.1f}s)")
+    return {
+        'scenario'    : 'global',
+        'algo_label'  : 'GLOBAL_ALS',
         'mae'         : mae,
         'rmse'        : rmse,
         'gray_mae'    : float('nan'),
@@ -793,7 +845,8 @@ def run_cluster_sharedV(train, test, assignments, gray_mask, memberships,
                         use_svdpp: bool = False,
                         run_command: Optional[str] = None,
                         top_n: int = 10,
-                        relevance_threshold: float = 4.0):
+                        relevance_threshold: float = 4.0,
+                        hybrid_alpha: Optional[float] = None):
     """
     Global V + küme bazlı U.
 
@@ -956,6 +1009,46 @@ def run_cluster_sharedV(train, test, assignments, gray_mask, memberships,
                     'n_test': int(np.sum(mask)),
                 })
 
+    if hybrid_alpha is not None:
+        global_mean = float(train[:, 2].mean())
+        user_ratings = {}
+        for row in train:
+            u, i, r = int(row[0]), int(row[1]), float(row[2])
+            if u not in user_ratings:
+                user_ratings[u] = {}
+            user_ratings[u][i] = r
+        user_means = {
+            u: float(np.mean(list(d.values())))
+            for u, d in user_ratings.items()
+        }
+        n_users = len(assignments)
+        cluster_users = {}
+        for u in range(n_users):
+            cid = int(assignments[u])
+            cluster_users.setdefault(cid, []).append(u)
+
+        knn_preds = {}
+        for row in test:
+            u, i, r = int(row[0]), int(row[1]), float(row[2])
+            cid = int(assignments[u])
+            knn_pred = _predict_knn(
+                u, i, cid, user_ratings, cluster_users, user_means,
+                similarity='pearson',
+                k_neighbors=30,
+                min_common=3,
+                global_mean=global_mean,
+            )
+            knn_preds[(u, i)] = knn_pred
+
+        for idx, row in enumerate(eval_rows):
+            u, i = int(row[0]), int(row[1])
+            wnmf_pred = float(row[3])
+            knn_pred = knn_preds.get((u, i), wnmf_pred)
+            hybrid = (1 - hybrid_alpha) * wnmf_pred + hybrid_alpha * knn_pred
+            eval_rows[idx, 3] = float(np.clip(hybrid, 1.0, 5.0))
+
+        all_pred = eval_rows[:, 3].tolist() if len(eval_rows) > 0 else []
+
     mae, rmse = _compute_metrics(all_true, all_pred)
     precision, recall, f1, ndcg = _compute_topn_metrics(
         eval_rows, top_n=top_n, threshold=relevance_threshold,
@@ -990,7 +1083,11 @@ def run_cluster_sharedV(train, test, assignments, gray_mask, memberships,
           f"Gray MAE={gray_mae:.4f}  ({elapsed:.1f}s)")
 
     return {
-        'scenario'    : 'cluster_sharedV',
+        'scenario'    : (
+            'cluster_sharedV'
+            if hybrid_alpha is None
+            else f'cluster_hybrid_{hybrid_alpha:.2f}'
+        ),
         'algo_label'  : algo_label,
         'mae'         : mae,
         'rmse'        : rmse,
@@ -1227,11 +1324,103 @@ def run_cluster_average(train, test, assignments, gray_mask,
     }
 
 
+def _predict_knn(
+    u: int,
+    i: int,
+    cid: int,
+    user_ratings: dict,
+    cluster_users: dict,
+    user_means: dict,
+    similarity: str = 'pearson',
+    k_neighbors: int = 30,
+    min_common: int = 3,
+    global_mean: float = 3.0,
+) -> float:
+    """Küme içi kNN tek (u,i) tahmini — run_cluster_knn ile aynı mantık (hard cluster)."""
+    k_neighbors = max(1, int(k_neighbors))
+
+    def pearson_sim(ua, va, mc: int = 3) -> float:
+        u_items = set(user_ratings.get(ua, {}).keys())
+        v_items = set(user_ratings.get(va, {}).keys())
+        common = list(u_items & v_items)
+
+        if len(common) < mc:
+            return 0.0
+
+        u_c = np.array([user_ratings[ua][ix] - user_means[ua]
+                        for ix in common], dtype=np.float32)
+        v_c = np.array([user_ratings[va][ix] - user_means[va]
+                        for ix in common], dtype=np.float32)
+
+        norm_u = np.sqrt((u_c**2).sum())
+        norm_v = np.sqrt((v_c**2).sum())
+
+        if norm_u < 1e-8 or norm_v < 1e-8:
+            return 0.0
+
+        return float(np.clip(np.dot(u_c, v_c) / (norm_u * norm_v),
+                             -1.0, 1.0))
+
+    def cosine_sim(ua, va, mc: int = 3) -> float:
+        u_items = set(user_ratings.get(ua, {}).keys())
+        v_items = set(user_ratings.get(va, {}).keys())
+        common = list(u_items & v_items)
+
+        if len(common) < mc:
+            return 0.0
+
+        u_r = np.array([user_ratings[ua][ix] for ix in common],
+                       dtype=np.float32)
+        v_r = np.array([user_ratings[va][ix] for ix in common],
+                       dtype=np.float32)
+
+        denom = np.sqrt((u_r**2).sum()) * np.sqrt((v_r**2).sum())
+        if denom < 1e-8:
+            return 0.0
+
+        return float(np.clip(np.dot(u_r, v_r) / denom,
+                             0.0, 1.0))
+
+    neighbors = cluster_users.get(cid, [])
+    sims = []
+    for v in neighbors:
+        if v == u:
+            continue
+        if i not in user_ratings.get(v, {}):
+            continue
+
+        if similarity == 'pearson':
+            s = pearson_sim(u, v, min_common)
+        else:
+            s = cosine_sim(u, v, min_common)
+
+        if abs(s) > 0.0:
+            sims.append((s, v))
+
+    if not sims:
+        return float(user_means.get(u, global_mean))
+
+    sims.sort(key=lambda x: -abs(x[0]))
+    top_k = sims[:k_neighbors]
+
+    num = sum(s * (user_ratings[v][i] - user_means.get(v, global_mean))
+              for s, v in top_k)
+    den = sum(abs(s) for s, v in top_k)
+
+    if den < 1e-8:
+        return float(user_means.get(u, global_mean))
+
+    pred = user_means.get(u, global_mean) + num / den
+    return float(np.clip(pred, 1.0, 5.0))
+
+
 def run_cluster_knn(train, test, assignments, gray_mask, memberships,
                     n_items, algo_label,
                     similarity: str = 'pearson',
                     min_common: int = 3,
                     k_neighbors: int = 30,
+                    sig_weight: int = 0,
+                    sim_amp: float = 1.0,
                     top_n: int = 10,
                     relevance_threshold: float = 4.0):
     t0 = time.time()
@@ -1255,7 +1444,7 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
         cid = int(assignments[u])
         cluster_users.setdefault(cid, []).append(u)
 
-    def pearson_sim(u, v, min_common=3):
+    def pearson_sim(u, v, min_common=3, sig_threshold=50, amp=1.5):
         """
         Pearson Korelasyon Katsayısı (PCC).
         Sadece iki kullanıcının ortak izlediği filmler üzerinden.
@@ -1283,8 +1472,15 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
         if norm_u < 1e-8 or norm_v < 1e-8:
             return 0.0
 
-        return float(np.clip(np.dot(u_c, v_c) / (norm_u * norm_v),
-                             -1.0, 1.0))
+        sim = float(np.clip(np.dot(u_c, v_c) / (norm_u * norm_v), -1.0, 1.0))
+
+        if sig_threshold > 0:
+            sim = sim * min(len(common), sig_threshold) / float(sig_threshold)
+
+        if amp != 1.0:
+            sim = float(np.sign(sim) * (abs(sim) ** amp))
+
+        return sim
 
     def cosine_sim(u, v, min_common=3):
         """
@@ -1340,7 +1536,13 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
                 continue
 
             if similarity == 'pearson':
-                s = pearson_sim(u, v, min_common)
+                s = pearson_sim(
+                    u,
+                    v,
+                    min_common=min_common,
+                    sig_threshold=sig_weight,
+                    amp=sim_amp,
+                )
             else:
                 s = cosine_sim(u, v, min_common)
 
@@ -1534,6 +1736,7 @@ def _mp_run_algo_job(job):
         similarity,
         knn,
         min_common,
+        hybrid_alpha,
         out_dir,
         run_command,
         ld, lr, reg, eg, ec,
@@ -1596,6 +1799,7 @@ def _mp_run_algo_job(job):
                 run_command=run_command,
                 top_n=top_n,
                 relevance_threshold=relevance_threshold,
+                hybrid_alpha=hybrid_alpha,
             )
             row['dataset'] = dataset_name
             rows.append(row)
@@ -1688,6 +1892,7 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
                 similarity: str = 'pearson',
                 knn: int = 30,
                 min_common: int = 3,
+                hybrid_alpha: Optional[float] = None,
                 use_svdpp: bool = False,
                 run_command: Optional[str] = None,
                 args=None,
@@ -1746,10 +1951,16 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
 
     # Global WNMF baseline
     if run_global:
-        row = run_global_wnmf(
-            train, test, n_items, use_bias=use_bias, use_svdpp=use_svdpp,
-            top_n=top_n, relevance_threshold=relevance_threshold,
-        )
+        if bool(getattr(args, 'als', False)):
+            row = run_global_als(
+                train, test, n_items, use_bias=use_bias, use_svdpp=use_svdpp,
+                top_n=top_n, relevance_threshold=relevance_threshold,
+            )
+        else:
+            row = run_global_wnmf(
+                train, test, n_items, use_bias=use_bias, use_svdpp=use_svdpp,
+                top_n=top_n, relevance_threshold=relevance_threshold,
+            )
         row['dataset'] = dataset_name
         results.append(row)
 
@@ -1782,6 +1993,7 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
                 eff_cluster_workers, weighted_v, use_bias, use_cluster_bias, use_svdpp,
                 run_cluster_avg, do_cluster_knn, top_n, relevance_threshold, similarity, knn,
                 min_common,
+                hybrid_alpha,
                 out_dir, run_command,
                 _ld, _lr, _reg, _eg, _ec,
             )
@@ -1851,6 +2063,7 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
                     run_command=run_command,
                     top_n=top_n,
                     relevance_threshold=relevance_threshold,
+                    hybrid_alpha=hybrid_alpha,
                 )
                 row['dataset'] = dataset_name
                 results.append(row)
@@ -2153,10 +2366,20 @@ def parse_args():
         '--weighted-v', action='store_true',
         help='SharedV global V eğitiminde gray sheep rating ağırlığı 0.1',
     )
-    p.add_argument(
-        '--no-bias', action='store_true',
-        help='Global WNMF ve SharedV yolunda bias terimleri kapalı',
+    _bias_grp = p.add_mutually_exclusive_group()
+    _bias_grp.add_argument(
+        '--bias',
+        dest='use_bias',
+        action='store_true',
+        help='Bias açık (mu, b_u, b_i; varsayılan)',
     )
+    _bias_grp.add_argument(
+        '--no-bias',
+        dest='use_bias',
+        action='store_false',
+        help='Bias kapalı',
+    )
+    p.set_defaults(use_bias=True)
     p.add_argument(
         '--cluster-bias', action='store_true',
         help='Küme bazlı mu_k kullan (global mu yerine)',
@@ -2192,8 +2415,28 @@ def parse_args():
         help='ClusterKNN: benzerlik için minimum ortak film sayısı (varsayılan: 3)',
     )
     p.add_argument(
+        '--sig-weight', type=int, default=0,
+        help='Significance weighting eşiği (0=kapalı, önerilen=50)',
+    )
+    p.add_argument(
+        '--sim-amp', type=float, default=1.0,
+        help='Similarity amplification üssü (1.0=kapalı, önerilen=1.5)',
+    )
+    p.add_argument(
+        '--hybrid-alpha', type=float, default=None,
+        metavar='A',
+        help='SharedV+kNN hibrit tahmin ağırlığı (0.0-1.0). '
+             '0=sadece WNMF, 1=sadece kNN, 0.3=önerilen. '
+             'Verilmezse hibrit kapalı.',
+    )
+    p.add_argument(
         '--svdpp', action='store_true',
         help='WNMFModel / global WNMFSharedV için SVD++ (implicit Y) kullan',
+    )
+    p.add_argument(
+        '--als',
+        action='store_true',
+        help='Global baseline için WNMF yerine ALS çalıştır',
     )
     p.add_argument(
         '--compare-mf-svdpp',
@@ -2430,7 +2673,7 @@ if __name__ == '__main__':
                                 assignment_k_100k=None,
                                 assignment_k_1m=None,
                                 weighted_v=args.weighted_v,
-                                use_bias=not args.no_bias,
+                                use_bias=args.use_bias,
                                 use_cluster_bias=args.cluster_bias,
                                 run_cluster_avg=not args.no_cluster_avg,
                                 do_cluster_knn=not args.no_cluster_knn,
@@ -2439,6 +2682,7 @@ if __name__ == '__main__':
                                 similarity=args.similarity,
                                 knn=args.knn,
                                 min_common=args.min_common,
+                                hybrid_alpha=args.hybrid_alpha,
                                 use_svdpp=use_sp,
                                 run_command=RUN_COMMAND,
                                 args=args,
@@ -2466,7 +2710,7 @@ if __name__ == '__main__':
                             assignment_k_100k=None,
                             assignment_k_1m=None,
                             weighted_v=args.weighted_v,
-                            use_bias=not args.no_bias,
+                            use_bias=args.use_bias,
                             use_cluster_bias=args.cluster_bias,
                             run_cluster_avg=not args.no_cluster_avg,
                             do_cluster_knn=not args.no_cluster_knn,
@@ -2475,6 +2719,7 @@ if __name__ == '__main__':
                             similarity=args.similarity,
                             knn=args.knn,
                             min_common=args.min_common,
+                            hybrid_alpha=args.hybrid_alpha,
                             use_svdpp=use_sp,
                             run_command=RUN_COMMAND,
                             args=args,
@@ -2519,7 +2764,7 @@ if __name__ == '__main__':
                                 assignment_k_100k=None,
                                 assignment_k_1m=None,
                                 weighted_v=args.weighted_v,
-                                use_bias=not args.no_bias,
+                                use_bias=args.use_bias,
                                 use_cluster_bias=args.cluster_bias,
                                 run_cluster_avg=not args.no_cluster_avg,
                                 do_cluster_knn=not args.no_cluster_knn,
@@ -2528,6 +2773,7 @@ if __name__ == '__main__':
                                 similarity=args.similarity,
                                 knn=args.knn,
                                 min_common=args.min_common,
+                                hybrid_alpha=args.hybrid_alpha,
                                 use_svdpp=use_sp,
                                 run_command=RUN_COMMAND,
                                 args=args,
@@ -2555,7 +2801,7 @@ if __name__ == '__main__':
                             assignment_k_100k=None,
                             assignment_k_1m=None,
                             weighted_v=args.weighted_v,
-                            use_bias=not args.no_bias,
+                            use_bias=args.use_bias,
                             use_cluster_bias=args.cluster_bias,
                             run_cluster_avg=not args.no_cluster_avg,
                             do_cluster_knn=not args.no_cluster_knn,
@@ -2564,6 +2810,7 @@ if __name__ == '__main__':
                             similarity=args.similarity,
                             knn=args.knn,
                             min_common=args.min_common,
+                            hybrid_alpha=args.hybrid_alpha,
                             use_svdpp=use_sp,
                             run_command=RUN_COMMAND,
                             args=args,

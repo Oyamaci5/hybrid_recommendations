@@ -30,6 +30,7 @@ Kullanım:
     python generate_assignments.py --k-100k 70 --k-1m 120     # ayrı K (--k çoklu ile birlikte kullanılmaz)
     python generate_assignments.py --lof --n-neighbors 15 --contamination 0.1
     python generate_assignments.py --jobs 4              # algoritmaları paralel süreçte
+    python generate_assignments.py --dataset 100k --paper-mode --algo LIT_GOA --k 30
 """
 
 import argparse
@@ -81,6 +82,9 @@ try:
     from ga_hho_optimizer import OriginalGAHHO  # pyright: ignore[reportMissingImports]
 except ImportError:
     from ga_hho import OriginalGAHHO  # pyright: ignore[reportMissingImports]
+from doa_optimizer import OriginalDOA  # pyright: ignore[reportMissingImports]
+from lf_hho_optimizer import LevyHHO_Clustering  # pyright: ignore[reportMissingImports]
+from sfoa_optimizer import SFOA_Clustering  # pyright: ignore[reportMissingImports]
 
 # ============================================================
 # AYARLAR
@@ -89,8 +93,8 @@ except ImportError:
 DATA_100K = os.path.join(os.path.dirname(BASE_DIR), 'data', 'ml-100k', 'u.data')
 DATA_1M   = os.path.join(os.path.dirname(BASE_DIR), 'data', 'ml-1m',   'ratings.dat')
 
-K_100K_DEFAULT = 30
-K_1M_DEFAULT   = 70
+K_100K_DEFAULT = 7
+K_1M_DEFAULT   = 7
 
 GLOBAL_EPOCH   = 30
 LOCAL_EPOCH    = 20
@@ -113,6 +117,11 @@ ALGO_CONFIG = [
     ('H13_HHO+GAop', 'HHO.OriginalHHO', 'GAop'),
     ('H5_GAHHO',   'GAHHO.OriginalGAHHO', None),
     ('H5_EliteGA+HHO', 'GA.EliteMultiGA', 'HHO.OriginalHHO'),
+    ('DOA', 'DOA.OriginalDOA', None),
+    ('LF_HHO', 'LF_HHO', None),
+    ('SFOA', 'SFOA', None),
+    ('SFOA_06', 'SFOA_06', None),
+    ('LIT_CIRCLESA', 'CircleSA.OriginalCircleSA', None),
     ('LIT_GOA', 'GOA.OriginalGOA', None),
     ('LIT_GWO', 'GWO.OriginalGWO', None),
     ('LIT_SSA', 'SSA.DevSSA', None),
@@ -172,6 +181,8 @@ def detect_gray_sheep_lof(matrix, assignments, n_neighbors=LOF_N_NEIGHBORS,
     contamination : 'auto' veya float (0-0.5)
     """
     from sklearn.neighbors import LocalOutlierFactor
+    from sklearn.decomposition import TruncatedSVD
+    from sklearn.preprocessing import MinMaxScaler, normalize
 
     n_users  = len(matrix)
     features = _build_lof_features(matrix, assignments)
@@ -187,6 +198,27 @@ def detect_gray_sheep_lof(matrix, assignments, n_neighbors=LOF_N_NEIGHBORS,
     lof_scores  = -lof.negative_outlier_factor_
     predictions = lof.fit_predict(features)
     gray_mask   = predictions == -1
+    original_gray_mask = gray_mask.copy()
+
+    R_matrix = matrix
+    R_centered = R_matrix - R_matrix.mean(axis=1, keepdims=True)
+    R_centered = np.nan_to_num(R_centered)
+    scaler = MinMaxScaler()
+    R_scaled = scaler.fit_transform(R_centered)
+    svd_n_components = min(30, R_scaled.shape[1])
+    svd = TruncatedSVD(n_components=svd_n_components, random_state=42)
+    U_svd = svd.fit_transform(R_scaled)
+    U_svd = normalize(U_svd)
+
+    lof_svd = LocalOutlierFactor(n_neighbors=20, contamination=0.05)
+    svd_outliers = lof_svd.fit_predict(U_svd)
+
+    svd_gray_mask = svd_outliers == -1
+    gray_mask = gray_mask | svd_gray_mask
+
+    print(f"Orijinal gray sheep : {original_gray_mask.sum()}")
+    print(f"SVD'den eklenen     : {(svd_gray_mask & ~original_gray_mask).sum()}")
+    print(f"Toplam gray sheep   : {gray_mask.sum()}")
 
     if gray_mask.sum() > 0 and (~gray_mask).sum() > 0:
         threshold = float(
@@ -454,7 +486,7 @@ def run_memetic_hybrid(base_info, matrix, K, init,
                 best_sol = current_pop[round_best_idx].copy()
 
             print(f"    Round {round_num}: swarm={new_fit:.4f} "
-                  f"GA_inject → best={best_fit:.4f}")
+                  f"GA_inject -> best={best_fit:.4f}")
 
     print(f"    Final WCSS: {best_fit:.4f}")
     return best_sol, best_fit
@@ -498,7 +530,7 @@ def save_assignment(assignments, gray_mask, best_sol, best_fit,
     cluster_sizes = np.bincount(white_assign, minlength=K_val)
     active        = cluster_sizes[cluster_sizes > 0]
 
-    threshold = extra_data.get('threshold', '—') if extra_data else '—'
+    threshold = extra_data.get('threshold_label', extra_data.get('threshold', '—')) if extra_data else '—'
 
     print(f"    OK Kaydedildi -> {save_dir}")
     print(f"      WCSS          : {best_fit:.4f}")
@@ -581,15 +613,22 @@ def _run_one_core(
     args=None,
     run_id=None,
     cluster_metric: str = 'pearson',
+    init_mode: str = 'mkpp',
+    disable_gray_sheep: bool = False,
 ):
     """Ortak gövde: algo_map ana süreçte veya worker’da bir kez oluşturulur."""
-    mode_str = 'LOF' if use_lof else 'percentile'
-    print(f"\n  [{label}] başlıyor (gray sheep: {mode_str}, küme metrik: {cluster_metric})...")
+    if disable_gray_sheep:
+        mode_str = 'off'
+    else:
+        mode_str = 'LOF' if use_lof else 'percentile'
+    print(
+        f"\n  [{label}] başlıyor "
+        f"(gray sheep: {mode_str}, küme metrik: {cluster_metric}, init: {init_mode})..."
+    )
     t0   = time.time()
-    #init = mkmeans_plus_plus_init(matrix, K=K, n_solutions=50, seed=seed)
     init = _multi_start_init(
         matrix, K=K, pop_size=POP_SIZE, seed=seed, n_restarts=10,
-        metric=cluster_metric,
+        metric=cluster_metric, init_mode=init_mode,
     )
 
     if g_name == 'KMEANS':
@@ -623,6 +662,37 @@ def _run_one_core(
             ga_mutation_rate=0.1,
             metric=cluster_metric,
         )
+    elif g_name == 'LF_HHO' or label == 'LF_HHO':
+        lf_hho = LevyHHO_Clustering(
+            n_agents=pop_size,
+            n_iter=baseline_epoch,
+            k=K,
+            levy_scale=1.0,
+            stagnation_tol=10,
+            seed=seed,
+        )
+        centers = lf_hho.optimize(matrix)
+        _ = lf_hho.assign(matrix, centers)
+        best_sol = centers.flatten()
+        best_fit, _ = compute_wcss_fast(
+            matrix, best_sol, K, metric=cluster_metric,
+        )
+    elif label in ('SFOA', 'SFOA_06') or g_name in ('SFOA', 'SFOA_06'):
+        gp_map = {'SFOA': 0.5, 'SFOA_06': 0.6}
+        sfoa_key = label if label in gp_map else g_name
+        sfoa = SFOA_Clustering(
+            n_agents=pop_size,
+            n_iter=baseline_epoch,
+            k=K,
+            Gp=gp_map[sfoa_key],
+            seed=seed,
+        )
+        centers = sfoa.optimize(matrix)
+        _ = sfoa.assign(matrix, centers)
+        best_sol = centers.flatten()
+        best_fit, _ = compute_wcss_fast(
+            matrix, best_sol, K, metric=cluster_metric,
+        )
     elif l_name is None:
         best_sol, best_fit = run_single(
             algo_map[g_name], matrix, K, init, baseline_epoch, pop_size,
@@ -655,7 +725,10 @@ def _run_one_core(
             matrix, best_sol, K, m=2.0,
         )
 
-    if use_lof:
+    if disable_gray_sheep:
+        gray_mask = np.zeros(len(assignments), dtype=bool)
+        extra_data = {'threshold': 0.0, 'threshold_label': 'disabled'}
+    elif use_lof:
         print(f"    LOF hesaplanıyor (n_neighbors={lof_n_neighbors})...")
         gs_info   = detect_gray_sheep_lof(
             matrix, assignments, lof_n_neighbors, lof_contamination
@@ -709,6 +782,8 @@ def _mp_run_assignment_job(job):
         args,
         run_id,
         cluster_metric,
+        init_mode,
+        disable_gray_sheep,
     ) = job
     algo_map = {a['full_name']: a for a in get_all_algorithms_v3()}
     algo_map['GAHHO.OriginalGAHHO'] = {
@@ -722,6 +797,10 @@ def _mp_run_assignment_job(job):
     algo_map['KMEANS'] = {
         'full_name': 'KMEANS',
         'class': None,
+    }
+    algo_map['DOA.OriginalDOA'] = {
+        'full_name': 'DOA.OriginalDOA',
+        'class':     OriginalDOA,
     }
     _run_one_core(
         label,
@@ -742,13 +821,16 @@ def _mp_run_assignment_job(job):
         args,
         run_id,
         cluster_metric,
+        init_mode,
+        disable_gray_sheep,
     )
 
 
 def run_one(label, g_name, l_name, matrix, K, seed, save_dir, algo_map,
             use_lof=False, lof_n_neighbors=LOF_N_NEIGHBORS,
             lof_contamination=LOF_CONTAMINATION, args=None, run_id=None,
-            cluster_metric: str = 'pearson'):
+            cluster_metric: str = 'pearson', init_mode: str = 'mkpp',
+            disable_gray_sheep: bool = False):
     """
     Bir algoritma için assignment üret ve kaydet.
 
@@ -774,6 +856,8 @@ def run_one(label, g_name, l_name, matrix, K, seed, save_dir, algo_map,
         args,
         run_id=run_id,
         cluster_metric=cluster_metric,
+        init_mode=init_mode,
+        disable_gray_sheep=disable_gray_sheep,
     )
 
 
@@ -940,13 +1024,16 @@ def prepare_matrix_for_clustering(
     zscore,
     pca_var,
     wnmf_k,
+    preprocess='minmax',
+    feature_extraction='svd',
+    svd_components=20,
     min_user_ratings=5,
     min_item_ratings=10,
     wnmf_init_method='inmed',
     inmed_trim=(5.0, 95.0),
 ):
     """Sıra: prune → z-score → PCA → WNMF (--pca ile --wnmf-features birlikte CLI’de yasak)."""
-    from sklearn.preprocessing import normalize
+    from sklearn.preprocessing import MinMaxScaler, normalize
 
     matrix = prune_sparse_matrix(
         matrix,
@@ -961,15 +1048,47 @@ def prepare_matrix_for_clustering(
         print("  L2 normalization uygulandı (axis=1)")
     if pca_var is not None:
         matrix = pca_variance_reduce(matrix, pca_var)
-    if wnmf_k is not None:
-        matrix = wnmf_feature_extract(
-            matrix,
-            n_components=wnmf_k,
-            n_epochs=50,
+    R_matrix = matrix
+    if preprocess == 'minmax':
+        from sklearn.preprocessing import MinMaxScaler
+        R_matrix = MinMaxScaler().fit_transform(R_matrix)
+    elif preprocess == 'zscore':
+        from sklearn.preprocessing import StandardScaler
+        R_matrix = StandardScaler().fit_transform(R_matrix)
+    elif preprocess == 'maxabs':
+        from sklearn.preprocessing import MaxAbsScaler
+        R_matrix = MaxAbsScaler().fit_transform(R_matrix)
+
+    if feature_extraction == 'svd':
+        from sklearn.decomposition import TruncatedSVD
+        from sklearn.preprocessing import normalize
+        svd = TruncatedSVD(n_components=svd_components, random_state=42)
+        X_cluster = normalize(svd.fit_transform(R_matrix))
+    elif feature_extraction == 'nmf':
+        from sklearn.decomposition import NMF
+        from sklearn.preprocessing import normalize
+        nmf = NMF(n_components=svd_components, random_state=42, max_iter=300)
+        X_cluster = normalize(nmf.fit_transform(R_matrix))
+    elif feature_extraction == 'pca':
+        from sklearn.decomposition import PCA
+        from sklearn.preprocessing import normalize
+        pca = PCA(n_components=svd_components, random_state=42)
+        X_cluster = normalize(pca.fit_transform(R_matrix))
+    elif feature_extraction == 'wnmf':
+        from sklearn.preprocessing import normalize
+        n_components = wnmf_k if wnmf_k is not None else svd_components
+        X_cluster = wnmf_feature_extract(
+            R_matrix,
+            n_components=n_components,
             random_seed=42,
             init_method=wnmf_init_method,
             inmed_trim=inmed_trim,
         )
+        X_cluster = normalize(X_cluster)
+    else:
+        X_cluster = R_matrix
+
+    matrix = X_cluster.astype(np.float32, copy=False)
     return matrix
 
 
@@ -981,13 +1100,17 @@ def run_dataset(dataset_name, matrix, K, out_root, algo_filter=None,
                 use_lof=False, lof_n_neighbors=LOF_N_NEIGHBORS,
                 lof_contamination=LOF_CONTAMINATION,
                 max_workers: Optional[int] = None, out_suffix: str = '',
-                args=None, run_id=None, cluster_metric: str = 'pearson'):
+                args=None, run_id=None, cluster_metric: str = 'pearson',
+                init_mode: str = 'mkpp', disable_gray_sheep: bool = False):
     print(f"\n{'='*60}")
     print(f"DATASET: {dataset_name.upper()}  |  K={K}  |  Seed={SEED}")
     mode_str = f'LOF (n={lof_n_neighbors}, cont={lof_contamination})' \
                if use_lof else 'percentile (80th)'
+    if disable_gray_sheep:
+        mode_str = 'off'
     print(f"Gray sheep  : {mode_str}")
     print(f"Küme metrik : {cluster_metric} (pearson | euclidean)")
+    print(f"Init modu   : {init_mode}")
     print(f"{'='*60}")
 
     # K=default için suffix yok, farklı K için _k{K} eklenir
@@ -999,7 +1122,10 @@ def run_dataset(dataset_name, matrix, K, out_root, algo_filter=None,
         if algo_filter and label not in algo_filter:
             print(f"  [{label}] atlandı (filtre)")
             continue
-        save_dir = os.path.join(out_root, dataset_name, f"{label}{k_suffix}{out_suffix}")
+        assign_suffix = ''
+        if args is not None:
+            assign_suffix = f'_{args.preprocess}_{args.feature_extraction}{args.svd_components}_k{K}'
+        save_dir = os.path.join(out_root, dataset_name, f"{label}{k_suffix}{out_suffix}{assign_suffix}")
         jobs_meta.append((label, g_name, l_name, save_dir))
 
     if not jobs_meta:
@@ -1023,6 +1149,10 @@ def run_dataset(dataset_name, matrix, K, out_root, algo_filter=None,
             'full_name': 'KMEANS',
             'class': None,
         }
+        algo_map['DOA.OriginalDOA'] = {
+            'full_name': 'DOA.OriginalDOA',
+            'class':     OriginalDOA,
+        }
         for label, g_name, l_name, save_dir in jobs_meta:
             run_one(
                 label,
@@ -1039,6 +1169,8 @@ def run_dataset(dataset_name, matrix, K, out_root, algo_filter=None,
                 args=args,
                 run_id=run_id,
                 cluster_metric=cluster_metric,
+                init_mode=init_mode,
+                disable_gray_sheep=disable_gray_sheep,
             )
     else:
         print(
@@ -1064,6 +1196,8 @@ def run_dataset(dataset_name, matrix, K, out_root, algo_filter=None,
                 args,
                 run_id,
                 cluster_metric,
+                init_mode,
+                disable_gray_sheep,
             )
             for label, g_name, l_name, save_dir in jobs_meta
         ]
@@ -1100,8 +1234,21 @@ def parse_args():
         help="LOF tabanlı gray sheep kullan (default: sabit 80. percentile)"
     )
     p.add_argument(
+        '--no-gray-sheep', action='store_true',
+        help='Gray sheep tespitini tamamen kapat (LOF/percentile yok)',
+    )
+    p.add_argument(
         '--zscore', action='store_true',
         help='Clustering matrisine kullanıcı bazlı Z-score normalizasyon uygula'
+    )
+    p.add_argument(
+        '--paper-mode', action='store_true',
+        help='Literatür preset: zscore + pca(0.95) + euclidean + random init + gray sheep kapalı',
+    )
+    p.add_argument(
+        '--init-mode', choices=['mkpp', 'random'], default=None,
+        help="Centroid başlangıcı: mkpp (MkMeans++) veya random. "
+             "Verilmezse paper-mode'da random, diğer modlarda mkpp.",
     )
     p.add_argument(
         '--min-user-ratings', type=int, default=5, metavar='N',
@@ -1175,6 +1322,16 @@ def parse_args():
         help='Paralel algoritma süreç sayısı (varsayılan: otomatik = CPU sayısına göre; '
              '1=sıralı, 2+=belirtilen sayıda süreç, 0=CPU ile sınırlandırılmış havuz)',
     )
+    p.add_argument('--preprocess',
+        choices=['none','minmax','zscore','maxabs'],
+        default='minmax',
+        help='Ön işleme yöntemi')
+    p.add_argument('--feature-extraction',
+        choices=['none','svd','pca','nmf','wnmf'],
+        default='svd',
+        help='Boyut indirgeme yöntemi')
+    p.add_argument('--svd-components', type=int, default=20,
+        help='SVD/PCA/NMF bileşen sayısı')
     args = p.parse_args()
     if args.k is not None and (args.k_100k is not None or args.k_1m is not None):
         p.error('--k (tek veya çoklu) ile --k-100k / --k-1m birlikte kullanılamaz')
@@ -1192,28 +1349,61 @@ def parse_args():
     args.pca = args.pca_variance
     if args.cluster_metric == 'auto':
         args.cluster_metric = 'euclidean' if args.wnmf_features else 'pearson'
+    if args.no_gray_sheep and args.lof:
+        print('  Uyarı: --no-gray-sheep aktif; --lof yok sayılıyor.')
+        args.lof = False
+    user_init_mode = args.init_mode
+    if args.paper_mode:
+        if args.wnmf_features is not None:
+            p.error('--paper-mode ile --wnmf-features birlikte kullanılamaz (PCA preset kullanılır)')
+        if args.lof:
+            print('  Uyarı: --paper-mode aktif; --lof yok sayılıyor (gray sheep kapalı).')
+            args.lof = False
+        args.zscore = True
+        if args.pca_variance is None:
+            args.pca_variance = 0.95
+        args.pca = args.pca_variance
+        if args.cluster_metric != 'euclidean':
+            print(
+                f"  Uyarı: --paper-mode aktif; cluster metric "
+                f"'{args.cluster_metric}' -> 'euclidean' olarak zorlandı."
+            )
+        args.cluster_metric = 'euclidean'
+        args.init_mode = user_init_mode or 'random'
+        args.disable_gray_sheep = True
+    else:
+        args.init_mode = user_init_mode or 'mkpp'
+        args.disable_gray_sheep = bool(args.no_gray_sheep)
     return args
 
 def _multi_start_init(matrix, K, pop_size, seed, n_restarts=10,
-                      metric: str = 'pearson'):
+                      metric: str = 'pearson', init_mode: str = 'mkpp'):
     """
     n_restarts farklı seed ile MkMeans++ çalıştır.
     Her seferinde 1 çözüm üret, WCSS hesapla.
     En iyi pop_size kadar çözümü döndür.
     """
+    if init_mode not in ('mkpp', 'random'):
+        raise ValueError(f"init_mode bilinmiyor: {init_mode}")
     candidates = []
+    rng = np.random.default_rng(seed=seed)
+    dim = K * matrix.shape[1]
+    ub = _centroid_value_upper_bound(matrix)
     for i in range(n_restarts * 3):   # fazla üret, en iyileri seç
-        sols = mkmeans_plus_plus_init(
-            matrix, K=K, n_solutions=1, seed=seed + i * 17, metric=metric,
-        )
-        sol = sols[0]
+        if init_mode == 'mkpp':
+            sols = mkmeans_plus_plus_init(
+                matrix, K=K, n_solutions=1, seed=seed + i * 17, metric=metric,
+            )
+            sol = sols[0]
+        else:
+            sol = rng.uniform(0.0, ub, size=dim).astype(np.float64, copy=False)
         wcss, _ = compute_wcss_fast(matrix, sol, K, metric=metric)
         candidates.append((wcss, sol))
 
     # WCSS'e göre sırala, en iyi pop_size tanesini al
     candidates.sort(key=lambda x: x[0])
     best = [c[1] for c in candidates[:pop_size + 10]]
-    print(f"    Init: {n_restarts*3} aday -> en iyi {pop_size} secildi  "
+    print(f"    Init({init_mode}): {n_restarts*3} aday -> en iyi {pop_size} secildi  "
           f"(WCSS aralığı: {candidates[0][0]:.1f} – {candidates[pop_size-1][0]:.1f})")
     return best
 # ============================================================
@@ -1275,7 +1465,12 @@ if __name__ == '__main__':
     print("=" * 60)
     print("ASSIGNMENT ÜRETİCİ")
     print("=" * 60)
-    print(f"Gray sheep  : {'LOF (adaptif)' if args.lof else 'Percentile (sabit %20)'}")
+    if args.disable_gray_sheep:
+        gs_banner = 'Kapalı (--no-gray-sheep/paper-mode)'
+    else:
+        gs_banner = 'LOF (adaptif)' if args.lof else 'Percentile (sabit %20)'
+    print(f"Gray sheep  : {gs_banner}")
+    print(f"Paper mode  : {'Açık' if args.paper_mode else 'Kapalı'}")
     print(f"Algoritmalar: {selected_algos or [c[0] for c in ALGO_CONFIG]}")
     print(f"Dataset     : {args.dataset}")
     if k_multi is not None:
@@ -1341,7 +1536,12 @@ if __name__ == '__main__':
         'fuzzy': '_fuzzy',
     }
     metric_suffix = metric_suffix_map.get(args.cluster_metric, '')
-    out_suffix = prune_suffix + zscore_suffix + pca_suffix + wnmf_suffix + metric_suffix
+    paper_suffix = '_paper' if args.paper_mode else ''
+    no_gs_suffix = '_nogs' if args.disable_gray_sheep and not args.paper_mode else ''
+    out_suffix = (
+        prune_suffix + zscore_suffix + pca_suffix + wnmf_suffix
+        + metric_suffix + paper_suffix + no_gs_suffix
+    )
 
     try:
         if args.dataset in ('100k', 'both'):
@@ -1352,6 +1552,9 @@ if __name__ == '__main__':
                 args.zscore,
                 args.pca_variance,
                 args.wnmf_features,
+                preprocess=args.preprocess,
+                feature_extraction=args.feature_extraction,
+                svd_components=args.svd_components,
                 min_user_ratings=args.min_user_ratings,
                 min_item_ratings=args.min_item_ratings,
                 wnmf_init_method=args.wnmf_init,
@@ -1375,6 +1578,8 @@ if __name__ == '__main__':
                         args=args,
                         run_id=db_run_id,
                         cluster_metric=args.cluster_metric,
+                        init_mode=args.init_mode,
+                        disable_gray_sheep=args.disable_gray_sheep,
                     )
             else:
                 run_dataset(
@@ -1388,6 +1593,8 @@ if __name__ == '__main__':
                     args=args,
                     run_id=db_run_id,
                     cluster_metric=args.cluster_metric,
+                    init_mode=args.init_mode,
+                    disable_gray_sheep=args.disable_gray_sheep,
                 )
 
         if args.dataset in ('1m', 'both'):
@@ -1398,6 +1605,9 @@ if __name__ == '__main__':
                 args.zscore,
                 args.pca_variance,
                 args.wnmf_features,
+                preprocess=args.preprocess,
+                feature_extraction=args.feature_extraction,
+                svd_components=args.svd_components,
                 min_user_ratings=args.min_user_ratings,
                 min_item_ratings=args.min_item_ratings,
                 wnmf_init_method=args.wnmf_init,
@@ -1421,6 +1631,8 @@ if __name__ == '__main__':
                         args=args,
                         run_id=db_run_id,
                         cluster_metric=args.cluster_metric,
+                        init_mode=args.init_mode,
+                        disable_gray_sheep=args.disable_gray_sheep,
                     )
             else:
                 run_dataset(
@@ -1434,6 +1646,8 @@ if __name__ == '__main__':
                     args=args,
                     run_id=db_run_id,
                     cluster_metric=args.cluster_metric,
+                    init_mode=args.init_mode,
+                    disable_gray_sheep=args.disable_gray_sheep,
                 )
 
         print(f"\n{'='*60}")

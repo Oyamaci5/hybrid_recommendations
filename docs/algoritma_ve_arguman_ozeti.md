@@ -70,17 +70,20 @@ Not:
 
 ### 3.2 Gray sheep modu
 - `--lof` -> LOF tabanli adaptif tespit
+- `--no-gray-sheep` -> gray sheep tespitini tamamen kapatir
 - `--n-neighbors` -> LOF komsu sayisi
 - `--contamination` -> `auto` veya oran
 
 LOF verilmezse:
 - sabit percentile tabanli tespit (80. percentile, yaklasik %20 gray sheep)
+- `%20` istemiyorsan `--no-gray-sheep` kullan.
 
 ### 3.3 On-isleme / ozellik cikarma
 - `--min-user-ratings` (vars. 5)
 - `--min-item-ratings` (vars. 10)
 - `--zscore`
 - `--pca` (0,1] varyans esigi
+- `--paper-mode` (zscore+pca+euclidean+random init preset, gray sheep kapali)
 - `--wnmf-features K`
 - `--wnmf-init {random,inmed}`
 - `--inmed-trim-low`, `--inmed-trim-high`
@@ -88,9 +91,16 @@ LOF verilmezse:
 
 Kural:
 - `--pca` ve `--wnmf-features` birlikte kullanilamaz.
+- `--paper-mode` ve `--wnmf-features` birlikte kullanilamaz.
 - `--cluster-metric auto`:
   - `wnmf-features` varsa `euclidean`
   - yoksa `pearson`
+- `--paper-mode`:
+  - `zscore` zorunlu acik
+  - `pca` varsayilan `0.95` (istenirse `--pca` ile degistirilebilir)
+  - `cluster-metric` `euclidean` olarak zorlanir
+  - init modu `random`
+  - gray sheep kapali
 
 ### 3.4 K ve paralellik
 - `--k` (tek veya coklu)
