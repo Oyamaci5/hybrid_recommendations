@@ -70,6 +70,8 @@ class WNMFModel:
         init_method    : str   = "random",
         inmed_trim     : tuple = (5.0, 95.0),
         inmed_jitter   : float = 0.01,
+        bias_lr        : float = None,
+        bias_reg       : float = None,
     ):
         self.n_users        = n_users
         self.n_items        = n_items
@@ -83,6 +85,8 @@ class WNMFModel:
         self.init_method    = str(init_method).lower()
         self.inmed_trim     = inmed_trim
         self.inmed_jitter   = float(inmed_jitter)
+        self.bias_lr        = bias_lr
+        self.bias_reg       = bias_reg
         self.is_fitted      = False
         self.user_implicit  = None
         self._svdpp_train_items: Optional[dict] = None
@@ -155,6 +159,8 @@ class WNMFModel:
         n        = len(ratings)
         lr       = self.learning_rate
         reg      = self.regularization
+        _blr = self.bias_lr if self.bias_lr is not None else lr
+        _breg = self.bias_reg if self.bias_reg is not None else reg
 
         if self.init_method == "inmed":
             self._initialize_inmed_factors(ratings)
@@ -224,8 +230,8 @@ class WNMFModel:
                         grad_v = -error * w * u_vec + reg * self.V[i]
                         self.V[i] -= lr * grad_v
                         np.maximum(self.V[i], 0, out=self.V[i])
-                        self.b_u[u] += lr * (error * w - reg * self.b_u[u])
-                        self.b_i[i] += lr * (error * w - reg * self.b_i[i])
+                        self.b_u[u] += _blr * (error * w - _breg * self.b_u[u])
+                        self.b_i[i] += _blr * (error * w - _breg * self.b_i[i])
                         if n_u > 0:
                             user_implicit[u] = (
                                 self.Y[user_items[u]].sum(axis=0) / sqrt_n
@@ -264,8 +270,8 @@ class WNMFModel:
                     grad_v = -error * w * self.U[u] + reg * self.V[i]
                     self.U[u] -= lr * grad_u
                     self.V[i] -= lr * grad_v
-                    self.b_u[u] += lr * (error * w - reg * self.b_u[u])
-                    self.b_i[i] += lr * (error * w - reg * self.b_i[i])
+                    self.b_u[u] += _blr * (error * w - _breg * self.b_u[u])
+                    self.b_i[i] += _blr * (error * w - _breg * self.b_i[i])
                     np.maximum(self.U[u], 0, out=self.U[u])
                     np.maximum(self.V[i], 0, out=self.V[i])
                 else:
@@ -595,6 +601,8 @@ class WNMFSharedV:
             mu             = self.mu,
             b_i_global     = self.b_i,
             cluster_ratings= cluster_ratings,
+            bias_lr        = self._global_model.bias_lr,
+            bias_reg       = self._global_model.bias_reg,
         )
 
 
@@ -619,6 +627,8 @@ class ClusterWNMF:
         mu             : float = 0.0,
         b_i_global     : Optional[np.ndarray] = None,
         cluster_ratings: Optional[np.ndarray] = None,
+        bias_lr        : float = None,
+        bias_reg       : float = None,
     ):
         self.n_users        = n_users
         self.n_items        = n_items
@@ -628,6 +638,8 @@ class ClusterWNMF:
         self.n_epochs       = n_epochs
         self.random_seed    = random_seed
         self.use_bias       = use_bias
+        self.bias_lr        = bias_lr
+        self.bias_reg       = bias_reg
         if cluster_ratings is not None and len(cluster_ratings) > 0:
             self.mu = float(cluster_ratings[:, 2].mean())
         else:
@@ -669,6 +681,8 @@ class ClusterWNMF:
         n        = len(ratings)
         lr       = self.learning_rate
         reg      = self.regularization
+        _blr = self.bias_lr if self.bias_lr is not None else lr
+        _breg = self.bias_reg if self.bias_reg is not None else reg
 
         for epoch in range(self.n_epochs):
             idx    = np.random.permutation(n)
@@ -691,7 +705,7 @@ class ClusterWNMF:
                     error = r - pred
                     grad_u = -error * self.V[i] + reg * self.U[u]
                     self.U[u] -= lr * grad_u
-                    self.b_u[u] += lr * (error - reg * self.b_u[u])
+                    self.b_u[u] += _blr * (error - _breg * self.b_u[u])
                     np.maximum(self.U[u], 0, out=self.U[u])
                 else:
                     error = r - float(np.dot(self.U[u], self.V[i]))

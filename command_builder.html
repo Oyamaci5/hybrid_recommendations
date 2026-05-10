@@ -1,0 +1,3461 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8" />
+<title>Hybrid Recommendations — Komut Üretici</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --panel: #161a23;
+    --panel-2: #1e2230;
+    --border: #2a3142;
+    --text: #e6e8ee;
+    --muted: #8a92a6;
+    --accent: #4f8cff;
+    --accent-2: #34d399;
+    --warn: #f59e0b;
+    --danger: #ef4444;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text);
+               font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  header { padding: 18px 24px; border-bottom: 1px solid var(--border);
+           display: flex; align-items: center; gap: 14px; }
+  header h1 { font-size: 18px; margin: 0; }
+  header .sub { color: var(--muted); font-size: 13px; }
+
+  .tabs { display: flex; gap: 4px; padding: 0 24px; border-bottom: 1px solid var(--border);
+          background: var(--panel); position: sticky; top: 0; z-index: 5; }
+  .tab { padding: 12px 18px; cursor: pointer; color: var(--muted);
+         border-bottom: 2px solid transparent; user-select: none; font-size: 14px; }
+  .tab.active { color: var(--text); border-bottom-color: var(--accent); }
+
+  .layout { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; padding: 18px 24px; }
+  @media (max-width: 1100px) { .layout { grid-template-columns: 1fr; } }
+
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+           padding: 16px; }
+  .panel h2 { margin: 0 0 10px 0; font-size: 15px; color: var(--text); }
+  .panel h2 .pill { font-size: 11px; color: var(--accent); border: 1px solid var(--accent);
+                    border-radius: 999px; padding: 2px 8px; margin-left: 8px; vertical-align: middle; }
+
+  details { background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px;
+            padding: 8px 12px; margin-bottom: 10px; }
+  details > summary { cursor: pointer; font-weight: 600; color: var(--text);
+                       list-style: none; padding: 4px 0; }
+  details > summary::-webkit-details-marker { display: none; }
+  details > summary:before { content: "▸"; display: inline-block; transform: translateY(-1px);
+                              margin-right: 8px; color: var(--muted); transition: transform .2s; }
+  details[open] > summary:before { transform: rotate(90deg); }
+
+  .row { display: grid; grid-template-columns: 220px 1fr; gap: 10px; align-items: start;
+         padding: 8px 0; border-top: 1px dashed var(--border); }
+  .row:first-of-type { border-top: none; }
+  .row .label { font-size: 13px; color: var(--text); }
+  .row .label .arg { color: var(--accent); font-family: ui-monospace, Menlo, Consolas, monospace;
+                      font-size: 12px; display: block; margin-top: 2px; }
+  .row .label .desc { color: var(--muted); font-size: 12px; margin-top: 4px; line-height: 1.4; }
+  .row .control input[type="text"], .row .control input[type="number"], .row .control select,
+  .row .control textarea {
+    width: 100%; background: #0d111b; color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px;
+    font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px;
+  }
+  .row .control textarea { min-height: 60px; resize: vertical; }
+  .row .control .check { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+  .row .control .check input { width: 16px; height: 16px; }
+  .row .control .multi { display: flex; flex-wrap: wrap; gap: 6px 14px; }
+  .row .control .multi label { display: flex; align-items: center; gap: 6px; font-size: 12px;
+                                background: #0d111b; border: 1px solid var(--border); border-radius: 6px;
+                                padding: 4px 8px; cursor: pointer; }
+  .row .control .help { color: var(--muted); font-size: 11px; margin-top: 4px; }
+
+  .preview { position: sticky; top: 56px; align-self: start; }
+  .preview pre { background: #0a0d14; color: #d4f0ff; border: 1px solid var(--border);
+                 border-radius: 8px; padding: 14px; overflow: auto; max-height: 60vh;
+                 font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px;
+                 white-space: pre-wrap; word-break: break-word; line-height: 1.55; }
+  .preview .actions { display: flex; gap: 8px; margin-top: 10px; }
+  .btn { padding: 8px 14px; border: 1px solid var(--border); background: var(--panel-2);
+          color: var(--text); border-radius: 8px; cursor: pointer; font-size: 13px; }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: white; font-weight: 600; }
+  .btn.ok { background: var(--accent-2); border-color: var(--accent-2); color: #06281b; font-weight: 700; }
+  .toast { position: fixed; right: 24px; bottom: 24px; padding: 10px 14px; background: var(--accent-2);
+           color: #06281b; font-weight: 700; border-radius: 8px; opacity: 0; transition: opacity .25s;
+           pointer-events: none; }
+  .toast.show { opacity: 1; }
+
+  .preset-bar { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+  .preset-bar .btn { font-size: 12px; padding: 6px 10px; }
+  .warn-banner { background: rgba(245, 158, 11, .12); border: 1px solid var(--warn);
+                  color: #ffce71; padding: 10px 12px; border-radius: 8px; font-size: 12px;
+                  margin-bottom: 10px; line-height: 1.5; }
+  .info-banner { background: rgba(79, 140, 255, .12); border: 1px solid var(--accent);
+                  color: #b9d2ff; padding: 10px 12px; border-radius: 8px; font-size: 12px;
+                  margin-bottom: 10px; line-height: 1.5; }
+  .danger-banner { background: rgba(239, 68, 68, .12); border: 1px solid var(--danger);
+                   color: #fca5a5; padding: 10px 12px; border-radius: 8px; font-size: 12px;
+                   margin-bottom: 10px; line-height: 1.5; }
+  .ok-banner { background: rgba(52, 211, 153, .10); border: 1px solid var(--accent-2);
+               color: #86efac; padding: 10px 12px; border-radius: 8px; font-size: 12px;
+               margin-bottom: 10px; line-height: 1.5; }
+  .lint-list { margin: 0; padding: 0; list-style: none; }
+  .lint-list li { padding: 6px 0; border-top: 1px solid rgba(255,255,255,.05); }
+  .lint-list li:first-child { border-top: none; }
+  .lint-tag { display: inline-block; font-size: 10px; font-weight: 700; padding: 1px 6px;
+              border-radius: 4px; margin-right: 6px; vertical-align: middle; }
+  .lint-tag.err { background: var(--danger); color: white; }
+  .lint-tag.warn { background: var(--warn); color: #1a1300; }
+  .lint-tag.ok { background: var(--accent-2); color: #06281b; }
+
+  .scenario-row { background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.08);
+                  border-radius: 8px; padding: 10px; margin-bottom: 8px; }
+  .scenario-row.disabled { opacity: 0.45; }
+  .scenario-row .sc-header { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+  .scenario-row .sc-header input[type=text].sc-label {
+    flex: 1; font-weight: 600; background: transparent; border: 1px solid rgba(255,255,255,.1);
+    color: var(--text); padding: 4px 8px; border-radius: 6px;
+  }
+  .scenario-row .sc-grid { display: grid; grid-template-columns: 110px 1fr; gap: 6px 10px;
+                            font-size: 12px; align-items: center; }
+  .scenario-row .sc-grid label { color: var(--muted); font-size: 11px; }
+  .scenario-row .sc-grid input[type=text],
+  .scenario-row .sc-grid select {
+    background: rgba(0,0,0,.25); color: var(--text); border: 1px solid rgba(255,255,255,.1);
+    padding: 4px 8px; border-radius: 6px; font-size: 12px; font-family: inherit;
+  }
+  .scenario-row .sc-grid input[type=text] { width: 100%; }
+  .scenario-row .sc-meta { font-size: 11px; color: var(--muted); margin-top: 6px; }
+  .scenario-row .sc-meta b { color: #b9d2ff; }
+  .scenario-row .btn.btn-rm {
+    font-size: 11px; padding: 3px 8px; background: rgba(239,68,68,.15);
+    border-color: rgba(239,68,68,.4); color: #fca5a5;
+  }
+
+  table.ref { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 13px; }
+  table.ref th, table.ref td { border: 1px solid var(--border); padding: 8px 10px;
+                                vertical-align: top; text-align: left; }
+  table.ref th { background: var(--panel-2); color: var(--text); font-size: 12px; font-weight: 700; }
+  table.ref td { color: var(--text); }
+  table.ref code { background: #0d111b; padding: 1px 6px; border-radius: 4px;
+                   font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; color: #cfe9ff; }
+  table.ref .ok-cell { color: #86efac; font-weight: 700; }
+  table.ref .bad-cell { color: #fca5a5; font-weight: 700; }
+  table.ref .warn-cell { color: #ffce71; font-weight: 700; }
+  table.ref tr:nth-child(even) td { background: rgba(255,255,255,.02); }
+  .ref-section { margin-bottom: 28px; }
+  .ref-section h3 { font-size: 14px; margin: 16px 0 6px 0; color: var(--accent); }
+  .ref-section p { color: var(--muted); font-size: 12px; line-height: 1.55; margin: 4px 0; }
+
+  .tab-page { display: none; }
+  .tab-page.active { display: block; }
+  code.kbd { background: #0d111b; border: 1px solid var(--border); padding: 1px 6px; border-radius: 4px;
+             font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11px; color: #cfe9ff; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Hybrid Recommendations — Komut Üretici</h1>
+  <div class="sub">Seçenekleri işaretle, sağdaki PowerShell komutunu kopyala.</div>
+</header>
+
+<div class="tabs">
+  <div class="tab active" data-tab="ga">1) Atama Üretici · <code class="kbd">generate_assignments.py</code></div>
+  <div class="tab" data-tab="wnmf">2) WNMF / Soft-KNN Deneyi · <code class="kbd">wnmf_experiment.py</code></div>
+  <div class="tab" data-tab="grid">3) Grid Search · MAE Karşılaştırma</div>
+  <div class="tab" data-tab="compare">4) Küme Karşılaştırma · <code class="kbd">compare_cluster_structure.py</code></div>
+  <div class="tab" data-tab="ref">5) Referans · Argümanlar &amp; Kombinasyonlar</div>
+</div>
+
+<!-- ============================================================
+     TAB 1: generate_assignments.py
+     ============================================================ -->
+<div class="tab-page active" id="page-ga">
+  <div class="layout">
+    <div class="panel" id="form-ga">
+      <div class="preset-bar">
+        <button class="btn" data-preset="zscore-nmf-fuzzy">Z-Score + NMF20 + FCM (önerilen)</button>
+        <button class="btn" data-preset="zscore-wnmf-fuzzy">Z-Score + WNMF20 + FCM</button>
+        <button class="btn" data-preset="paper">--paper-mode (Z-Score + PCA0.95)</button>
+        <button class="btn" data-preset="reset">Temizle</button>
+      </div>
+      <div class="info-banner">
+        Çıktı dizini: <code>mealpy\results\assignments_lof\&lt;dataset&gt;\&lt;ALGO&gt;&lt;suffix&gt;</code>
+        (LOF kapalıysa <code>assignments\</code>). Klasör suffix'i, alttaki <b>Önizleme</b>'de
+        otomatik gösterilir.
+      </div>
+
+      <details open>
+        <summary>Veri ve Kümeleme Hedefi</summary>
+
+        <div class="row">
+          <div class="label">Veri kümesi
+            <span class="arg">--dataset</span>
+            <div class="desc">Hangi MovieLens üzerinde çalışılacak.</div>
+          </div>
+          <div class="control">
+            <select data-arg="--dataset" data-default="both">
+              <option value="100k" selected>100k</option>
+              <option value="1m">1m</option>
+              <option value="both">both</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Algoritmalar
+            <span class="arg">--algo</span>
+            <div class="desc">Birden fazla seçilebilir. <code>B0_KMEANS</code> sklearn KMeans;
+              diğerleri meta-sezgisel (<code>HA_AVOAHGS</code> = HGS+AVOA hibriti).</div>
+          </div>
+          <div class="control">
+            <div class="multi" id="algo-list-ga"></div>
+            <div class="help">Boş bırakılırsa hepsi çalışır (uzun sürer).</div>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">K (küme sayısı)
+            <span class="arg">--k</span>
+            <div class="desc">Tek değer (örn. 14) veya boşlukla ayrılmış birden fazla (örn. 7 14 20).
+              Boş bırakılırsa veri seti varsayılanı kullanılır (100K=7, 1M=7).</div>
+          </div>
+          <div class="control">
+            <input type="text" data-arg="--k" placeholder="14" value="14" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">K — sadece 100K
+            <span class="arg">--k-100k</span>
+            <div class="desc"><code>--k</code> ile birlikte kullanılamaz.</div>
+          </div>
+          <div class="control">
+            <input type="number" data-arg="--k-100k" placeholder="(boş)" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">K — sadece 1M
+            <span class="arg">--k-1m</span>
+            <div class="desc"><code>--k</code> ile birlikte kullanılamaz.</div>
+          </div>
+          <div class="control">
+            <input type="number" data-arg="--k-1m" placeholder="(boş)" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Kümeleme metriği (fitness)
+            <span class="arg">--cluster-metric</span>
+            <div class="desc">Optimizer'ın hedef fonksiyonu. <code>fuzzy</code> = FCM amaç (m=2),
+              üyelik dosyası otomatik üretilir.</div>
+          </div>
+          <div class="control">
+            <select data-arg="--cluster-metric" data-default="auto">
+              <option value="auto">auto (WNMF ise euclidean, değilse pearson)</option>
+              <option value="pearson">pearson (1 − Pearson_corr)</option>
+              <option value="euclidean">euclidean (k-means SSE)</option>
+              <option value="fuzzy" selected>fuzzy (FCM, üyelik üretir)</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Centroid başlatma (meta)
+            <span class="arg">--init-mode</span>
+            <div class="desc">Meta-sezgiseller için ilk popülasyon stratejisi.
+              <code>mkpp</code> = MkMeans++; <code>random</code>.</div>
+          </div>
+          <div class="control">
+            <select data-arg="--init-mode" data-default="">
+              <option value="">(varsayılan)</option>
+              <option value="mkpp">mkpp</option>
+              <option value="random">random</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">B0_KMEANS init
+            <span class="arg">--init</span>
+            <div class="desc">Sadece sklearn KMeans (B0_KMEANS) için.</div>
+          </div>
+          <div class="control">
+            <select data-arg="--init" data-default="kmeans++">
+              <option value="kmeans++" selected>kmeans++</option>
+              <option value="random">random</option>
+            </select>
+          </div>
+        </div>
+      </details>
+
+      <details open>
+        <summary>Ön İşleme</summary>
+
+        <div class="row">
+          <div class="label">Kullanıcı bazlı Z-Score + L2
+            <span class="arg">--zscore</span>
+            <div class="desc">Her kullanıcının rating'lerinden ortalamayı çıkarır, std'ye böler;
+              ardından L2 normalize. CF için doğal merkezleme.</div>
+          </div>
+          <div class="control">
+            <label class="check"><input type="checkbox" data-arg="--zscore" checked /> Açık</label>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Global ön işleme (scaler)
+            <span class="arg">--preprocess</span>
+            <div class="desc">Z-score sonrası uygulanan scaler. NMF kullanacaksan
+              <code>minmax</code> veya <code>maxabs</code> seç (negatif değer kalmasın).</div>
+          </div>
+          <div class="control">
+            <select data-arg="--preprocess" data-default="minmax">
+              <option value="none">none</option>
+              <option value="minmax" selected>minmax</option>
+              <option value="zscore">zscore (StandardScaler)</option>
+              <option value="maxabs">maxabs</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Min kullanıcı rating
+            <span class="arg">--min-user-ratings</span>
+            <div class="desc">Bu sayıdan az rating veren kullanıcıları at.</div>
+          </div>
+          <div class="control">
+            <input type="number" data-arg="--min-user-ratings" data-default="5" value="5" min="0" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Min film rating
+            <span class="arg">--min-item-ratings</span>
+            <div class="desc">Bu sayıdan az rating alan filmleri at.</div>
+          </div>
+          <div class="control">
+            <input type="number" data-arg="--min-item-ratings" data-default="10" value="10" min="0" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">PCA varyans
+            <span class="arg">--pca</span>
+            <div class="desc">Birikimli açıklanan varyans eşiği (örn. 0.95).
+              <code>DEPRECATED --wnmf-features</code> ile birlikte kullanılamaz.</div>
+          </div>
+          <div class="control">
+            <input type="number" step="0.01" min="0" max="1" data-arg="--pca" placeholder="(boş)" />
+          </div>
+        </div>
+      </details>
+
+      <details open>
+        <summary>Özellik Çıkarımı</summary>
+
+        <div class="row">
+          <div class="label">Yöntem
+            <span class="arg">--feature-extraction</span>
+            <div class="desc"><code>wnmf</code> = ağırlıklı NMF (sıfırları ihmal eder, INMED init).
+              <code>nmf</code> = sklearn NMF (negatifleri 0'a kırpar). <code>svd</code> aslında
+              kodda yine NMF çağırır (isim eski).</div>
+          </div>
+          <div class="control">
+            <select data-arg="--feature-extraction" data-default="svd">
+              <option value="none">none (ham matris)</option>
+              <option value="svd">svd (kodda NMF)</option>
+              <option value="pca">pca</option>
+              <option value="nmf" selected>nmf</option>
+              <option value="wnmf">wnmf</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Bileşen sayısı
+            <span class="arg">--svd-components</span>
+            <div class="desc"><b>Tüm</b> feature-extraction yöntemleri için latent boyut
+              (svd, nmf, pca, <b>wnmf dahil</b>). Önerilen kullanım:
+              <code>--feature-extraction wnmf --svd-components 10</code>. Klasör adı
+              tek bir <code>_wnmf10_k14</code> ile temiz çıkar.</div>
+          </div>
+          <div class="control">
+            <input type="number" data-arg="--svd-components" data-default="20" value="20" min="2" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label"><code>--wnmf-features</code> <b>(DEPRECATED)</b>
+            <span class="arg">--wnmf-features</span>
+            <div class="desc">Kaldırılacak. Yerine <code>--feature-extraction wnmf --svd-components N</code>
+              kullanın. Geçici olarak doldurursanız Python otomatik olarak <code>wnmf</code> moduna alır,
+              <code>--svd-components</code> ile eşitler ve <code>FutureWarning</code> basar.
+              Klasör adına ek olarak <code>_inmed_trim5_95</code> etiketi gelir; tamamen temiz yol için
+              bu alanı boş bırakın.</div>
+          </div>
+          <div class="control">
+            <input type="number" data-arg="--wnmf-features" placeholder="(boş — kullanma)" min="2" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">WNMF init
+            <span class="arg">--wnmf-init</span>
+            <div class="desc">INMED = trimmed-mean tabanlı, daha kararlı başlangıç.</div>
+          </div>
+          <div class="control">
+            <select data-arg="--wnmf-init" data-default="inmed">
+              <option value="inmed" selected>inmed</option>
+              <option value="random">random</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">INMED trim — alt
+            <span class="arg">--inmed-trim-low</span>
+            <div class="desc">Trimmed-mean alt yüzdelik (default 5).</div>
+          </div>
+          <div class="control">
+            <input type="number" step="0.5" data-arg="--inmed-trim-low" data-default="5" value="5" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">INMED trim — üst
+            <span class="arg">--inmed-trim-high</span>
+            <div class="desc">Trimmed-mean üst yüzdelik (default 95).</div>
+          </div>
+          <div class="control">
+            <input type="number" step="0.5" data-arg="--inmed-trim-high" data-default="95" value="95" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">WNMF U matrisini kaydet
+            <span class="arg">--save-wnmf-u</span>
+            <div class="desc">Belirtilen klasöre <code>ml100k_U.npy</code> / <code>ml1m_U.npy</code>
+              olarak yazar.</div>
+          </div>
+          <div class="control">
+            <input type="text" data-arg="--save-wnmf-u" placeholder="(boş)" />
+          </div>
+        </div>
+      </details>
+
+      <details open>
+        <summary>Gray Sheep (Aykırı Kullanıcı)</summary>
+
+        <div class="row">
+          <div class="label">Gray sheep modu
+            <span class="arg">--lof / --no-gray-sheep</span>
+            <div class="desc">Birbirini dışlar. Sabit %20 percentile modu kullanılmıyor;
+              ya LOF tabanlı tespit ya da hiç gri koyun olmasın.</div>
+          </div>
+          <div class="control">
+            <label class="check"><input type="radio" name="ga-gs" data-ga-gs="lof" checked /> --lof (LOF tabanlı, <code>assignments_lof/</code>)</label>
+            <label class="check" style="margin-top:6px;"><input type="radio" name="ga-gs" data-ga-gs="off" /> --no-gray-sheep (kapalı, <code>assignments/</code> + <code>_nogs</code>)</label>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Mevcut atamayı atla
+            <span class="arg">--skip-existing</span>
+            <div class="desc">Hedef klasörde <code>assignments.npy</code> varsa o algoritmayı
+              yeniden çalıştırmaz; mevcut yolu yazıp atlar. Tekrar çalıştırırken zaman
+              kaybetmemek için.</div>
+          </div>
+          <div class="control">
+            <label class="check"><input type="checkbox" data-arg="--skip-existing" checked /> Açık</label>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">LOF n_neighbors
+            <span class="arg">--n-neighbors</span>
+            <div class="desc">LOF komşu sayısı (default 20).</div>
+          </div>
+          <div class="control">
+            <input type="number" data-arg="--n-neighbors" data-default="20" value="20" min="2" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">LOF contamination
+            <span class="arg">--contamination</span>
+            <div class="desc"><code>auto</code> veya 0–0.5 arası float.</div>
+          </div>
+          <div class="control">
+            <input type="text" data-arg="--contamination" data-default="auto" placeholder="auto" />
+          </div>
+        </div>
+      </details>
+
+      <details>
+        <summary>FCM / Üyelik</summary>
+
+        <div class="row">
+          <div class="label">Post-hoc FCM üyeliği
+            <span class="arg">--fcm</span>
+            <div class="desc">Hedef ne olursa olsun, optimizer sonrası centroid'lerden
+              FCM üyeliği hesaplar ve kaydeder. <code>--cluster-metric fuzzy</code> seçtiysen
+              gerek yok (üyelikler zaten kaydediliyor); <b>B0_KMEANS</b> için hâlâ faydalı.</div>
+          </div>
+          <div class="control">
+            <label class="check"><input type="checkbox" data-arg="--fcm" checked /> Açık</label>
+          </div>
+        </div>
+      </details>
+
+      <details open>
+        <summary>KMeans Refinement (mode-collapse onarımı)</summary>
+
+        <div class="row">
+          <div class="label">Refinement açık
+            <span class="arg">--kmeans-refine</span>
+            <div class="desc">Meta-sezgisel bittikten sonra centroidleri sklearn KMeans
+              (<code>init=centroids, n_init=1</code>) ile rafine eder. Boş/dejenere kümeleri
+              Lloyd iterasyonuyla onarır → genelde <b>aktif küme = K</b>. <b>B0_KMEANS</b>
+              ve dahili <b>KMEANS</b> dallarına etkisi yok. Klasör adına <code>_kmref</code> eklenir.</div>
+          </div>
+          <div class="control">
+            <label class="check"><input type="checkbox" data-arg="--kmeans-refine" /> Açık</label>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Refinement max iter
+            <span class="arg">--kmeans-refine-iter</span>
+            <div class="desc">KMeans Lloyd iterasyon limiti (default: 300). Önerilen 100-500.</div>
+          </div>
+          <div class="control">
+            <input type="number" data-arg="--kmeans-refine-iter" data-default="300" placeholder="300" min="10" />
+          </div>
+        </div>
+      </details>
+
+      <details>
+        <summary>Çalıştırma & Diğer</summary>
+
+        <div class="row">
+          <div class="label">Paralel süreç
+            <span class="arg">--jobs</span>
+            <div class="desc">1 = sıralı; 0 / boş = otomatik.</div>
+          </div>
+          <div class="control">
+            <input type="number" data-arg="--jobs" placeholder="1" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Sadece son algoritma
+            <span class="arg">--last-only</span>
+            <div class="desc">Hızlı test için.</div>
+          </div>
+          <div class="control">
+            <label class="check"><input type="checkbox" data-arg="--last-only" /> Açık</label>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">--paper-mode
+            <span class="arg">--paper-mode</span>
+            <div class="desc">Preset: <code>--zscore --pca 0.95 --cluster-metric euclidean</code> +
+              gray sheep kapalı + random init. DEPRECATED <code>--wnmf-features</code> ile birlikte
+              kullanılamaz.</div>
+          </div>
+          <div class="control">
+            <label class="check"><input type="checkbox" data-arg="--paper-mode" /> Açık</label>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">100K veri yolu
+            <span class="arg">--data-100k</span>
+            <div class="desc">Varsayılan: <code>data/ml-100k/u.data</code></div>
+          </div>
+          <div class="control">
+            <input type="text" data-arg="--data-100k" placeholder="(varsayılan)" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">1M veri yolu
+            <span class="arg">--data-1m</span>
+          </div>
+          <div class="control">
+            <input type="text" data-arg="--data-1m" placeholder="(varsayılan)" />
+          </div>
+        </div>
+      </details>
+    </div>
+
+    <div class="panel preview">
+      <h2>PowerShell Komutu <span class="pill">Adım 1 · Atama</span></h2>
+      <div id="suffix-preview-ga" class="info-banner" style="display:none;"></div>
+      <div id="lint-ga"></div>
+      <pre id="cmd-ga"></pre>
+      <div class="actions">
+        <button class="btn primary" id="copy-ga">Kopyala</button>
+        <button class="btn" id="reset-ga">Tüm alanları sıfırla</button>
+      </div>
+      <div class="help" style="margin-top:10px; color:var(--muted); font-size:12px;">
+        Komutu D:\hybrid_recommendations dizininde çalıştır. <br />
+        Ürettiği klasör adındaki sondaki ek (<i>suffix</i>), Adım 2'deki <code>--assign-suffix</code>
+        için otomatik kopyalanır.
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================
+     TAB 2: wnmf_experiment.py
+     ============================================================ -->
+<div class="tab-page" id="page-wnmf">
+  <div class="layout">
+    <div class="panel" id="form-wnmf">
+      <div class="preset-bar">
+        <button class="btn" data-wpreset="soft-knn">Soft-Membership KNN (sadece KNN)</button>
+        <button class="btn" data-wpreset="sharedV">SharedV (WNMF eğit)</button>
+        <button class="btn" data-wpreset="all">All (KNN + sharedV + full)</button>
+        <button class="btn" data-wpreset="reset">Temizle</button>
+      </div>
+      <div class="info-banner">
+        <code>--assign-suffix</code> alanı, Adım 1'de seçtiğin ayarlara göre <b>otomatik</b>
+        doldurulur. İstersen elle değiştirebilirsin (boşsa otomatik üretilir).
+      </div>
+      <div class="warn-banner" id="suffix-warn-wnmf" style="display:none;"></div>
+
+      <details open>
+        <summary>Veri & Atama Kaynağı</summary>
+
+        <div class="row">
+          <div class="label">Veri kümesi
+            <span class="arg">--dataset</span>
+          </div>
+          <div class="control">
+            <select data-arg="--dataset" data-default="both">
+              <option value="100k" selected>100k</option>
+              <option value="1m">1m</option>
+              <option value="both">both</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">CV / holdout fold (1–5)
+            <span class="arg">--fold</span>
+            <div class="desc">
+              Boş: ML-100K <code>u1.base</code>/<code>u1.test</code>; ML-1M %20 holdout; sonuçlar
+              <code>results/wnmf/.../k{K}/run*/</code>.
+              <b>1–5</b>: ML-100K <code>u{N}.base</code>/<code>u{N}.test</code>; ML-1M için
+              <code>wnmf_experiment</code> içindeki fold mantığı; sonuçlar
+              <code>.../k{K}/fold{N}/run*/</code>.
+            </div>
+          </div>
+          <div class="control">
+            <input type="number" min="1" max="5" data-arg="--fold" placeholder="(boş = u1 / varsayılan)" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Atama kök dizini
+            <span class="arg">--assign-root</span>
+            <div class="desc">Boş: Adım 1'deki <code>--lof</code> seçimine göre otomatik
+              (LOF ise <code>mealpy\results\assignments_lof</code>).</div>
+          </div>
+          <div class="control">
+            <input type="text" data-arg="--assign-root" placeholder="(otomatik)" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Atama suffix
+            <span class="arg">--assign-suffix</span>
+            <div class="desc">Klasör adının algoritma etiketinden sonraki kısmı.
+              Boşsa Adım 1 ayarlarından üretilir.</div>
+          </div>
+          <div class="control">
+            <input type="text" data-arg="--assign-suffix" id="assign-suffix-input" placeholder="(otomatik)" />
+            <div class="help" id="assign-suffix-auto"></div>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Suffix latent senkron
+            <span class="arg">--sync-assign-suffix-latent</span>
+            <div class="desc">Suffix içindeki ilk <code>_wnmf{N}</code>'yi <code>--latent-dim</code>
+              ile değiştirir.</div>
+          </div>
+          <div class="control">
+            <label class="check"><input type="checkbox" data-arg="--sync-assign-suffix-latent" /> Açık</label>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Mevcutu atla
+            <span class="arg">--skip-existing</span>
+            <div class="desc">Aynı hyperparam için CSV varsa o K'yı atlar.</div>
+          </div>
+          <div class="control">
+            <label class="check"><input type="checkbox" data-arg="--skip-existing" /> Açık</label>
+          </div>
+        </div>
+      </details>
+
+      <details open>
+        <summary>Senaryo & Algoritmalar</summary>
+
+        <div class="row">
+          <div class="label">Mod
+            <span class="arg">--mode</span>
+            <div class="desc">
+              <b>baselines</b>: WNMF eğitimi yok; sadece küme içi KNN + cluster-average
+              (üyelik dosyası varsa <i>Soft-Membership KNN</i>).<br />
+              <b>sharedV</b>: Global V + küme bazlı U (önerilen WNMF).<br />
+              <b>full</b>: Her küme U+V eğitir.<br />
+              <b>all</b>: sharedV + full (kıyas için).
+            </div>
+          </div>
+          <div class="control">
+            <select data-arg="--mode" data-default="sharedV">
+              <option value="baselines" selected>baselines (sadece KNN)</option>
+              <option value="sharedV">sharedV</option>
+              <option value="full">full</option>
+              <option value="all">all</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Global baseline kapat
+            <span class="arg">--no-global</span>
+            <div class="desc">Global WNMF/ALS baseline'ını çalıştırma.</div>
+          </div>
+          <div class="control">
+            <label class="check"><input type="checkbox" data-arg="--no-global" checked /> Açık</label>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Algoritmalar
+            <span class="arg">--algo</span>
+            <div class="desc">Adım 1'de ürettiklerinle aynı olmalı.</div>
+          </div>
+          <div class="control">
+            <div class="multi" id="algo-list-wnmf"></div>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">K (assignment K)
+            <span class="arg">--k</span>
+            <div class="desc">Hangi K klasöründen okunacak. Adım 1'deki K ile aynı tut.</div>
+          </div>
+          <div class="control">
+            <input type="text" data-arg="--k" placeholder="14" value="14" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">K — sadece 100K
+            <span class="arg">--k-100k</span>
+          </div>
+          <div class="control">
+            <input type="number" data-arg="--k-100k" placeholder="(boş)" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">K — sadece 1M
+            <span class="arg">--k-1m</span>
+          </div>
+          <div class="control">
+            <input type="number" data-arg="--k-1m" placeholder="(boş)" />
+          </div>
+        </div>
+      </details>
+
+      <details open>
+        <summary>KNN Ayarları</summary>
+
+        <div class="row">
+          <div class="label">Cluster-Avg kapat
+            <span class="arg">--no-cluster-avg</span>
+            <div class="desc">Sadece KNN istiyorsan açık tut.</div>
+          </div>
+          <div class="control">
+            <label class="check"><input type="checkbox" data-arg="--no-cluster-avg" /> Açık</label>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Cluster-KNN kapat
+            <span class="arg">--no-cluster-knn</span>
+          </div>
+          <div class="control">
+            <label class="check"><input type="checkbox" data-arg="--no-cluster-knn" /> Açık</label>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Benzerlik metriği
+            <span class="arg">--similarity</span>
+          </div>
+          <div class="control">
+            <select data-arg="--similarity" data-default="pearson">
+              <option value="pearson" selected>pearson</option>
+              <option value="cosine">cosine</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Komşu sayısı
+            <span class="arg">--knn</span>
+            <div class="desc">Küme içi en fazla K komşu.</div>
+          </div>
+          <div class="control">
+            <input type="number" data-arg="--knn" data-default="30" value="14" min="1" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Min ortak film
+            <span class="arg">--min-common</span>
+          </div>
+          <div class="control">
+            <input type="number" data-arg="--min-common" data-default="3" value="3" min="1" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Küme dışına genişle
+            <span class="arg">--expand-knn</span>
+            <div class="desc">Küme içinde yeterli komşu yoksa diğer kümelerden de bak.</div>
+          </div>
+          <div class="control">
+            <label class="check"><input type="checkbox" data-arg="--expand-knn" /> Açık</label>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Significance weighting
+            <span class="arg">--sig-weight</span>
+            <div class="desc">0 = kapalı, 50 önerilir.</div>
+          </div>
+          <div class="control">
+            <input type="number" data-arg="--sig-weight" data-default="0" value="0" min="0" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Similarity amplification
+            <span class="arg">--sim-amp</span>
+            <div class="desc">1.0 = kapalı, 1.5 önerilir.</div>
+          </div>
+          <div class="control">
+            <input type="number" step="0.1" data-arg="--sim-amp" data-default="1.0" value="1.0" min="0.1" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Top-N (P/R)
+            <span class="arg">--top-n</span>
+          </div>
+          <div class="control">
+            <input type="number" data-arg="--top-n" data-default="10" value="10" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Relevance threshold
+            <span class="arg">--relevance-threshold</span>
+          </div>
+          <div class="control">
+            <input type="number" step="0.5" data-arg="--relevance-threshold" data-default="4.0" value="4.0" />
+          </div>
+        </div>
+      </details>
+
+      <details>
+        <summary>WNMF Hiperparametreleri (sharedV / full / all modunda)</summary>
+
+        <div class="row">
+          <div class="label">Latent boyut
+            <span class="arg">--latent-dim</span>
+            <div class="desc">Birden fazla: <code>10 20 50</code></div>
+          </div>
+          <div class="control">
+            <input type="text" data-arg="--latent-dim" placeholder="(varsayılan)" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">L2 reg
+            <span class="arg">--reg</span>
+          </div>
+          <div class="control">
+            <input type="text" data-arg="--reg" placeholder="0.01" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Learning rate
+            <span class="arg">--lr</span>
+          </div>
+          <div class="control">
+            <input type="text" data-arg="--lr" placeholder="0.01" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Epochs (global)
+            <span class="arg">--epochs-global</span>
+          </div>
+          <div class="control">
+            <input type="text" data-arg="--epochs-global" placeholder="(varsayılan)" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Epochs (cluster)
+            <span class="arg">--epochs-cluster</span>
+          </div>
+          <div class="control">
+            <input type="text" data-arg="--epochs-cluster" placeholder="(varsayılan)" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Epochs grid (Cartesian)
+            <span class="arg">--epochs-grid</span>
+          </div>
+          <div class="control">
+            <label class="check"><input type="checkbox" data-arg="--epochs-grid" /> Açık</label>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Bias
+            <span class="arg">--bias / --no-bias</span>
+            <div class="desc">Global mu + b_u + b_i.</div>
+          </div>
+          <div class="control">
+            <select data-arg="__bias" data-default="">
+              <option value="" selected>(varsayılan: --bias)</option>
+              <option value="--bias">--bias</option>
+              <option value="--no-bias">--no-bias</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Küme bazlı mu
+            <span class="arg">--cluster-bias</span>
+          </div>
+          <div class="control">
+            <label class="check"><input type="checkbox" data-arg="--cluster-bias" /> Açık</label>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Gray ağırlık 0.1
+            <span class="arg">--weighted-v</span>
+            <div class="desc">SharedV global V eğitiminde gray sheep rating ağırlığı 0.1.</div>
+          </div>
+          <div class="control">
+            <label class="check"><input type="checkbox" data-arg="--weighted-v" /> Açık</label>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Hibrit alpha (WNMF + KNN)
+            <span class="arg">--hybrid-alpha</span>
+            <div class="desc">0=sadece WNMF, 1=sadece kNN, 0.3 önerilir. Boş = hibrit kapalı.</div>
+          </div>
+          <div class="control">
+            <input type="number" step="0.05" min="0" max="1" data-arg="--hybrid-alpha" placeholder="(boş)" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">SVD++
+            <span class="arg">--svdpp</span>
+          </div>
+          <div class="control">
+            <label class="check"><input type="checkbox" data-arg="--svdpp" /> Açık</label>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Global = ALS
+            <span class="arg">--als</span>
+            <div class="desc">Global baseline için WNMF yerine ALS.</div>
+          </div>
+          <div class="control">
+            <label class="check"><input type="checkbox" data-arg="--als" /> Açık</label>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">MF & SVD++ karşılaştır
+            <span class="arg">--compare-mf-svdpp</span>
+          </div>
+          <div class="control">
+            <label class="check"><input type="checkbox" data-arg="--compare-mf-svdpp" /> Açık</label>
+          </div>
+        </div>
+      </details>
+
+      <details>
+        <summary>Çalıştırma & Diğer</summary>
+
+        <div class="row">
+          <div class="label">Küme içi süreç
+            <span class="arg">-j / --jobs</span>
+          </div>
+          <div class="control">
+            <input type="number" data-arg="--jobs" placeholder="(otomatik)" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Algo süreç
+            <span class="arg">--algo-jobs</span>
+            <div class="desc">0 = CPU sayısına göre otomatik.</div>
+          </div>
+          <div class="control">
+            <input type="number" data-arg="--algo-jobs" placeholder="1" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Açıklama notu
+            <span class="arg">--note</span>
+          </div>
+          <div class="control">
+            <input type="text" data-arg="--note" placeholder="(boş)" />
+          </div>
+        </div>
+      </details>
+    </div>
+
+    <div class="panel preview">
+      <h2>PowerShell Komutu <span class="pill">Adım 2 · WNMF / KNN</span></h2>
+      <pre id="cmd-wnmf"></pre>
+      <div class="actions">
+        <button class="btn primary" id="copy-wnmf">Kopyala</button>
+        <button class="btn" id="reset-wnmf">Tüm alanları sıfırla</button>
+      </div>
+      <div class="help" style="margin-top:10px; color:var(--muted); font-size:12px;">
+        Önce Adım 1'i çalıştırıp atama klasörlerinin oluştuğundan emin ol; sonra bu komutu çalıştır.
+        <code>--fold</code> (sol panel, Veri bölümü) verilirse aynı atama suffix'i ile farklı train/test
+        ayrımı kullanılır; çıktı klasörü <code>fold{N}</code> altına yazılır.
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================
+     TAB 3: Grid Search
+     ============================================================ -->
+<div class="tab-page" id="page-grid">
+  <div class="layout">
+    <div class="panel" id="form-grid">
+      <div class="info-banner">
+        Birden fazla değeri <b>boşlukla ayır</b> (örn. <code>7 14 30 70</code>).
+        Toplam kombinasyon = <code>K × (her senaryoda alt-kombinasyon sayısı toplamı) × gray-sheep modu sayısı × (tahmin: knn × sim × fold)</code>.
+      </div>
+      <div class="warn-banner">
+        Toplam kombinasyon: <b id="grid-total">—</b>.
+        <code>--skip-existing</code> açık olduğu için aynı klasör varsa atlanır,
+        ikinci koşuda yalnızca eksikler çalışır.
+      </div>
+
+      <details open>
+        <summary>Genel Eksenler (tüm senaryolarda denenir)</summary>
+
+        <div class="row">
+          <div class="label">Veri kümesi
+            <span class="arg">--dataset</span>
+          </div>
+          <div class="control">
+            <select data-grid="--dataset">
+              <option value="100k" selected>100k</option>
+              <option value="1m">1m</option>
+              <option value="both">both</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">K (küme sayısı)
+            <span class="arg">--k</span>
+            <div class="desc">Boşlukla ayır: <code>7 14 30 70</code></div>
+          </div>
+          <div class="control">
+            <input type="text" data-grid="--k" data-axis="k" value="7 14 30 70" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Algoritmalar
+            <span class="arg">--algo</span>
+            <div class="desc">Tüm seçili algoritmalar her koşuya tek seferde verilir
+              (algo grid değil, küme içinde paralel/sıralı işlenir).</div>
+          </div>
+          <div class="control">
+            <div class="multi" id="algo-list-grid"></div>
+          </div>
+        </div>
+      </details>
+
+      <details open>
+        <summary>Senaryolar (FE + scaler + cluster metric + zscore + pca)</summary>
+        <div class="info-banner" style="margin-bottom:8px;">
+          Her satır <b>bir kombinasyon kuralı</b>. Tam Cartesian değil — sadece sen yazdığın
+          eşleşmeler grid'e girer. Örn: <code>WNMF</code> sadece <code>none/minmax/maxabs</code> ile,
+          <code>PCA</code> sadece <code>zscore + 0.95</code> ile vs.
+          Bir satırda <b>boşlukla ayrılmış</b> birden fazla değer (scaler/metric/dim/pca) verirsen
+          o satır kendi içinde Cartesian açılır.
+        </div>
+
+        <div id="scenario-list"></div>
+
+        <div class="actions" style="margin-top:8px;">
+          <button class="btn" id="scenario-add" type="button">+ Senaryo ekle</button>
+          <button class="btn" id="scenario-load-defaults" type="button">Varsayılan setleri yükle</button>
+          <button class="btn" id="scenario-clear" type="button">Hepsini sil</button>
+        </div>
+      </details>
+
+      <details open>
+        <summary>Sabit Bayraklar</summary>
+
+        <div class="row">
+          <div class="label">Gray sheep modu
+            <span class="arg">--lof / --no-gray-sheep</span>
+            <div class="desc">Her ikisi de seçilebilir → grid bu eksenle de çoğaltılır.
+              <code>--lof</code> → <code>assignments_lof/</code>, <code>--no-gray-sheep</code> →
+              <code>assignments/</code> + <code>_nogs</code>. En az biri seçili olmalı.</div>
+          </div>
+          <div class="control">
+            <label class="check"><input type="checkbox" data-grid-gsmulti="lof" checked /> --lof (LOF tabanlı, <code>assignments_lof/</code>)</label>
+            <label class="check" style="margin-top:6px;"><input type="checkbox" data-grid-gsmulti="off" /> --no-gray-sheep (kapalı, <code>assignments/</code> + <code>_nogs</code>)</label>
+          </div>
+        </div>
+        <div class="row">
+          <div class="label">--fcm</div>
+          <div class="control">
+            <label class="check"><input type="checkbox" data-grid-flag="--fcm" checked /> Açık</label>
+          </div>
+        </div>
+        <div class="row">
+          <div class="label">--skip-existing</div>
+          <div class="control">
+            <label class="check"><input type="checkbox" data-grid-flag="--skip-existing" checked /> Açık</label>
+          </div>
+        </div>
+        <div class="row">
+          <div class="label">--kmeans-refine
+            <div class="desc" style="color: var(--muted); font-size: 11px; margin-top: 4px;">
+              Aktifse her grid hücresi <b>refined</b> klasörlere yazılır
+              (<code>_kmref</code> eklenir). LIT_* ailesinin mode collapse'unu önler.</div>
+          </div>
+          <div class="control">
+            <label class="check"><input type="checkbox" data-grid-flag="--kmeans-refine" /> Açık</label>
+            <input type="number" data-grid-val="--kmeans-refine-iter" value="" placeholder="iter (örn 300)" min="10" style="margin-top:6px; max-width:160px;" />
+          </div>
+        </div>
+        <div class="row">
+          <div class="label">Min user / item ratings</div>
+          <div class="control" style="display:flex; gap:8px;">
+            <input type="number" data-grid-val="--min-user-ratings" value="5" min="0" />
+            <input type="number" data-grid-val="--min-item-ratings" value="10" min="0" />
+          </div>
+        </div>
+        <div class="row">
+          <div class="label">Init mode
+            <span class="arg">--init-mode</span>
+          </div>
+          <div class="control">
+            <select data-grid-val="--init-mode">
+              <option value="" selected>(varsayılan)</option>
+              <option value="mkpp">mkpp</option>
+              <option value="random">random</option>
+            </select>
+          </div>
+        </div>
+        <div class="row">
+          <div class="label">--jobs</div>
+          <div class="control">
+            <input type="number" data-grid-val="--jobs" value="1" />
+          </div>
+        </div>
+      </details>
+
+      <details open>
+        <summary>Tahmin Zinciri (wnmf_experiment.py)</summary>
+
+        <div class="row">
+          <div class="label">Tahmini de zincirle
+            <span class="arg">(her atama sonrası KNN/MAE)</span>
+          </div>
+          <div class="control">
+            <label class="check"><input type="checkbox" id="grid-chain-predict" checked /> Açık</label>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">--mode</div>
+          <div class="control">
+            <select id="grid-pred-mode">
+              <option value="baselines" selected>baselines (sadece KNN)</option>
+              <option value="sharedV">sharedV</option>
+              <option value="full">full</option>
+              <option value="all">all</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">--knn (komşu sayısı)
+            <div class="desc">Boşlukla ayır: <code>10 14 30</code></div>
+          </div>
+          <div class="control">
+            <input type="text" id="grid-pred-knn" data-axis="knn" value="10 14 30" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">--similarity</div>
+          <div class="control">
+            <input type="text" id="grid-pred-sim" data-axis="sim" value="pearson" />
+            <div class="help">Tek değer veya boşlukla iki: <code>pearson cosine</code></div>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">--fold (tahmin zinciri)
+            <span class="arg">wnmf_experiment.py</span>
+            <div class="desc">Boş: varsayılan split (100K u1). Birden fazla: <code>1 2 3 4 5</code> —
+              her grid hücresinde <code>wnmf_experiment</code> her fold için ayrı çalışır.</div>
+          </div>
+          <div class="control">
+            <input type="text" id="grid-pred-fold" data-axis="fold" placeholder="(boş)" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Cluster-Avg kapat
+            <span class="arg">--no-cluster-avg</span>
+          </div>
+          <div class="control">
+            <label class="check"><input type="checkbox" id="grid-pred-no-avg" checked /> Açık</label>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Global baseline kapat
+            <span class="arg">--no-global</span>
+          </div>
+          <div class="control">
+            <label class="check"><input type="checkbox" id="grid-pred-no-global" checked /> Açık</label>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">--algo-jobs (tahmin)
+          </div>
+          <div class="control">
+            <input type="number" id="grid-pred-algo-jobs" placeholder="(boş)" />
+          </div>
+        </div>
+      </details>
+
+      <details>
+        <summary>Hazır Şablonlar (algoritma + senaryo seti)</summary>
+        <div class="preset-bar">
+          <button class="btn" data-grid-preset="prompt-default">Promptun ruhu (WNMF·zscore + NMF·noscaler + PCA·zscore·0.95)</button>
+          <button class="btn" data-grid-preset="latent-effect">Latent boyut etkisi (NMF, dim=10/20/50/100)</button>
+          <button class="btn" data-grid-preset="fe-effect">Feature extraction karşılaştırması (4 senaryo)</button>
+          <button class="btn" data-grid-preset="k-effect">K etkisi (NMF base, K=7/14/30/70)</button>
+          <button class="btn" data-grid-preset="metric-effect">Metric etkisi (fuzzy/euclidean/pearson)</button>
+        </div>
+      </details>
+    </div>
+
+    <div class="panel preview">
+      <h2>PowerShell Grid Betiği <span class="pill">Adım 1+2 zincirleme</span></h2>
+      <div id="lint-grid"></div>
+      <pre id="cmd-grid"></pre>
+      <div class="actions">
+        <button class="btn primary" id="copy-grid">Kopyala</button>
+        <button class="btn ok" id="save-grid">Dosyaya kaydet (.ps1)</button>
+      </div>
+      <div class="help" style="margin-top:10px; color:var(--muted); font-size:12px;">
+        Beti k <code>D:\hybrid_recommendations</code> dizininde çalıştır.<br />
+        Her kombinasyon <code>--skip-existing</code> ile gelir; tekrar tekrar çalıştırabilirsin.<br />
+        Sonuç klasörleri: <code>mealpy\results\assignments_lof\</code> ve
+        <code>results\wnmf\&lt;ds&gt;\k{K}\runN\</code> (veya <code>--fold</code> verildiyse <code>...\fold{N}\runN\</code>).<br />
+        Tahmin zincirinde <b>--fold</b> alanına <code>1 2 3 4 5</code> yazarak her grid hücresinde tüm MovieLens 100K split'lerini sırayla çalıştırabilirsin.
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================
+     TAB 4: Referans · Argümanlar ve Kombinasyon Uyarıları
+     ============================================================ -->
+<div class="tab-page" id="page-ref">
+  <div style="padding: 18px 24px;">
+    <div class="panel">
+
+      <div class="ref-section">
+        <h2>Kombinasyon Kuralları (kesin)</h2>
+        <p>Bu kurallar koddan ve gözlemlerden çıkarıldı. Tab 1 ve Tab 3'teki komut
+           önizlemelerinde aynı kurallar canlı çalışıyor (kırmızı = hata, sarı = uyarı,
+           yeşil = doğru kombinasyon).</p>
+
+        <table class="ref">
+          <thead>
+            <tr>
+              <th style="width:25%;">Kombinasyon</th>
+              <th style="width:15%;">Durum</th>
+              <th>Sebep ve sonuç</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>--zscore</code> + <code>--preprocess minmax</code> + <code>--feature-extraction nmf</code></td>
+              <td class="bad-cell">MODE COLLAPSE</td>
+              <td>Z-score sonrası sütunda negatif değer oluşur; MinMax (0 − col_min)/range ile <b>0'ı yapay nötr değere (~0.6) kaydırır</b>; sparsity yıkılır, NMF herkesi aynı profil olarak görür → tek kümede toplanır. (Senin yaşadığın "Aktif küme: 1".)</td>
+            </tr>
+            <tr>
+              <td><code>--zscore</code> + <code>--preprocess zscore</code></td>
+              <td class="bad-cell">İKİ KEZ MERKEZLEME</td>
+              <td>Birinci satır bazlı (sparse-aware), ikinci sütun bazlı (sparse'ı yıkar). Aynı veriyi iki kez merkezler, sparsity bozulur, NMF için negatifler kırpılır. Çift bilgi kaybı.</td>
+            </tr>
+            <tr>
+              <td><code>--zscore</code> + <code>--feature-extraction nmf</code></td>
+              <td class="warn-cell">BİLGİ KAYBI</td>
+              <td>NMF non-negative giriş ister; kod negatifleri <code>np.maximum(R, 0)</code> ile <b>0'a kırpar</b>. "Ortalamanın altı" sinyali silinir. Çalışır ama yarı sinyal kayıp.</td>
+            </tr>
+            <tr>
+              <td><code>--zscore</code> + <code>--preprocess maxabs</code></td>
+              <td class="warn-cell">SPARSITY OK ama YANLI</td>
+              <td>MaxAbs 0'a dokunmaz (sparsity korur), ama negatif değerler kalır → sonra NMF kırpar. Tam çözüm değil.</td>
+            </tr>
+            <tr>
+              <td><code>--lof</code> + <code>--no-gray-sheep</code></td>
+              <td class="bad-cell">ÇELİŞKİ</td>
+              <td>Python <code>--lof</code>'u <b>sessizce kapatır</b>; atamalar <code>assignments/</code> (lof değil) altına yazılır. HTML'deki radio bu çelişkiyi engelliyor.</td>
+            </tr>
+            <tr>
+              <td><code>--pca</code> + DEPRECATED <code>--wnmf-features</code></td>
+              <td class="bad-cell">YASAK</td>
+              <td>CLI <code>p.error()</code> ile reddediyor. Birini seç.</td>
+            </tr>
+            <tr>
+              <td><code>--paper-mode</code> + DEPRECATED <code>--wnmf-features</code></td>
+              <td class="bad-cell">YASAK</td>
+              <td>Paper preset PCA(0.95) zorlar; WNMF ile çakışır.</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Önerilen güvenli kombinasyonlar</h3>
+        <table class="ref">
+          <thead>
+            <tr>
+              <th style="width:35%;">Kombinasyon</th>
+              <th style="width:15%;">Durum</th>
+              <th>Açıklama</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>--zscore</code> + <code>--preprocess none</code> + <code>--feature-extraction wnmf --svd-components 20</code></td>
+              <td class="ok-cell">EN SAĞLAM (Yol A.2)</td>
+              <td>WNMF eksikleri <b>ağırlık matrisiyle</b> ayırır → sparsity korunur, kullanıcı merkezleme korunur, negatif kırpma yok.
+                Klasör adı tek bir <code>_wnmf20_k…</code> ile temiz çıkar (<code>--wnmf-features</code> kullanılmaz; DEPRECATED).</td>
+            </tr>
+            <tr>
+              <td><code>--preprocess minmax</code> + <code>--feature-extraction nmf</code> (zscore <b>kapalı</b>)</td>
+              <td class="ok-cell">İYİ</td>
+              <td>Ham 1–5 puanlar üzerinde MinMax 0'a dokunmaz; NMF için non-negative girdi sağlar. Hızlı, dengeli kümeler.</td>
+            </tr>
+            <tr>
+              <td><code>--preprocess maxabs</code> + <code>--feature-extraction nmf</code> (zscore <b>kapalı</b>)</td>
+              <td class="ok-cell">İYİ</td>
+              <td>MaxAbs sparse-friendly. Bazı kullanıcı ölçek farkı kalır.</td>
+            </tr>
+            <tr>
+              <td><code>--zscore</code> + <code>--preprocess none</code> + <code>--feature-extraction none</code> + <code>--cluster-metric pearson</code></td>
+              <td class="ok-cell">KLASIK CF</td>
+              <td>Latent yok, ham matris + Pearson. En hızlı baseline; sparsity hiç yok edilmez.</td>
+            </tr>
+            <tr>
+              <td><code>--zscore</code> + <code>--preprocess none</code> + <code>--feature-extraction pca</code></td>
+              <td class="warn-cell">ORTA</td>
+              <td>PCA negatif kabul eder ama yoğun çıktı verir; PCA için scaler genelde önerilmez. Yine de sklearn StandardScaler'a göre daha güvenli.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="ref-section">
+        <h2>Scaler Karşılaştırması (<code>--preprocess</code>)</h2>
+        <p>Hepsi sütun (axis=0) bazında çalışır. Eksen seçimi sklearn varsayılanıdır.</p>
+
+        <table class="ref">
+          <thead>
+            <tr>
+              <th>Scaler</th>
+              <th>Formül</th>
+              <th>Çıktı aralığı</th>
+              <th>0'ı kaydırır mı?</th>
+              <th>Sparsity korur mu?</th>
+              <th>Negatif üretir mi?</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>none</code></td>
+              <td>—</td>
+              <td>(değişmez)</td>
+              <td class="ok-cell">Hayır</td>
+              <td class="ok-cell">Evet</td>
+              <td>Girdiye göre</td>
+            </tr>
+            <tr>
+              <td><code>minmax</code> (<code>MinMaxScaler</code>)</td>
+              <td><code>(x − col_min) / (col_max − col_min)</code></td>
+              <td><code>[0, 1]</code></td>
+              <td><b>Sütunda negatif varsa Evet</b><br />(0 → ~0.5–0.7)</td>
+              <td>Sadece girdi pozitifse</td>
+              <td>Hayır</td>
+            </tr>
+            <tr>
+              <td><code>maxabs</code> (<code>MaxAbsScaler</code>)</td>
+              <td><code>x / max(|col|)</code></td>
+              <td><code>[-1, +1]</code></td>
+              <td class="ok-cell">Hayır</td>
+              <td class="ok-cell">Evet</td>
+              <td>Girdide negatif varsa Evet</td>
+            </tr>
+            <tr>
+              <td><code>zscore</code> (<code>StandardScaler</code>)</td>
+              <td><code>(x − col_mean) / col_std</code></td>
+              <td>sınırsız</td>
+              <td><b>Evet</b><br />(0 → −col_mean/col_std)</td>
+              <td class="bad-cell">Hayır</td>
+              <td>Evet</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="ref-section">
+        <h2>Kullanıcı Bazlı Z-Score (<code>--zscore</code>)</h2>
+        <p>Sütun bazlı <code>--preprocess zscore</code> ile <b>aynı şey değildir</b>. Bu satır bazlı, sparse-aware bir merkezlemedir.</p>
+        <table class="ref">
+          <thead>
+            <tr><th>Özellik</th><th>--zscore (satır)</th><th>--preprocess zscore (sütun)</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Yön</td><td>Kullanıcı (satır)</td><td>Film (sütun)</td></tr>
+            <tr><td>Eksik (0) hücreye</td><td class="ok-cell">Dokunmaz, 0 kalır</td><td class="bad-cell">−mean/std değerine kayar</td></tr>
+            <tr><td>Sparsity korur mu?</td><td class="ok-cell">Evet</td><td class="bad-cell">Hayır</td></tr>
+            <tr><td>Sonrası L2 normalize</td><td>Evet (otomatik, axis=1)</td><td>Hayır</td></tr>
+            <tr><td>CF için anlamı</td><td>Kullanıcının kişisel ölçek farkını siler ("ben 5 verirken sen 3 verirsin")</td><td>Standart ML ön-işleme; CF semantiği yok</td></tr>
+            <tr><td>Pearson benzerliği için</td><td class="ok-cell">İdeal — Pearson zaten user-centered</td><td>Gereksiz</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="ref-section">
+        <h2>Boyut İndirgeme (<code>--feature-extraction</code>)</h2>
+        <table class="ref">
+          <thead>
+            <tr>
+              <th>Yöntem</th>
+              <th>Negatif girdi kabul</th>
+              <th>Sparse-aware</th>
+              <th>Çıktı</th>
+              <th>Ne işe yarar</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>none</code></td>
+              <td>—</td>
+              <td class="ok-cell">Evet (matris değişmez)</td>
+              <td>Ham/preprocessed matris</td>
+              <td>Latent yok; doğrudan ham/scaled matris üzerinde kümeleme. En hızlı; Pearson ile ideal.</td>
+            </tr>
+            <tr>
+              <td><code>nmf</code> (sklearn NMF)</td>
+              <td class="bad-cell">Hayır</td>
+              <td class="bad-cell">Hayır</td>
+              <td>Yoğun, non-negative latent</td>
+              <td>Klasik NMF: <code>R ≈ U·V</code>. Eksik hücreleri "0 oy" sayar; negatif girdi varsa kırpar. Pozitif sparse matriste çalışırken iyi (ham 1–5 + minmax).</td>
+            </tr>
+            <tr>
+              <td><code>wnmf</code> (Weighted NMF)</td>
+              <td class="ok-cell">Önemsiz</td>
+              <td class="ok-cell">Evet</td>
+              <td>Yoğun, non-negative latent</td>
+              <td>Ağırlık matrisi <code>W</code> ile sadece <b>oylanmış</b> hücreleri öğrenir; eksik (0) hücreler için W=0. NMF'ten <b>çok daha doğru</b> CF için. INMED init ile başlar.</td>
+            </tr>
+            <tr>
+              <td><code>svd</code> (kodda yine NMF!)</td>
+              <td class="warn-cell">Hayır (NMF gibi davranır)</td>
+              <td class="bad-cell">Hayır</td>
+              <td>Yoğun, non-negative</td>
+              <td><b>Bu repoda <code>svd</code> seçeneği gerçek SVD değil, sklearn NMF'i çağırır</b> (init=nndsvda). İsmi "svd" eski bir takma ad. Pratikte <code>nmf</code>'ten farkı yok; aynı kırpma sorunu var.</td>
+            </tr>
+            <tr>
+              <td><code>pca</code> (PCA)</td>
+              <td class="ok-cell">Evet</td>
+              <td class="bad-cell">Hayır</td>
+              <td>Yoğun, ±latent</td>
+              <td>Doğrusal varyans-maksimize boyut indirgeme. Negatif değerleri kabul eder, NMF'in "negatifleri 0'a kırpma" sorunu yoktur. <b>Ne zaman tercih?</b> <code>--zscore</code> kullanıyorsun (matriste negatifler var) ve meta-sezgiseli <code>--cluster-metric euclidean</code>/<code>fuzzy</code> ile çalıştırmak istiyorsun. NMF olsa kullanıcı sinyalinin yarısı silinirdi; PCA hem negatifi korur hem latent uzayda Öklid mesafesi anlamlı sonuç verir. <b>Ne zaman değil?</b> Sparsity'yi korumak istiyorsan (PCA yoğun çıktı verir) — onun yerine WNMF kullan.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="ref-section">
+        <h2>Kümeleme Metriği (<code>--cluster-metric</code>)</h2>
+        <table class="ref">
+          <thead>
+            <tr>
+              <th>Metric</th>
+              <th>Mesafe</th>
+              <th>Üyelik üretir</th>
+              <th>Ne için uygun</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>auto</code></td>
+              <td>WNMF varsa euclidean, yoksa pearson</td>
+              <td>Hayır</td>
+              <td>Akıllı varsayılan</td>
+            </tr>
+            <tr>
+              <td><code>pearson</code></td>
+              <td><code>1 − Pearson_corr(user, centroid)</code></td>
+              <td>Hayır (sadece <code>--fcm</code> ile)</td>
+              <td>Seyrek rating uzayı (latent yok). CF için doğal.</td>
+            </tr>
+            <tr>
+              <td><code>euclidean</code></td>
+              <td>Squared L2 (k-means SSE)</td>
+              <td>Hayır (sadece <code>--fcm</code> ile)</td>
+              <td>Yoğun latent uzayı (NMF/WNMF/PCA çıktısı). L2 normalize sonrası cosine'a eşdeğer.</td>
+            </tr>
+            <tr>
+              <td><code>fuzzy</code></td>
+              <td>FCM amaç: <code>J = Σ u<sub>ij</sub><sup>m</sup>·d<sub>ij</sub><sup>2</sup></code></td>
+              <td class="ok-cell">Evet, otomatik</td>
+              <td>Soft-Membership KNN için <b>gerekli</b>. <code>memberships.npy</code> üretilir; tahminde her küme ağırlıklı işlenir.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="ref-section">
+        <h2>Gray Sheep (Aykırı Kullanıcı)</h2>
+        <table class="ref">
+          <thead>
+            <tr><th>Mod</th><th>Bayrak</th><th>Çıktı dizini</th><th>Açıklama</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>LOF tabanlı</td>
+              <td><code>--lof</code></td>
+              <td><code>assignments_lof/</code></td>
+              <td>Local Outlier Factor; eşik veriden otomatik. Tipik %5–20 gray sheep oranı.</td>
+            </tr>
+            <tr>
+              <td>Tamamen kapalı</td>
+              <td><code>--no-gray-sheep</code></td>
+              <td><code>assignments/</code> + <code>_nogs</code> suffix</td>
+              <td>Gray sheep tespiti yok; tüm kullanıcılar normal. <code>gray_sheep_mask.npy</code> hep False.</td>
+            </tr>
+            <tr>
+              <td>Sabit %20 percentile</td>
+              <td>(default — bayraksız)</td>
+              <td><code>assignments/</code></td>
+              <td>Eski mod; kullanmıyoruz. HTML'deki radio bu seçeneği göstermiyor.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="ref-section">
+        <h2>WNMF / Tahmin Argümanları (<code>wnmf_experiment.py</code>)</h2>
+        <table class="ref">
+          <thead>
+            <tr><th>Argüman</th><th>Ne yapar</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>--mode baselines</code></td><td>WNMF eğitimi yok; sadece küme içi KNN + cluster-average. <code>memberships.npy</code> varsa Soft-Membership KNN devreye girer.</td></tr>
+            <tr><td><code>--mode sharedV</code></td><td>Global V matrisi + küme bazlı U. Önerilen WNMF varyantı.</td></tr>
+            <tr><td><code>--mode full</code></td><td>Her küme hem U hem V öğrenir. Eski versiyon, küçük kümelerde aşırı uyum riski.</td></tr>
+            <tr><td><code>--mode all</code></td><td>sharedV + full + KNN; kıyaslama için.</td></tr>
+            <tr><td><code>--no-global</code></td><td>Global WNMF/ALS baseline'ı kapatır. Sadece KNN istiyorsan.</td></tr>
+            <tr><td><code>--no-cluster-avg</code></td><td>Cluster-average baseline'ı kapatır.</td></tr>
+            <tr><td><code>--no-cluster-knn</code></td><td>Cluster-KNN'i kapatır.</td></tr>
+            <tr><td><code>--knn N</code></td><td>Her tahmin için en fazla N komşu. <b>Küme boyutu ile sınırlanır</b>; küme küçükse N'e ulaşamaz.</td></tr>
+            <tr><td><code>--similarity pearson|cosine</code></td><td>KNN benzerlik metriği.</td></tr>
+            <tr><td><code>--min-common N</code></td><td>İki kullanıcı arası benzerlik için minimum ortak film sayısı.</td></tr>
+            <tr><td><code>--expand-knn</code></td><td>Küme içinde N komşu yoksa diğer kümelerden de bak.</td></tr>
+            <tr><td><code>--sig-weight K</code></td><td>Significance weighting eşiği (0=kapalı, 50=önerilen). Az ortak filme dayanan benzerlikleri zayıflatır.</td></tr>
+            <tr><td><code>--sim-amp E</code></td><td>Similarity amplification üssü (1.0=kapalı, 1.5=önerilen). Yüksek benzerliklere daha çok ağırlık.</td></tr>
+            <tr><td><code>--hybrid-alpha A</code></td><td>SharedV + KNN harmanı; 0=sadece WNMF, 1=sadece KNN, 0.3 önerilen.</td></tr>
+            <tr><td><code>--latent-dim D</code></td><td>WNMF latent boyut (sharedV/full modunda). <code>--sync-assign-suffix-latent</code> ile suffix'le senkron.</td></tr>
+            <tr><td><code>--reg R</code></td><td>L2 regularization (0.001–0.1).</td></tr>
+            <tr><td><code>--lr LR</code></td><td>Öğrenme oranı (0.001–0.01).</td></tr>
+            <tr><td><code>--epochs-global / --epochs-cluster</code></td><td>Global ve küme bazlı eğitim epoch sayıları.</td></tr>
+            <tr><td><code>--bias / --no-bias</code></td><td>Global mu + b_u + b_i bias terimleri.</td></tr>
+            <tr><td><code>--cluster-bias</code></td><td>Küme bazlı mu_k.</td></tr>
+            <tr><td><code>--svdpp</code></td><td>SVD++ (implicit Y) kullan.</td></tr>
+            <tr><td><code>--als</code></td><td>Global baseline için WNMF yerine ALS.</td></tr>
+            <tr><td><code>--fold N</code></td><td>1–5: ML-100K <code>u{N}.base</code> / <code>u{N}.test</code>; ML-1M için <code>load_ratings_1m(fold=N)</code>. Boş: 100K u1, 1M holdout; sonuçlar <code>.../k{K}/run*/</code> veya <code>.../k{K}/fold{N}/run*/</code>.</td></tr>
+            <tr><td><code>--skip-existing</code></td><td>Aynı hyperparam için CSV varsa K'yı atlar.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="ref-section">
+        <h2>Eksik Rating İşleme (önemli not)</h2>
+        <p>
+          Sistem hiçbir aşamada eksik rating'leri ham matriste <b>doldurmaz</b>.
+          Her aşama gözlemlenen rating'leri farklı şekilde işler; aşağıdaki tabloda
+          özetlendi. Bu, makale CF setup'ı için doğru yaklaşımdır — imputation kendi
+          bias'ımızı veriye katardı.
+        </p>
+
+        <h3>Aşama bazlı davranış</h3>
+        <table class="ref">
+          <thead>
+            <tr>
+              <th style="width:25%;">Aşama</th>
+              <th style="width:30%;">Eksik rating ne olur?</th>
+              <th>Detay / fallback</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><b>Clustering girdisi</b><br /><code>--zscore</code></td>
+              <td class="ok-cell">Doldurulmaz; <code>0</code> korunur</td>
+              <td>Sadece <b>rated</b> hücrelere user-mean / user-std uygulanır
+                (<code>matrix[u] != 0</code> maskesi). Kullanıcı tek puan verdiyse std=0,
+                sadece mean çıkarılır.</td>
+            </tr>
+            <tr>
+              <td><b>WNMF</b><br /><code>--feature-extraction wnmf</code></td>
+              <td class="ok-cell">Maskelenir (weight=0)</td>
+              <td>SGD adımı sadece <code>matrix &gt; 0</code> olan hücrelerde atılır.
+                Latent faktörler sadece gözlemlenen rating'lerden öğrenilir.
+                Eksikler "bilinmiyor" sayılır.</td>
+            </tr>
+            <tr>
+              <td><b>NMF</b><br /><code>--feature-extraction nmf</code></td>
+              <td class="warn-cell"><code>0</code> olarak girer</td>
+              <td>Klasik sklearn NMF "0 puan verilmiş" diye yorumlar. Sparse veride
+                <b>bilgi kaybı</b>. Z-score sonrası negatifler de
+                <code>np.maximum(R,0)</code> ile 0'a kırpılır → "ortalamanın altı"
+                sinyali silinir.</td>
+            </tr>
+            <tr>
+              <td><b>PCA</b><br /><code>--feature-extraction pca</code></td>
+              <td class="warn-cell"><code>0</code> olarak girer</td>
+              <td>NMF gibi sparse'a duyarsız. Z-score ile birlikte (negatifleri
+                koruyarak) kullanılırsa NMF'ten daha az bilgi kaybı yapar.</td>
+            </tr>
+            <tr>
+              <td><b>Tahmin: <code>cluster_avg</code></b></td>
+              <td class="warn-cell">Örtük doldurulur</td>
+              <td>Train'de <code>cluster_item_means[cid, i]</code> matrisi kurulur:
+                küme c'deki tüm kullanıcıların i'ye verdiği ortalama. Küme i'yi hiç
+                rate etmemişse <b><code>global_mean</code></b> (~3.5) ile doldurulur.
+                Test sırasında lookup yapılır.</td>
+            </tr>
+            <tr>
+              <td><b>Tahmin: <code>cluster_knn</code></b><br />(baselines mode)</td>
+              <td class="ok-cell">Doldurulmaz; doğrudan tahmin</td>
+              <td>Test (u,i) için u'nun kümesindeki <code>i</code>'yi <b>rate etmiş</b>
+                v'ler bulunur, Pearson/Cosine sadece <b>ortak film</b> üzerinden
+                hesaplanır. Tahmin: <code>r̂_ui = mean_u +
+                Σ sim(u,v)·(r_vi − mean_v) / Σ |sim|</code>.</td>
+            </tr>
+            <tr>
+              <td><b>Tahmin: WNMF SharedV</b><br /><code>--mode sharedV</code></td>
+              <td class="ok-cell">Train'de maskeli, test'te formülle</td>
+              <td>Train: ağırlıklı NMF — sadece observed üzerinden U, V öğrenilir.
+                Test: <code>r̂_ui = U[u]·V[i] + b_u + b_i + μ</code> her hücre için
+                hesaplanabilir.</td>
+            </tr>
+            <tr>
+              <td><b>Soft-Membership KNN</b><br />(memberships.npy varsa)</td>
+              <td class="ok-cell">K küme için ayrı tahmin + ağırlıklı toplam</td>
+              <td>Her küme c için <code>r̂_ui^(c)</code> hesaplanır (yukarıdaki KNN
+                ile), sonra:
+                <code>r̂_ui = Σ_c μ_uc · r̂_ui^(c)</code>. Her küme için ayrı
+                fallback hiyerarşisi geçerli.</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>KNN tahmini için fallback hiyerarşisi (sırayla)</h3>
+        <table class="ref">
+          <thead>
+            <tr>
+              <th style="width:8%;">Sıra</th>
+              <th style="width:35%;">Koşul</th>
+              <th>Tahmin değeri</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><b>1</b></td>
+              <td>Top-K komşu var, <code>Σ|sim| &gt; 1e-8</code></td>
+              <td><b>En iyi durum:</b>
+                <code>r̂_ui = mean_u + Σ sim·(r_vi − mean_v) / Σ |sim|</code>,
+                sonra <code>[1, 5]</code>'e clip.</td>
+            </tr>
+            <tr>
+              <td><b>2</b></td>
+              <td>Kümede hiç komşu rate etmemiş veya <code>Σ|sim| ≈ 0</code></td>
+              <td><code>user_means[u]</code> — kullanıcının train ortalaması.</td>
+            </tr>
+            <tr>
+              <td><b>3</b></td>
+              <td>Kullanıcının train'de hiç rating'i yok</td>
+              <td><code>global_mean</code> — train setinin global ortalaması (~3.5).</td>
+            </tr>
+            <tr>
+              <td><b>4</b></td>
+              <td>Soft-membership: bir küme için yukarıdaki adımlar başarısız</td>
+              <td>O küme için fallback uygulanır, <b>diğer kümeler</b> hâlâ
+                kendi tahminlerini üretebilir; final = ağırlıklı toplam.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>
+          <b>Önemli:</b> 943×1682 = 1.585.626 hücreden train'de ~80.000 dolu (%95
+          sparse). Test sırasında <b>sadece test set'teki (u,i) çiftleri için</b>
+          tahmin üretilir; tüm matris asla doldurulmaz. <code>--no-global</code>
+          ve <code>--no-cluster-avg</code> bayrakları sadece global/cluster-avg
+          baseline'larını <b>raporlamadan çıkarır</b>; KNN tahmin akışını etkilemez.
+        </p>
+
+        <h3>Sparsity'ye dost ön işleme önerisi</h3>
+        <table class="ref">
+          <thead>
+            <tr>
+              <th>Hedef</th>
+              <th>Doğru kombinasyon</th>
+              <th>Sebep</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Sparsity'yi koru, eksiği "bilinmiyor" tut</td>
+              <td><code>--zscore --preprocess none --feature-extraction wnmf</code></td>
+              <td>Z-score sadece rated hücrelere uygulanır; WNMF eksiği maskeler.
+                <b>Hiçbir doldurma yok.</b></td>
+            </tr>
+            <tr>
+              <td>NMF kullanmak zorundaysan, en az kayıp</td>
+              <td><code>--preprocess minmax --feature-extraction nmf</code> (zscore
+                <b>kapalı</b>)</td>
+              <td>Ham 1–5 puanlar üzerinde MinMax 0'a dokunmaz. Eksikler hâlâ <code>0</code>
+                ama negatif kırpılma yok.</td>
+            </tr>
+            <tr>
+              <td>Cold-start kullanıcılar için stabilite</td>
+              <td>KNN + <code>cluster_avg</code> birlikte raporla
+                (<code>--no-cluster-avg</code> kullanma)</td>
+              <td>KNN fallback'i <code>user_mean</code>; cluster_avg <code>global_mean</code>
+                ile doldurur. İkisinin MAE'sini karşılaştırarak fallback'in payını
+                ölçebilirsin.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="ref-section">
+        <h2>Pratik Karar Akışı</h2>
+        <table class="ref">
+          <thead>
+            <tr><th>Hedefin</th><th>Kombinasyon</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Promptun ruhu — Soft-Membership KNN, sparsity-aware, doğru CF (Yol A.2)</td>
+              <td>
+                <code>--zscore --preprocess none --feature-extraction wnmf --svd-components 20 --cluster-metric fuzzy --fcm</code><br />
+                + tahmin: <code>--mode baselines --no-global --no-cluster-avg --knn 14</code><br />
+                <small>Not: <code>--wnmf-features</code> kullanılmıyor → klasör adı tek bir <code>_wnmf20_k…</code> ile temiz.</small>
+              </td>
+            </tr>
+            <tr>
+              <td>Hızlı baseline (latent yok)</td>
+              <td><code>--zscore --preprocess none --feature-extraction none --cluster-metric pearson</code></td>
+            </tr>
+            <tr>
+              <td>Hızlı, dengeli kümeleme (zscore'suz)</td>
+              <td><code>--preprocess minmax --feature-extraction nmf --svd-components 20 --cluster-metric fuzzy --fcm</code></td>
+            </tr>
+            <tr>
+              <td>Geniş ablation</td>
+              <td>Tab 3'teki "Tam MAE çalışması" presetini kullan.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================
+     TAB 4: Küme Karşılaştırma · compare_cluster_structure.py
+     ============================================================ -->
+<div class="tab-page" id="page-compare">
+  <div style="padding: 18px 24px;">
+
+    <!-- A) PowerShell komut üretici -->
+    <div class="panel" style="margin-bottom: 18px;">
+      <h2>A) Komut üretici <span class="pill">paths</span></h2>
+      <div class="info-banner">
+        Aynı suffix altındaki algoritma klasörlerini <code>compare_cluster_structure.py</code>
+        ile karşılaştırır. Tarayıcıdan dosya okunmaz; çıktı PowerShell satırıdır.
+      </div>
+
+      <div class="row">
+        <div class="label">Dataset kökü
+          <span class="arg">--dataset-root</span>
+          <div class="desc"><code>ml100k</code> / <code>ml1m</code> klasörünün tam yolu.</div>
+        </div>
+        <div class="control">
+          <input type="text" id="cmp-root" value="mealpy\results\assignments\ml100k" />
+        </div>
+      </div>
+
+      <div class="row">
+        <div class="label">Suffix
+          <span class="arg">--suffix</span>
+          <div class="desc">Algoritma adından sonraki klasör eki. Örn:
+            <code>_pruneu5_i10_euc_nogs_none_nmf30_k14</code>. Boş bırakılırsa
+            her algoritma için <b>en yeni</b> <code>assignments.npy</code> seçilir.</div>
+        </div>
+        <div class="control">
+          <input type="text" id="cmp-suffix"
+                 value="_pruneu5_i10_euc_nogs_none_nmf30_k14" />
+        </div>
+      </div>
+
+      <div class="row">
+        <div class="label">Algoritmalar
+          <span class="arg">--algos</span>
+          <div class="desc">Boşlukla ayır. En az 2 tane.</div>
+        </div>
+        <div class="control">
+          <input type="text" id="cmp-algos"
+                 value="B0_KMEANS HA_AVOAHGS B2_HGS H4_MFO+HHO LIT_PSO LIT_GWO" />
+        </div>
+      </div>
+
+      <div class="row">
+        <div class="label">Referans algoritma
+          <span class="arg">--reference</span>
+          <div class="desc">Tüm diğerlerinin ARI/NMI'si bu kümelemeyle hesaplanır
+            (boş bırakırsan listenin ilki).</div>
+        </div>
+        <div class="control">
+          <input type="text" id="cmp-reference" value="B0_KMEANS" />
+        </div>
+      </div>
+
+      <div class="row">
+        <div class="label">CSV çıktı
+          <span class="arg">--csv</span>
+          <div class="desc">Yapı tablosunu bu yola yaz (boş bırakılabilir).</div>
+        </div>
+        <div class="control">
+          <input type="text" id="cmp-csv" placeholder="(opsiyonel) örn: mealpy\results\compare_k14.csv" />
+        </div>
+      </div>
+
+      <div class="preview" style="margin-top: 14px; position: static;">
+        <pre id="cmd-compare"></pre>
+        <div class="actions">
+          <button class="btn primary" id="copy-compare">Kopyala</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- B) Tarayıcıda canlı karşılaştır -->
+    <div class="panel">
+      <h2>B) Tarayıcıda canlı karşılaştır <span class="pill">.npy</span></h2>
+      <div class="info-banner">
+        2 veya daha fazla <code>assignments.npy</code> dosyasını seç. Tarayıcı dosyaları
+        <b>okur, NPY parse eder</b> ve aşağıda küme yapısı + ARI/NMI tablolarını gösterir.
+        Dosya adında <code>_k14_</code> gibi bir desen varsa K otomatik çıkarılır;
+        yoksa <code>max(label)+1</code> kullanılır.
+      </div>
+
+      <div class="row">
+        <div class="label">Dosyalar
+          <span class="arg">.npy</span>
+          <div class="desc">Birden fazla seç (Ctrl/Cmd + tık). Sadece <code>int</code> tipi
+            assignment dosyaları desteklenir.</div>
+        </div>
+        <div class="control">
+          <input type="file" id="cmp-files" accept=".npy" multiple />
+          <div class="help" id="cmp-files-status">Henüz dosya seçilmedi.</div>
+        </div>
+      </div>
+
+      <div class="row">
+        <div class="label">Beklenen K (override)
+          <span class="arg">K_expected</span>
+          <div class="desc">Boş bırakırsan her dosya için ayrı çıkarılır.
+            Aynı K varsayımıyla tablo yapmak için sabitleyebilirsin.</div>
+        </div>
+        <div class="control">
+          <input type="number" id="cmp-kexp" placeholder="(otomatik)" min="2" />
+        </div>
+      </div>
+
+      <div class="row">
+        <div class="label">Referans dosya
+          <span class="arg">reference</span>
+          <div class="desc">ARI/NMI özet tablosunda referans satır. İlk dosya varsayılan.</div>
+        </div>
+        <div class="control">
+          <select id="cmp-ref-file"><option value="">(ilk dosya)</option></select>
+        </div>
+      </div>
+
+      <div class="actions" style="margin-top: 8px;">
+        <button class="btn ok" id="run-compare">Karşılaştır</button>
+        <button class="btn" id="clear-compare">Temizle</button>
+      </div>
+
+      <div id="compare-results" style="margin-top: 16px;"></div>
+    </div>
+
+  </div>
+</div>
+
+<div class="toast" id="toast">Kopyalandı</div>
+
+<script>
+// =============================================================
+// Algoritma listesi (her iki tab için ortak)
+// =============================================================
+const ALGOS = [
+  'B0_KMEANS',
+  'B1_HHO', 'B2_HGS', 'B3_MFO',
+  'H1_HHO+HGS', 'H4_MFO+HHO',
+  'H9_QSA+CDO', 'H12_MFO+CDO', 'H13_HHO+GAop',
+  'H5_GAHHO', 'H5_EliteGA+HHO',
+  'DOA', 'LF_HHO', 'SFOA', 'SFOA_06',
+  'LIT_CIRCLESA', 'LIT_GOA', 'LIT_GWO', 'LIT_SSA', 'LIT_PSO',
+  'HA_AVOAHGS',
+];
+
+// Senin senaryon için varsayılan seçim
+const DEFAULT_SELECTED_ALGOS = ['B0_KMEANS','B2_HGS','HA_AVOAHGS','LIT_PSO','LIT_GWO','H4_MFO+HHO'];
+
+function renderAlgoList(containerId) {
+  const c = document.getElementById(containerId);
+  c.innerHTML = '';
+  ALGOS.forEach(a => {
+    const id = containerId + '__' + a.replace(/\W+/g, '_');
+    const checked = DEFAULT_SELECTED_ALGOS.includes(a) ? 'checked' : '';
+    c.insertAdjacentHTML('beforeend',
+      `<label><input type="checkbox" data-algo="${a}" id="${id}" ${checked}/> ${a}</label>`);
+  });
+  c.addEventListener('change', regenerateAll);
+}
+renderAlgoList('algo-list-ga');
+renderAlgoList('algo-list-wnmf');
+
+// =============================================================
+// Tab geçişi
+// =============================================================
+document.querySelectorAll('.tab').forEach(t => {
+  t.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+    document.querySelectorAll('.tab-page').forEach(x => x.classList.remove('active'));
+    t.classList.add('active');
+    document.getElementById('page-' + t.dataset.tab).classList.add('active');
+  });
+});
+
+// =============================================================
+// Form oku → arg listesi
+// =============================================================
+function getValues(formId) {
+  const root = document.getElementById(formId);
+  const out = {};
+  root.querySelectorAll('[data-arg]').forEach(el => {
+    const arg = el.dataset.arg;
+    if (el.type === 'checkbox') {
+      out[arg] = el.checked;
+    } else {
+      out[arg] = (el.value || '').trim();
+    }
+  });
+  // algo listesi
+  const algoBox = root.querySelector('.multi[id^="algo-list-"]');
+  if (algoBox) {
+    const sel = [...algoBox.querySelectorAll('input[type=checkbox]:checked')]
+                .map(i => i.dataset.algo);
+    out['__algos'] = sel;
+  }
+  return out;
+}
+
+function isDefault(el) {
+  if (el.type === 'checkbox') return !el.checked;
+  const v = (el.value || '').trim();
+  if (!v) return true;
+  const d = el.dataset.default;
+  if (d !== undefined && d === v) return true;
+  return false;
+}
+
+// =============================================================
+// Suffix üretici (generate_assignments.py mantığını birebir taklit eder)
+// =============================================================
+function buildAssignmentSuffix(ga) {
+  const minU = ga['--min-user-ratings'] || '5';
+  const minI = ga['--min-item-ratings'] || '10';
+  let suffix = `_pruneu${minU}_i${minI}`;
+
+  if (ga['--zscore']) suffix += '_zscore';
+
+  const pca = parseFloat(ga['--pca']);
+  if (!isNaN(pca) && pca > 0 && pca <= 1) {
+    suffix += `_pca${Math.round(pca * 100)}pct`;
+  }
+
+  // Eski stil --wnmf-features verildiyse SADECE init/trim etiketi eklenir.
+  // Latent boyut etiketi (`_wnmf{N}`) aşağıdaki assign_suffix bloğunda
+  // `--feature-extraction wnmf --svd-components N` üzerinden bir kez yazılır.
+  const wf = ga['--wnmf-features'];
+  if (wf) {
+    const wi = ga['--wnmf-init'] || 'inmed';
+    const lo = ga['--inmed-trim-low'] || '5';
+    const hi = ga['--inmed-trim-high'] || '95';
+    suffix += `_${wi}_trim${parseFloat(lo)}_${parseFloat(hi)}`;
+  }
+
+  const cm = ga['--cluster-metric'] || 'auto';
+  if (cm === 'fuzzy') suffix += '_fuzzy';
+  else if (cm === 'euclidean') suffix += '_euc';
+
+  if (ga['--paper-mode']) suffix += '_paper';
+  else if (ga['--no-gray-sheep']) suffix += '_nogs';
+
+  // run_dataset() içindeki ek
+  const prep = ga['--preprocess'] || 'minmax';
+  const fe = ga['--feature-extraction'] || 'svd';
+  const comp = ga['--svd-components'] || '20';
+  const kRaw = (ga['--k'] || '').split(/\s+/).filter(Boolean);
+  const k = kRaw.length ? kRaw[0] : '7';
+
+  suffix += `_${prep}_${fe}${comp}_k${k}`;
+  // KMeans refinement aktifse klasör adına ekle (Python tarafıyla birebir aynı).
+  if (ga['--kmeans-refine']) suffix += '_kmref';
+  return suffix;
+}
+
+// =============================================================
+// PowerShell satır üretici
+// =============================================================
+function quote(v) {
+  // Boşluk veya özel karakter varsa tırnakla
+  if (v === '' || v == null) return '""';
+  if (/[\s"`$;&|<>]/.test(v)) return `"${v.replace(/"/g, '`"')}"`;
+  return v;
+}
+
+function buildCommand(scriptPath, formId, opts = {}) {
+  const v = getValues(formId);
+  const lines = [];
+  lines.push(`python ${scriptPath}`);
+
+  const root = document.getElementById(formId);
+  // Sıralı: bilinen sıraya göre yazmak için arg listesini DOM'dan al
+  const argEls = [...root.querySelectorAll('[data-arg]')];
+
+  for (const el of argEls) {
+    const arg = el.dataset.arg;
+    if (arg.startsWith('__')) continue; // bias gibi özel
+    if (el.type === 'checkbox') {
+      if (el.checked) lines.push(`  ${arg}`);
+      continue;
+    }
+    if (isDefault(el)) continue;
+    const raw = (el.value || '').trim();
+    if (!raw) continue;
+    // Liste tipi (boşlukla ayrık birden fazla)
+    if (/\s/.test(raw)) {
+      const parts = raw.split(/\s+/).map(quote).join(' ');
+      lines.push(`  ${arg} ${parts}`);
+    } else {
+      lines.push(`  ${arg} ${quote(raw)}`);
+    }
+  }
+
+  // __bias özel: select değeri direkt arg
+  const biasSel = root.querySelector('[data-arg="__bias"]');
+  if (biasSel && biasSel.value) lines.push(`  ${biasSel.value}`);
+
+  // Tab 1: Gray sheep radio (--lof veya --no-gray-sheep)
+  const gsRadio = root.querySelector('input[name="ga-gs"]:checked');
+  if (gsRadio) {
+    if (gsRadio.dataset.gaGs === 'lof') lines.push('  --lof');
+    else if (gsRadio.dataset.gaGs === 'off') lines.push('  --no-gray-sheep');
+  }
+
+  // __algos
+  if (v['__algos'] && v['__algos'].length) {
+    lines.push(`  --algo ${v['__algos'].join(' ')}`);
+  }
+
+  // PowerShell backtick line continuation
+  return lines.map((l, i) => i === lines.length - 1 ? l : l + ' `').join('\n');
+}
+
+// =============================================================
+// LINT — kombinasyon kuralları
+// =============================================================
+// state: { zscore, preprocess, fe, dim, metric, gs, pca, wnmfFeat }
+function lintCombination(state) {
+  const out = [];
+  const z   = !!state.zscore;
+  const pp  = state.preprocess || 'none';
+  const fe  = state.fe || 'none';
+  const cm  = state.metric || 'auto';
+  const pca = state.pca || '';
+  const wnf = state.wnmfFeat || '';
+
+  // HATA seviyeleri
+  if (pca && wnf) {
+    out.push({ tag: 'err', msg: '<b>--pca</b> ile DEPRECATED <b>--wnmf-features</b> birlikte kullanılamaz (CLI yasağı).' });
+  }
+  // DEPRECATED --wnmf-features: Python köprüsü hâlâ çalışır ama FutureWarning basar.
+  if (wnf) {
+    const dimSvd = state.dim || '20';
+    const same   = String(wnf) === String(dimSvd);
+    const feMismatch = (fe !== 'wnmf');
+    let msg = '<b>DEPRECATED:</b> <code>--wnmf-features ' + wnf + '</code>. ';
+    if (feMismatch) {
+      msg += 'Python köprüsü <code>--feature-extraction</code> değerini ' +
+             '<code>' + fe + '</code> → <code>wnmf</code> olarak <i>otomatik düzeltir</i>. ';
+    }
+    if (!same) {
+      msg += 'Python köprüsü <code>--svd-components</code> değerini ' +
+             '<code>' + dimSvd + '</code> → <code>' + wnf + '</code> olarak <i>otomatik senkronlar</i>. ';
+    }
+    msg += '<br><b>Yol A.2:</b> <code>--wnmf-features</code>\'i kaldır; ' +
+           '<code>--feature-extraction wnmf --svd-components ' + (same ? dimSvd : wnf) + '</code> kullan. ' +
+           'Terminalde <code>FutureWarning</code> görmezsin; klasör adı <code>_inmed_trim…</code> olmadan daha temiz.';
+    out.push({ tag: 'warn', msg });
+  }
+  if (z && fe === 'nmf' && pp === 'minmax') {
+    out.push({
+      tag: 'err',
+      msg: '<b>MODE COLLAPSE riski:</b> <code>--zscore + --preprocess minmax + --feature-extraction nmf</code>. ' +
+           'Z-score sonrası negatif değerler oluşur, MinMax 0\'ı yapay nötr değere kaydırır → sparsity yıkılır → ' +
+           'NMF herkesi aynı küme yapar (Aktif küme: 1).'
+    });
+  }
+  if (z && pp === 'zscore') {
+    out.push({
+      tag: 'err',
+      msg: '<b>İKİ KEZ MERKEZLEME:</b> Hem <code>--zscore</code> (satır) hem <code>--preprocess zscore</code> (sütun) ' +
+           'açık. Sparsity yıkılır + NMF için kırpma. Sadece birini seç.'
+    });
+  }
+
+  // UYARI seviyeleri
+  if (z && fe === 'nmf' && pp !== 'minmax') {
+    out.push({
+      tag: 'warn',
+      msg: '<b>BİLGİ KAYBI:</b> <code>--zscore</code> + <code>--feature-extraction nmf</code>. ' +
+           'NMF non-negative ister; kod negatifleri 0\'a kırpar → "ortalamanın altı" sinyali silinir. ' +
+           'Daha iyisi: <code>--feature-extraction wnmf --svd-components ' + (state.dim || '20') + '</code> ' +
+           '(Yol A.2 — temiz klasör adı).'
+    });
+  }
+  if (z && pp === 'maxabs' && fe === 'nmf') {
+    out.push({
+      tag: 'warn',
+      msg: 'Sparsity korunur ama NMF girdideki negatifleri kırpar → kısmi bilgi kaybı. WNMF daha temiz olur.'
+    });
+  }
+  if (z && fe === 'svd') {
+    out.push({
+      tag: 'warn',
+      msg: '<b>Not:</b> Bu repoda <code>--feature-extraction svd</code> aslında sklearn NMF\'i çalıştırır. ' +
+           'NMF ile aynı sorunlar geçerli.'
+    });
+  }
+  if (cm === 'pearson' && (fe === 'nmf' || fe === 'wnmf' || fe === 'svd')) {
+    out.push({
+      tag: 'warn',
+      msg: '<code>--cluster-metric pearson</code> + latent çıkarımı: latent vektörleri tipik olarak yoğun-pozitif olur ' +
+           '(NMF/WNMF non-negative); Pearson korelasyonları suni şekilde yüksek çıkıp ayrımı zayıflatır. ' +
+           '<code>--cluster-metric euclidean</code> veya <code>fuzzy</code> tercih et.'
+    });
+  }
+  if (cm === 'fuzzy' && fe === 'none') {
+    out.push({
+      tag: 'warn',
+      msg: 'FCM amaç fonksiyonu Öklid mesafesi kullanır; ham seyrek matrisle (<code>none</code>) sayısal kararsızlık olabilir. ' +
+           'Önce latent çıkar (wnmf/nmf/pca) veya <code>--cluster-metric pearson</code> kullan.'
+    });
+  }
+
+  // OK / bilgi
+  if (z && pp === 'none' && fe === 'wnmf') {
+    out.push({
+      tag: 'ok',
+      msg: '<b>EN SAĞLAM:</b> <code>--zscore + --preprocess none + --feature-extraction wnmf</code>. ' +
+           'WNMF eksikleri ağırlıkla ayırır; sparsity ve negatif sinyal korunur.'
+    });
+  }
+  if (!z && pp === 'minmax' && fe === 'nmf') {
+    out.push({
+      tag: 'ok',
+      msg: 'Güvenli: ham 1–5 puanlar üzerinde MinMax 0\'a dokunmaz; NMF için doğru girdi.'
+    });
+  }
+  if (!z && pp === 'maxabs' && fe === 'nmf') {
+    out.push({
+      tag: 'ok',
+      msg: 'Güvenli: MaxAbs sparse-friendly + NMF non-negative girdi alır.'
+    });
+  }
+  if (z && pp === 'none' && fe === 'none' && cm === 'pearson') {
+    out.push({
+      tag: 'ok',
+      msg: 'Klasik CF baseline: ham + Pearson + kullanıcı merkezleme. Hızlı ve sağlam.'
+    });
+  }
+
+  return out;
+}
+
+function renderLint(targetId, state) {
+  const el = document.getElementById(targetId);
+  if (!el) return;
+  const issues = lintCombination(state);
+  if (!issues.length) {
+    el.innerHTML = '';
+    return;
+  }
+  // Önce err, sonra warn, sonra ok
+  const order = { err: 0, warn: 1, ok: 2 };
+  issues.sort((a, b) => order[a.tag] - order[b.tag]);
+
+  const html = issues.map(i => {
+    const cls = i.tag === 'err' ? 'danger-banner'
+              : i.tag === 'warn' ? 'warn-banner'
+              : 'ok-banner';
+    const tag = i.tag === 'err' ? 'HATA'
+              : i.tag === 'warn' ? 'UYARI'
+              : 'OK';
+    return `<div class="${cls}"><span class="lint-tag ${i.tag}">${tag}</span>${i.msg}</div>`;
+  }).join('');
+  el.innerHTML = html;
+}
+
+// =============================================================
+// Render & güncelle
+// =============================================================
+function regenerateAll() {
+  const ga = getValues('form-ga');
+  // Gray sheep radio durumu (Tab 1)
+  const gaGsRadio = document.querySelector('#form-ga input[name="ga-gs"]:checked');
+  const gaGsMode = gaGsRadio ? gaGsRadio.dataset.gaGs : 'lof';
+  ga['--lof'] = (gaGsMode === 'lof');
+  ga['--no-gray-sheep'] = (gaGsMode === 'off');
+
+  // 1) Atama komutu
+  const cmdGA = buildCommand('mealpy\\generate_assignments.py', 'form-ga');
+  document.getElementById('cmd-ga').textContent = cmdGA;
+
+  // 1b) Suffix önizleme
+  const suffix = buildAssignmentSuffix(ga);
+  const sp = document.getElementById('suffix-preview-ga');
+  sp.style.display = 'block';
+  sp.innerHTML = `Üretilecek klasör adı (örnek): <code>&lt;ALGO&gt;${suffix}</code>`;
+
+  // 2) WNMF tab'ında otomatik suffix doldur
+  const sIn = document.getElementById('assign-suffix-input');
+  const auto = document.getElementById('assign-suffix-auto');
+  if (!sIn.dataset.userEdited) {
+    sIn.value = suffix;
+  }
+  auto.textContent = sIn.dataset.userEdited
+    ? `Otomatik (özel ile değiştirildi): ${suffix}`
+    : `Otomatik üretildi: ${suffix}`;
+
+  // 2b) Auto assign-root (Tab 1 radio'sundan oku)
+  const wnmfRoot = document.querySelector('#form-wnmf [data-arg="--assign-root"]');
+  if (!wnmfRoot.dataset.userEdited) {
+    wnmfRoot.value = ga['--lof']
+      ? 'mealpy\\results\\assignments_lof'
+      : 'mealpy\\results\\assignments';
+  }
+
+  // 2c) Algo listesi senkron — Adım 1'de seçilenleri Adım 2'ye yansıt
+  const wnmfAlgoBox = document.getElementById('algo-list-wnmf');
+  const gaSelected = new Set(ga['__algos'] || []);
+  if (!wnmfAlgoBox.dataset.userEdited) {
+    wnmfAlgoBox.querySelectorAll('input[type=checkbox]').forEach(cb => {
+      cb.checked = gaSelected.has(cb.dataset.algo);
+    });
+  }
+
+  // 3) WNMF komutu
+  const cmdW = buildCommand('wnmf\\wnmf_experiment.py', 'form-wnmf');
+  document.getElementById('cmd-wnmf').textContent = cmdW;
+
+  // 4) Tab 1 lint
+  renderLint('lint-ga', {
+    zscore:     !!ga['--zscore'],
+    preprocess: ga['--preprocess'] || 'minmax',
+    fe:         ga['--feature-extraction'] || 'svd',
+    dim:        ga['--svd-components'] || '20',
+    metric:     ga['--cluster-metric'] || 'auto',
+    pca:        ga['--pca'] || '',
+    wnmfFeat:   ga['--wnmf-features'] || '',
+  });
+}
+
+// kullanıcı suffix'i / root'u manuel değiştirdiğinde işaretle
+document.getElementById('assign-suffix-input').addEventListener('input', e => {
+  e.target.dataset.userEdited = '1';
+  regenerateAll();
+});
+document.querySelector('#form-wnmf [data-arg="--assign-root"]').addEventListener('input', e => {
+  e.target.dataset.userEdited = '1';
+  regenerateAll();
+});
+document.getElementById('algo-list-wnmf').addEventListener('change', () => {
+  document.getElementById('algo-list-wnmf').dataset.userEdited = '1';
+  regenerateAll();
+});
+
+// Tüm form alanlarına input listener
+document.querySelectorAll('#form-ga, #form-wnmf').forEach(form => {
+  form.addEventListener('input', regenerateAll);
+  form.addEventListener('change', regenerateAll);
+});
+
+// =============================================================
+// Presetler — generate_assignments.py
+// =============================================================
+function setGA(arg, value) {
+  // Gray sheep özel: artık radio
+  if (arg === '--lof' || arg === '--no-gray-sheep') {
+    const target = (arg === '--lof' && value) ? 'lof'
+                  : (arg === '--no-gray-sheep' && value) ? 'off'
+                  : null;
+    if (target) {
+      const r = document.querySelector(`#form-ga input[name="ga-gs"][data-ga-gs="${target}"]`);
+      if (r) r.checked = true;
+    }
+    return;
+  }
+  const el = document.querySelector(`#form-ga [data-arg="${arg}"]`);
+  if (!el) return;
+  if (el.type === 'checkbox') el.checked = !!value;
+  else el.value = value == null ? '' : String(value);
+}
+function setW(arg, value) {
+  const el = document.querySelector(`#form-wnmf [data-arg="${arg}"]`);
+  if (!el) return;
+  if (el.type === 'checkbox') el.checked = !!value;
+  else el.value = value == null ? '' : String(value);
+}
+function selectGAAlgos(arr) {
+  const set = new Set(arr);
+  document.querySelectorAll('#algo-list-ga input[type=checkbox]').forEach(cb => {
+    cb.checked = set.has(cb.dataset.algo);
+  });
+}
+
+document.querySelectorAll('[data-preset]').forEach(b => {
+  b.addEventListener('click', () => {
+    const p = b.dataset.preset;
+    if (p === 'reset') {
+      document.getElementById('form-ga').querySelectorAll('[data-arg]').forEach(el => {
+        if (el.type === 'checkbox') el.checked = false;
+        else el.value = '';
+      });
+      // Radio'yu default lof'a sıfırla
+      const rLof = document.querySelector('#form-ga input[name="ga-gs"][data-ga-gs="lof"]');
+      if (rLof) rLof.checked = true;
+      selectGAAlgos([]);
+    } else if (p === 'zscore-nmf-fuzzy') {
+      selectGAAlgos(DEFAULT_SELECTED_ALGOS);
+      setGA('--dataset', '100k');
+      setGA('--k', '14');
+      setGA('--lof', true);
+      setGA('--zscore', true);
+      setGA('--preprocess', 'minmax');
+      setGA('--feature-extraction', 'nmf');
+      setGA('--svd-components', '20');
+      setGA('--cluster-metric', 'fuzzy');
+      setGA('--fcm', true);
+      setGA('--jobs', '1');
+      setGA('--wnmf-features', '');
+    } else if (p === 'zscore-wnmf-fuzzy') {
+      selectGAAlgos(DEFAULT_SELECTED_ALGOS);
+      setGA('--dataset', '100k');
+      setGA('--k', '14');
+      setGA('--lof', true);
+      setGA('--zscore', true);
+      setGA('--preprocess', 'zscore');
+      setGA('--feature-extraction', 'wnmf');
+      setGA('--svd-components', '20');
+      setGA('--wnmf-features', '');
+      setGA('--wnmf-init', 'inmed');
+      setGA('--cluster-metric', 'fuzzy');
+      setGA('--fcm', true);
+      setGA('--jobs', '1');
+    } else if (p === 'paper') {
+      selectGAAlgos(DEFAULT_SELECTED_ALGOS);
+      setGA('--dataset', '100k');
+      setGA('--k', '14');
+      setGA('--paper-mode', true);
+      setGA('--zscore', true);
+      setGA('--pca', '0.95');
+      setGA('--cluster-metric', 'euclidean');
+      setGA('--feature-extraction', 'pca');
+      setGA('--svd-components', '20');
+      setGA('--jobs', '1');
+    }
+    regenerateAll();
+  });
+});
+
+// =============================================================
+// Presetler — wnmf_experiment.py
+// =============================================================
+document.querySelectorAll('[data-wpreset]').forEach(b => {
+  b.addEventListener('click', () => {
+    const p = b.dataset.wpreset;
+    if (p === 'reset') {
+      document.getElementById('form-wnmf').querySelectorAll('[data-arg]').forEach(el => {
+        if (el.type === 'checkbox') el.checked = false;
+        else el.value = '';
+      });
+      const sel = document.querySelector('#form-wnmf [data-arg="--mode"]');
+      if (sel) sel.value = 'sharedV';
+      const algoBox = document.getElementById('algo-list-wnmf');
+      algoBox.querySelectorAll('input[type=checkbox]').forEach(cb => cb.checked = false);
+      delete algoBox.dataset.userEdited;
+      const sIn = document.getElementById('assign-suffix-input');
+      delete sIn.dataset.userEdited;
+      const root = document.querySelector('#form-wnmf [data-arg="--assign-root"]');
+      delete root.dataset.userEdited;
+    } else if (p === 'soft-knn') {
+      setW('--dataset', '100k');
+      setW('--k', '14');
+      setW('--mode', 'baselines');
+      setW('--no-global', true);
+      setW('--no-cluster-avg', false);
+      setW('--no-cluster-knn', false);
+      setW('--similarity', 'pearson');
+      setW('--knn', '14');
+    } else if (p === 'sharedV') {
+      setW('--dataset', '100k');
+      setW('--k', '14');
+      setW('--mode', 'sharedV');
+      setW('--no-global', false);
+      setW('--knn', '14');
+    } else if (p === 'all') {
+      setW('--dataset', '100k');
+      setW('--k', '14');
+      setW('--mode', 'all');
+      setW('--no-global', false);
+      setW('--knn', '14');
+    }
+    regenerateAll();
+  });
+});
+
+// =============================================================
+// Kopyala
+// =============================================================
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 1500);
+}
+function copyText(id) {
+  const txt = document.getElementById(id).textContent;
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(txt).then(() => showToast('Kopyalandı'));
+  } else {
+    const ta = document.createElement('textarea');
+    ta.value = txt; document.body.appendChild(ta); ta.select();
+    document.execCommand('copy'); document.body.removeChild(ta);
+    showToast('Kopyalandı');
+  }
+}
+document.getElementById('copy-ga').addEventListener('click', () => copyText('cmd-ga'));
+document.getElementById('copy-wnmf').addEventListener('click', () => copyText('cmd-wnmf'));
+
+document.getElementById('reset-ga').addEventListener('click', () => {
+  document.querySelector('[data-preset="reset"]').click();
+});
+document.getElementById('reset-wnmf').addEventListener('click', () => {
+  document.querySelector('[data-wpreset="reset"]').click();
+});
+
+// =============================================================
+// GRID SEARCH (Tab 3)
+// =============================================================
+function renderAlgoListGrid() {
+  const c = document.getElementById('algo-list-grid');
+  c.innerHTML = '';
+  ALGOS.forEach(a => {
+    const id = 'algo-grid__' + a.replace(/\W+/g, '_');
+    const checked = DEFAULT_SELECTED_ALGOS.includes(a) ? 'checked' : '';
+    c.insertAdjacentHTML('beforeend',
+      `<label><input type="checkbox" data-algo="${a}" id="${id}" ${checked}/> ${a}</label>`);
+  });
+  c.addEventListener('change', regenerateGrid);
+}
+renderAlgoListGrid();
+
+function getGridLists() {
+  const root = document.getElementById('form-grid');
+  const out = {};
+  root.querySelectorAll('[data-grid]').forEach(el => {
+    const key = el.dataset.grid;
+    out[key] = (el.value || '').trim();
+  });
+  out['__algos'] = [...root.querySelectorAll('#algo-list-grid input[type=checkbox]:checked')]
+                    .map(i => i.dataset.algo);
+  out['__flags'] = {};
+  root.querySelectorAll('[data-grid-flag]').forEach(el => {
+    out['__flags'][el.dataset.gridFlag] = el.checked;
+  });
+  out['__vals'] = {};
+  root.querySelectorAll('[data-grid-val]').forEach(el => {
+    out['__vals'][el.dataset.gridVal] = (el.value || '').trim();
+  });
+  return out;
+}
+
+function gridSplit(s) {
+  if (!s) return [];
+  return s.split(/\s+/).filter(Boolean);
+}
+
+// PowerShell tarafında çalışacak suffix builder fonksiyonu
+const PS_SUFFIX_FUNC = `
+function Get-AssignSuffix {
+  param(
+    [int]$MinU, [int]$MinI,
+    [bool]$Zscore,
+    [string]$Pca,
+    [int]$WnmfFeat,
+    [string]$WnmfInit, [double]$TrimLow, [double]$TrimHigh,
+    [string]$Metric,
+    [bool]$Paper, [bool]$NoGs,
+    [string]$Preprocess, [string]$Fe, [int]$Components,
+    [int]$K,
+    [bool]$KmRefine = $false,
+    [string]$Algo = ""
+  )
+  $s = "_pruneu$($MinU)_i$($MinI)"
+  if ($Zscore) { $s += "_zscore" }
+  if ($Pca -ne "") { $s += "_pca$([int][math]::Round([double]$Pca * 100))pct" }
+  # Yol A.2: legacy --wnmf-features verildiyse SADECE init/trim etiketi düşer.
+  # Latent boyut etiketi (_wnmf{N}) zaten aşağıda _$Fe$Components içinde tek sefer yazılır.
+  if ($WnmfFeat -gt 0) {
+    $s += "_$($WnmfInit)_trim$($TrimLow)_$($TrimHigh)"
+  }
+  if ($Metric -eq "fuzzy")    { $s += "_fuzzy" }
+  elseif ($Metric -eq "euclidean") { $s += "_euc" }
+  if ($Paper) { $s += "_paper" }
+  elseif ($NoGs) { $s += "_nogs" }
+  $s += "_$($Preprocess)_$($Fe)$($Components)_k$($K)"
+  # KMeans refinement aktifse ve algoritma B0_KMEANS değilse klasör adına _kmref ekle
+  if ($KmRefine -and $Algo -ne "B0_KMEANS") { $s += "_kmref" }
+  return $s
+}
+`.trim();
+
+// =============================================================
+// Senaryo motoru: her senaryoyu kendi içinde Cartesian açar
+// (fe × dim × pp × cm × pca × zscore)
+// =============================================================
+function expandScenario(sc) {
+  const fe   = (sc.fe || '').trim();
+  if (!fe) return [];
+  const dims = gridSplit(sc.dims  || '');
+  const pps  = gridSplit(sc.pps   || '');
+  const cms  = gridSplit(sc.cms   || '');
+  const pcas = sc.pcas && sc.pcas.trim() ? gridSplit(sc.pcas) : [''];
+  let zsList;
+  if (sc.zscore === 'on')  zsList = [true];
+  else if (sc.zscore === 'off') zsList = [false];
+  else zsList = [true, false];
+
+  if (!dims.length || !pps.length || !cms.length) return [];
+
+  const out = [];
+  for (const dim of dims) {
+    for (const pp of pps) {
+      for (const cm of cms) {
+        for (const pca of pcas) {
+          for (const zs of zsList) {
+            // Otomatik elemeler
+            if (fe === 'wnmf' && pca !== '') continue; // CLI yasağı
+            if (fe !== 'pca' && pca !== '') continue;  // PCA varyansı sadece fe=pca anlamlı
+            out.push({
+              label: sc.label || '',
+              fe, dim, pp, cm, pca, zscore: zs,
+            });
+          }
+        }
+      }
+    }
+  }
+  return out;
+}
+
+function buildGridScript() {
+  const g = getGridLists();
+  const ks    = gridSplit(g['--k']);
+  const algos = g['__algos'];
+  const dataset = g['--dataset'] || '100k';
+
+  const flags = g['__flags'];
+  const vals = g['__vals'];
+
+  // Senaryolar (yeni model)
+  const scenarios = readScenarios().filter(s => s.enabled);
+  let combos = [];
+  for (const sc of scenarios) combos = combos.concat(expandScenario(sc));
+
+  // Gray sheep modları (multi-checkbox: lof, off, ya da ikisi)
+  const gsModes = [];
+  if (document.querySelector('#form-grid [data-grid-gsmulti="lof"]')?.checked) gsModes.push('lof');
+  if (document.querySelector('#form-grid [data-grid-gsmulti="off"]')?.checked) gsModes.push('off');
+
+  // Tahmin
+  const chain = document.getElementById('grid-chain-predict').checked;
+  const knns  = chain ? gridSplit(document.getElementById('grid-pred-knn').value) : [];
+  const sims  = chain ? gridSplit(document.getElementById('grid-pred-sim').value) : [];
+  const foldInp = chain ? (document.getElementById('grid-pred-fold')?.value || '').trim() : '';
+  const predFolds = chain ? (foldInp ? gridSplit(foldInp) : ['']) : [''];
+
+  let total = ks.length * combos.length * gsModes.length;
+  if (chain) {
+    total *= Math.max(1, knns.length) * Math.max(1, sims.length) * predFolds.length;
+  }
+  document.getElementById('grid-total').textContent = total;
+
+  if (!ks.length) return '# Eksik: --k boş.';
+  if (!algos.length) return '# Eksik: en az bir algoritma seç.';
+  if (!combos.length) return '# Eksik: aktif senaryo yok ya da senaryolar boş alanlı. "Varsayılan setleri yükle" düğmesini kullanabilirsin.';
+  if (!gsModes.length) return '# Eksik: Gray sheep için en az birini (--lof veya --no-gray-sheep) seç.';
+
+  const lines = [];
+  lines.push('# Otomatik üretilmiş grid betiği (senaryo bazlı)');
+  lines.push('# Çalıştırmadan önce konumun D:\\hybrid_recommendations olduğundan emin ol.');
+  lines.push('');
+  lines.push(PS_SUFFIX_FUNC);
+  lines.push('');
+
+  const minU = vals['--min-user-ratings'] || '5';
+  const minI = vals['--min-item-ratings'] || '10';
+  const initMode = vals['--init-mode'] || '';
+  const jobs = vals['--jobs'] || '';
+  const flagF = flags['--fcm'] ? '$true' : '$false';
+  const flagSE = flags['--skip-existing'] ? '$true' : '$false';
+  const flagKR = flags['--kmeans-refine'] ? '$true' : '$false';
+  const krIter = vals['--kmeans-refine-iter'] || '';
+
+  lines.push(`$ErrorActionPreference = "Stop"`);
+  lines.push(`$dataset    = "${dataset}"`);
+  lines.push(`$minU       = ${minU}`);
+  lines.push(`$minI       = ${minI}`);
+  lines.push(`$initMode   = "${initMode}"`);
+  lines.push(`$jobs       = "${jobs}"`);
+  lines.push(`$useFcm     = ${flagF}`);
+  lines.push(`$skipExist  = ${flagSE}`);
+  lines.push(`$kmRefine   = ${flagKR}`);
+  lines.push(`$kmRefineIt = "${krIter}"`);
+  lines.push(`$algos      = @(${algos.map(a => `"${a}"`).join(', ')})`);
+  lines.push('');
+
+  lines.push(`$ks      = @(${ks.map(x => `"${x}"`).join(', ')})`);
+  lines.push(`$gsModes = @(${gsModes.map(x => `"${x}"`).join(', ')})`);
+  lines.push('');
+
+  // Senaryo array'i (PowerShell hashtable listesi)
+  lines.push(`# Senaryolar — her satır kurallı bir kombinasyon`);
+  lines.push(`$scenarios = @(`);
+  combos.forEach((c, idx) => {
+    const tag = (c.label ? c.label + ' · ' : '') +
+                `${c.fe}/dim${c.dim}/${c.pp}/${c.cm}` +
+                (c.pca ? `/pca${c.pca}` : '') +
+                (c.zscore ? '/zs' : '/no-zs');
+    const comma = (idx < combos.length - 1) ? ',' : '';
+    lines.push(`  @{ Label="${tag.replace(/"/g, '`"')}"; Fe="${c.fe}"; Dim="${c.dim}"; Pp="${c.pp}"; Cm="${c.cm}"; Pca="${c.pca}"; Zscore=${c.zscore ? '$true' : '$false'} }${comma}`);
+  });
+  lines.push(`)`);
+  lines.push('');
+
+  if (chain) {
+    lines.push(`$knns = @(${(knns.length ? knns : ['14']).map(x => `"${x}"`).join(', ')})`);
+    lines.push(`$sims = @(${(sims.length ? sims : ['pearson']).map(x => `"${x}"`).join(', ')})`);
+    lines.push(`$predMode      = "${document.getElementById('grid-pred-mode').value}"`);
+    lines.push(`$predNoAvg     = ${document.getElementById('grid-pred-no-avg').checked ? '$true' : '$false'}`);
+    lines.push(`$predNoGlobal  = ${document.getElementById('grid-pred-no-global').checked ? '$true' : '$false'}`);
+    const algoJobs = document.getElementById('grid-pred-algo-jobs').value.trim();
+    lines.push(`$predAlgoJobs  = "${algoJobs}"`);
+    const predFoldsPs = predFolds.map(fd => (fd === '' ? '""' : `"${fd}"`)).join(', ');
+    lines.push(`$predFolds = @(${predFoldsPs})`);
+    lines.push('');
+  }
+
+  lines.push(`$counter = 0`);
+  lines.push(`$total = ${total}`);
+  lines.push('');
+
+  lines.push(`foreach ($k in $ks) {`);
+  lines.push(`  foreach ($sc in $scenarios) {`);
+  lines.push(`    foreach ($gsMode in $gsModes) {`);
+  lines.push(`      $useLof      = ($gsMode -eq "lof")`);
+  lines.push(`      $noGraySheep = ($gsMode -eq "off")`);
+  lines.push(`      $assignRoot  = if ($useLof) { "mealpy\\results\\assignments_lof" } else { "mealpy\\results\\assignments" }`);
+  lines.push('');
+  lines.push(`      $counter++`);
+  lines.push(`      Write-Host ""`);
+  lines.push(`      Write-Host "==================================================" -ForegroundColor Cyan`);
+  lines.push(`      Write-Host "[$counter / $total] k=$k gs=$gsMode  $($sc.Label)" -ForegroundColor Cyan`);
+  lines.push(`      Write-Host "==================================================" -ForegroundColor Cyan`);
+  lines.push('');
+
+  lines.push(`      $args = @(`);
+  lines.push(`        "mealpy\\generate_assignments.py",`);
+  lines.push(`        "--dataset", $dataset,`);
+  lines.push(`        "--k", $k,`);
+  lines.push(`        "--algo"`);
+  lines.push(`      ) + $algos + @(`);
+  lines.push(`        "--preprocess", $sc.Pp,`);
+  lines.push(`        "--feature-extraction", $sc.Fe,`);
+  lines.push(`        "--svd-components", $sc.Dim,`);
+  lines.push(`        "--cluster-metric", $sc.Cm,`);
+  lines.push(`        "--min-user-ratings", $minU,`);
+  lines.push(`        "--min-item-ratings", $minI`);
+  lines.push(`      )`);
+  lines.push(`      if ($sc.Zscore)    { $args += "--zscore" }`);
+  lines.push(`      if ($useLof)       { $args += "--lof" }`);
+  lines.push(`      if ($noGraySheep)  { $args += "--no-gray-sheep" }`);
+  lines.push(`      if ($useFcm)       { $args += "--fcm" }`);
+  lines.push(`      if ($skipExist)    { $args += "--skip-existing" }`);
+  lines.push(`      if ($kmRefine)     { $args += "--kmeans-refine" }`);
+  lines.push(`      if ($kmRefine -and $kmRefineIt -ne "") { $args += @("--kmeans-refine-iter", $kmRefineIt) }`);
+  lines.push(`      if ($initMode)     { $args += @("--init-mode", $initMode) }`);
+  lines.push(`      if ($jobs -ne "")  { $args += @("--jobs", $jobs) }`);
+  lines.push(`      if ($sc.Pca -ne "" -and $sc.Fe -eq "pca") { $args += @("--pca", $sc.Pca) }`);
+  lines.push('');
+  lines.push(`      python @args`);
+  lines.push('');
+
+  if (chain) {
+    lines.push(`      # Atama klasörü suffix'i (kmref durumunda B0_KMEANS hariç _kmref eklenir)`);
+    lines.push(`      $suffixBase = Get-AssignSuffix -MinU $minU -MinI $minI \``);
+    lines.push(`        -Zscore $sc.Zscore -Pca $sc.Pca \``);
+    lines.push(`        -WnmfFeat 0 -WnmfInit "inmed" -TrimLow 5.0 -TrimHigh 95.0 \``);
+    lines.push(`        -Metric $sc.Cm -Paper $false -NoGs $noGraySheep \``);
+    lines.push(`        -Preprocess $sc.Pp -Fe $sc.Fe -Components ([int]$sc.Dim) -K ([int]$k) \``);
+    lines.push(`        -KmRefine $false -Algo "B0_KMEANS"`);
+    lines.push(`      $suffixRefined = Get-AssignSuffix -MinU $minU -MinI $minI \``);
+    lines.push(`        -Zscore $sc.Zscore -Pca $sc.Pca \``);
+    lines.push(`        -WnmfFeat 0 -WnmfInit "inmed" -TrimLow 5.0 -TrimHigh 95.0 \``);
+    lines.push(`        -Metric $sc.Cm -Paper $false -NoGs $noGraySheep \``);
+    lines.push(`        -Preprocess $sc.Pp -Fe $sc.Fe -Components ([int]$sc.Dim) -K ([int]$k) \``);
+    lines.push(`        -KmRefine $kmRefine -Algo "OTHER"`);
+    lines.push('');
+    lines.push(`      $algosBase    = $algos | Where-Object { $_ -eq "B0_KMEANS" }`);
+    lines.push(`      $algosRefined = $algos | Where-Object { $_ -ne "B0_KMEANS" }`);
+    lines.push('');
+    lines.push(`      foreach ($fd in $predFolds) {`);
+    lines.push(`        foreach ($knn in $knns) {`);
+    lines.push(`          foreach ($sim in $sims) {`);
+    lines.push(`            Write-Host "  -> tahmin: fold=$fd knn=$knn sim=$sim mode=$predMode" -ForegroundColor Yellow`);
+    lines.push('');
+    lines.push(`            $predGroups = @()`);
+    lines.push(`            if ($algosRefined.Count -gt 0) {`);
+    lines.push(`              $predGroups += ,@{ Algos = $algosRefined; Suffix = $suffixRefined }`);
+    lines.push(`            }`);
+    lines.push(`            if ($algosBase.Count -gt 0) {`);
+    lines.push(`              $predGroups += ,@{ Algos = $algosBase; Suffix = $suffixBase }`);
+    lines.push(`            }`);
+    lines.push('');
+    lines.push(`            foreach ($grp in $predGroups) {`);
+    lines.push(`              $pargs = @(`);
+    lines.push(`                "wnmf\\wnmf_experiment.py",`);
+    lines.push(`                "--dataset", $dataset,`);
+    lines.push(`                "--k", $k,`);
+    lines.push(`                "--assign-root", $assignRoot,`);
+    lines.push(`                "--assign-suffix", $grp.Suffix,`);
+    lines.push(`                "--mode", $predMode,`);
+    lines.push(`                "--similarity", $sim,`);
+    lines.push(`                "--knn", $knn,`);
+    lines.push(`                "--algo"`);
+    lines.push(`              ) + $grp.Algos`);
+    lines.push(`              if ($predNoAvg)    { $pargs += "--no-cluster-avg" }`);
+    lines.push(`              if ($predNoGlobal) { $pargs += "--no-global" }`);
+    lines.push(`              if ($predAlgoJobs -ne "") { $pargs += @("--algo-jobs", $predAlgoJobs) }`);
+    lines.push(`              if ($fd -ne "") { $pargs += @("--fold", [int]$fd) }`);
+    lines.push(`              python @pargs`);
+    lines.push(`            }`);
+    lines.push(`          }`);
+    lines.push(`        }`);
+    lines.push(`      }`);
+  }
+
+  lines.push(`    }`);
+  lines.push(`  }`);
+  lines.push(`  }`);
+  lines.push(`}`);
+  lines.push('');
+  lines.push(`Write-Host ""`);
+  lines.push(`Write-Host "Grid tamamlandı: $counter / $total kombinasyon" -ForegroundColor Green`);
+
+  return lines.join('\n');
+}
+
+function regenerateGrid() {
+  document.getElementById('cmd-grid').textContent = buildGridScript();
+
+  // Grid lint: aktif senaryoları açıp her birini lintle
+  const scenarios = readScenarios().filter(s => s.enabled);
+  let combos = [];
+  for (const sc of scenarios) combos = combos.concat(expandScenario(sc));
+  const seenMsgs = new Map();
+  for (const c of combos) {
+    const issues = lintCombination({
+      zscore: c.zscore,
+      preprocess: c.pp,
+      fe: c.fe,
+      dim: c.dim,
+      metric: c.cm,
+      pca: c.pca,
+      wnmfFeat: '',
+    });
+    for (const i of issues) {
+      const key = i.tag + '|' + i.msg;
+      if (!seenMsgs.has(key)) seenMsgs.set(key, i);
+    }
+  }
+
+  const uniqueIssues = [...seenMsgs.values()];
+  const el = document.getElementById('lint-grid');
+  if (!uniqueIssues.length) {
+    el.innerHTML = '';
+    return;
+  }
+  const order = { err: 0, warn: 1, ok: 2 };
+  uniqueIssues.sort((a, b) => order[a.tag] - order[b.tag]);
+  const html = uniqueIssues.map(i => {
+    const cls = i.tag === 'err' ? 'danger-banner'
+              : i.tag === 'warn' ? 'warn-banner'
+              : 'ok-banner';
+    const tag = i.tag === 'err' ? 'HATA'
+              : i.tag === 'warn' ? 'UYARI'
+              : 'OK';
+    return `<div class="${cls}"><span class="lint-tag ${i.tag}">${tag}</span>${i.msg}</div>`;
+  }).join('');
+  el.innerHTML = html;
+}
+
+document.querySelectorAll('#form-grid').forEach(form => {
+  form.addEventListener('input', regenerateGrid);
+  form.addEventListener('change', regenerateGrid);
+});
+
+function setGridAxis(axis, value) {
+  const el = document.querySelector(`#form-grid [data-axis="${axis}"]`);
+  if (el) el.value = value;
+}
+function selectGridAlgos(arr) {
+  const set = new Set(arr);
+  document.querySelectorAll('#algo-list-grid input[type=checkbox]').forEach(cb => {
+    cb.checked = set.has(cb.dataset.algo);
+  });
+}
+
+// =============================================================
+// SENARYO MOTORU — UI render, okuma, varsayılanlar, preset'ler
+// =============================================================
+const FE_CHOICES = ['none', 'svd', 'pca', 'nmf', 'wnmf'];
+
+// Varsayılan kurallar — promptun ruhu
+const DEFAULT_SCENARIOS = [
+  // WNMF: zscore + (none / minmax / maxabs); pca yok
+  { enabled: true, label: 'WNMF·zscore', fe: 'wnmf', dims: '10 20',
+    pps: 'none minmax maxabs', cms: 'fuzzy euclidean', pcas: '', zscore: 'on' },
+  // NMF: (minmax / maxabs / none), zscore opsiyonel
+  { enabled: true, label: 'NMF·noscaler', fe: 'nmf', dims: '20',
+    pps: 'minmax maxabs none', cms: 'fuzzy euclidean', pcas: '', zscore: 'off' },
+  // PCA: zscore + 0.95 (klasik literatür preset)
+  { enabled: true, label: 'PCA·zscore·0.95', fe: 'pca', dims: '20',
+    pps: 'none', cms: 'euclidean fuzzy', pcas: '0.95', zscore: 'on' },
+];
+
+let scenarioState = JSON.parse(JSON.stringify(DEFAULT_SCENARIOS));
+
+function renderScenarios() {
+  const root = document.getElementById('scenario-list');
+  if (!root) return;
+  root.innerHTML = '';
+  scenarioState.forEach((sc, idx) => {
+    const div = document.createElement('div');
+    div.className = 'scenario-row' + (sc.enabled ? '' : ' disabled');
+    div.dataset.idx = String(idx);
+    div.innerHTML = `
+      <div class="sc-header">
+        <label class="check"><input type="checkbox" data-sc-field="enabled" ${sc.enabled ? 'checked' : ''}/> Aktif</label>
+        <input type="text" class="sc-label" data-sc-field="label" value="${(sc.label || '').replace(/"/g, '&quot;')}" placeholder="Etiket (opsiyonel)" />
+        <button class="btn btn-rm" data-sc-action="remove" type="button">Sil</button>
+      </div>
+      <div class="sc-grid">
+        <label>Feature ext</label>
+        <select data-sc-field="fe">
+          ${FE_CHOICES.map(f => `<option value="${f}" ${sc.fe === f ? 'selected' : ''}>${f}</option>`).join('')}
+        </select>
+        <label>--svd-components</label>
+        <input type="text" data-sc-field="dims" value="${sc.dims || ''}" placeholder="örn: 10 20 50" />
+        <label>--preprocess</label>
+        <input type="text" data-sc-field="pps" value="${sc.pps || ''}" placeholder="none minmax maxabs zscore" />
+        <label>--cluster-metric</label>
+        <input type="text" data-sc-field="cms" value="${sc.cms || ''}" placeholder="fuzzy euclidean pearson" />
+        <label>--pca</label>
+        <input type="text" data-sc-field="pcas" value="${sc.pcas || ''}" placeholder="(boş) — sadece fe=pca için" />
+        <label>--zscore</label>
+        <select data-sc-field="zscore">
+          <option value="on"   ${sc.zscore === 'on'   ? 'selected' : ''}>açık</option>
+          <option value="off"  ${sc.zscore === 'off'  ? 'selected' : ''}>kapalı</option>
+          <option value="both" ${sc.zscore === 'both' ? 'selected' : ''}>ikisi (her ikisi denenir)</option>
+        </select>
+      </div>
+      <div class="sc-meta" data-sc-meta></div>
+    `;
+    root.appendChild(div);
+    updateScenarioMeta(div, sc);
+  });
+}
+
+function updateScenarioMeta(div, sc) {
+  const combos = expandScenario(sc);
+  const meta = div.querySelector('[data-sc-meta]');
+  if (!meta) return;
+  if (!sc.enabled) {
+    meta.innerHTML = '<i>(devre dışı)</i>';
+    return;
+  }
+  if (!combos.length) {
+    meta.innerHTML = '<span style="color:#fca5a5;">Bu senaryo 0 kombinasyon üretiyor — feature/dim/scaler/metric alanlarını kontrol et.</span>';
+    return;
+  }
+  meta.innerHTML = `<b>${combos.length}</b> alt-kombinasyon · örn: <code>${combos[0].fe}/dim${combos[0].dim}/${combos[0].pp}/${combos[0].cm}${combos[0].pca ? '/pca' + combos[0].pca : ''}${combos[0].zscore ? ' (zscore)' : ''}</code>`;
+}
+
+function readScenarios() {
+  const root = document.getElementById('scenario-list');
+  if (!root) return [];
+  const out = [];
+  root.querySelectorAll('.scenario-row').forEach(div => {
+    const sc = {};
+    div.querySelectorAll('[data-sc-field]').forEach(el => {
+      const k = el.dataset.scField;
+      sc[k] = (el.type === 'checkbox') ? el.checked : (el.value || '').trim();
+    });
+    out.push(sc);
+  });
+  scenarioState = out;
+  return out;
+}
+
+document.getElementById('scenario-add')?.addEventListener('click', () => {
+  readScenarios();
+  scenarioState.push({
+    enabled: true, label: '', fe: 'nmf', dims: '20',
+    pps: 'minmax', cms: 'fuzzy', pcas: '', zscore: 'off',
+  });
+  renderScenarios();
+  regenerateGrid();
+});
+document.getElementById('scenario-clear')?.addEventListener('click', () => {
+  scenarioState = [];
+  renderScenarios();
+  regenerateGrid();
+});
+document.getElementById('scenario-load-defaults')?.addEventListener('click', () => {
+  scenarioState = JSON.parse(JSON.stringify(DEFAULT_SCENARIOS));
+  renderScenarios();
+  regenerateGrid();
+});
+
+// Senaryo satırları içinde değişiklik veya sil tıklaması
+document.getElementById('scenario-list')?.addEventListener('input', (e) => {
+  const div = e.target.closest('.scenario-row');
+  if (!div) return;
+  readScenarios();
+  // ilgili satırın meta + disabled durumunu güncelle
+  const idx = parseInt(div.dataset.idx, 10);
+  if (!Number.isNaN(idx) && scenarioState[idx]) {
+    div.classList.toggle('disabled', !scenarioState[idx].enabled);
+    updateScenarioMeta(div, scenarioState[idx]);
+  }
+  regenerateGrid();
+});
+document.getElementById('scenario-list')?.addEventListener('change', (e) => {
+  const div = e.target.closest('.scenario-row');
+  if (!div) return;
+  readScenarios();
+  const idx = parseInt(div.dataset.idx, 10);
+  if (!Number.isNaN(idx) && scenarioState[idx]) {
+    div.classList.toggle('disabled', !scenarioState[idx].enabled);
+    updateScenarioMeta(div, scenarioState[idx]);
+  }
+  regenerateGrid();
+});
+document.getElementById('scenario-list')?.addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-sc-action="remove"]');
+  if (!btn) return;
+  const div = btn.closest('.scenario-row');
+  if (!div) return;
+  readScenarios();
+  scenarioState.splice(parseInt(div.dataset.idx, 10), 1);
+  renderScenarios();
+  regenerateGrid();
+});
+
+renderScenarios();
+
+// =============================================================
+// Hızlı şablonlar — senaryo setleri
+// =============================================================
+const SCENARIO_PRESETS = {
+  'latent-effect': {
+    k: '14',
+    algos: ['B0_KMEANS', 'B2_HGS', 'HA_AVOAHGS'],
+    scenarios: [
+      { enabled: true, label: 'NMF·dim sweep', fe: 'nmf', dims: '10 20 50 100',
+        pps: 'minmax', cms: 'fuzzy', pcas: '', zscore: 'off' },
+    ],
+  },
+  'fe-effect': {
+    k: '14',
+    algos: ['B0_KMEANS', 'B2_HGS', 'HA_AVOAHGS', 'LIT_PSO', 'LIT_GWO', 'H4_MFO+HHO'],
+    scenarios: [
+      { enabled: true, label: 'NMF', fe: 'nmf',  dims: '20', pps: 'minmax', cms: 'fuzzy', pcas: '',     zscore: 'off' },
+      { enabled: true, label: 'WNMF', fe: 'wnmf', dims: '20', pps: 'none',   cms: 'fuzzy', pcas: '',     zscore: 'on'  },
+      { enabled: true, label: 'PCA',  fe: 'pca',  dims: '20', pps: 'none',   cms: 'euclidean', pcas: '0.95', zscore: 'on' },
+      { enabled: true, label: 'none', fe: 'none', dims: '20', pps: 'minmax', cms: 'pearson', pcas: '',  zscore: 'off' },
+    ],
+  },
+  'k-effect': {
+    k: '7 14 30 70',
+    algos: ['B0_KMEANS', 'B2_HGS', 'HA_AVOAHGS', 'LIT_PSO'],
+    scenarios: [
+      { enabled: true, label: 'NMF base', fe: 'nmf', dims: '20',
+        pps: 'minmax', cms: 'fuzzy', pcas: '', zscore: 'off' },
+    ],
+  },
+  'metric-effect': {
+    k: '14',
+    algos: ['B0_KMEANS', 'B2_HGS', 'HA_AVOAHGS', 'LIT_PSO'],
+    scenarios: [
+      { enabled: true, label: 'NMF metrics', fe: 'nmf', dims: '20',
+        pps: 'minmax', cms: 'fuzzy euclidean pearson', pcas: '', zscore: 'off' },
+    ],
+  },
+  'prompt-default': {
+    k: '14',
+    algos: ['B0_KMEANS', 'B2_HGS', 'HA_AVOAHGS', 'LIT_PSO', 'LIT_GWO', 'H4_MFO+HHO'],
+    scenarios: JSON.parse(JSON.stringify(DEFAULT_SCENARIOS)),
+  },
+};
+
+document.querySelectorAll('[data-grid-preset]').forEach(b => {
+  b.addEventListener('click', () => {
+    const p = b.dataset.gridPreset;
+    const preset = SCENARIO_PRESETS[p];
+    if (!preset) return;
+    setGridAxis('k', preset.k);
+    selectGridAlgos(preset.algos);
+    scenarioState = JSON.parse(JSON.stringify(preset.scenarios));
+    renderScenarios();
+    regenerateGrid();
+  });
+});
+
+// Kopyala / kaydet
+document.getElementById('copy-grid').addEventListener('click', () => copyText('cmd-grid'));
+document.getElementById('save-grid').addEventListener('click', () => {
+  const txt = document.getElementById('cmd-grid').textContent;
+  const blob = new Blob([txt], { type: 'text/plain;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'run_grid.ps1';
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  showToast('run_grid.ps1 indirildi');
+});
+
+regenerateGrid();
+
+// =============================================================
+// TAB 4: Küme Karşılaştırma — komut üretici + canlı .npy parse
+// =============================================================
+function buildCompareCommand() {
+  const root = (document.getElementById('cmp-root').value || '').trim();
+  const suffix = (document.getElementById('cmp-suffix').value || '').trim();
+  const algos = (document.getElementById('cmp-algos').value || '').trim().split(/\s+/).filter(Boolean);
+  const ref = (document.getElementById('cmp-reference').value || '').trim();
+  const csv = (document.getElementById('cmp-csv').value || '').trim();
+
+  const lines = ['python mealpy\\compare_cluster_structure.py'];
+  if (root) lines.push(`  --dataset-root ${quote(root)}`);
+  if (suffix) lines.push(`  --suffix ${quote(suffix)}`);
+  if (algos.length) lines.push(`  --algos ${algos.map(quote).join(' ')}`);
+  if (ref) lines.push(`  --reference ${quote(ref)}`);
+  if (csv) lines.push(`  --csv ${quote(csv)}`);
+  document.getElementById('cmd-compare').textContent = lines.join(' `\n');
+}
+['cmp-root','cmp-suffix','cmp-algos','cmp-reference','cmp-csv'].forEach(id => {
+  document.getElementById(id).addEventListener('input', buildCompareCommand);
+});
+document.getElementById('copy-compare').addEventListener('click', () => copyText('cmd-compare'));
+buildCompareCommand();
+
+// ---- NPY parser (1D int/uint/float arrays, fortran_order=False) ----
+function parseNpy(arrayBuffer) {
+  const bytes = new Uint8Array(arrayBuffer);
+  // Magic: \x93NUMPY
+  if (bytes[0] !== 0x93 || String.fromCharCode(bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]) !== 'NUMPY') {
+    throw new Error('Geçersiz NPY magic');
+  }
+  const major = bytes[6];
+  const headerLen = (major >= 2)
+    ? new DataView(arrayBuffer, 8, 4).getUint32(0, true)
+    : new DataView(arrayBuffer, 8, 2).getUint16(0, true);
+  const headerStart = (major >= 2) ? 12 : 10;
+  const headerStr = new TextDecoder('latin1').decode(bytes.subarray(headerStart, headerStart + headerLen));
+
+  const dtypeMatch = headerStr.match(/'descr'\s*:\s*'([^']+)'/);
+  const shapeMatch = headerStr.match(/'shape'\s*:\s*\(([^)]*)\)/);
+  const fortranMatch = headerStr.match(/'fortran_order'\s*:\s*(True|False)/);
+  if (!dtypeMatch || !shapeMatch) throw new Error('NPY header parse başarısız');
+  const dtype = dtypeMatch[1];
+  const fortran = fortranMatch && fortranMatch[1] === 'True';
+  if (fortran) throw new Error('fortran_order=True desteklenmiyor');
+  const shape = shapeMatch[1].split(',').map(s => s.trim()).filter(s => s.length).map(s => parseInt(s, 10));
+  const dataStart = headerStart + headerLen;
+
+  const total = shape.reduce((a, b) => a * b, 1);
+  const dv = new DataView(arrayBuffer, dataStart);
+  let arr;
+  // Hedef: Int32Array (assignments)
+  if (dtype === '<i8' || dtype === '<u8') {
+    arr = new Int32Array(total);
+    for (let i = 0; i < total; i++) {
+      arr[i] = dv.getInt32(i * 8, true); // alt 32-bit (cluster ID küçük, kayıpsız)
+    }
+  } else if (dtype === '<i4' || dtype === '<u4') {
+    arr = new Int32Array(arrayBuffer.slice(dataStart, dataStart + total * 4));
+  } else if (dtype === '<i2' || dtype === '<u2') {
+    arr = new Int32Array(total);
+    for (let i = 0; i < total; i++) arr[i] = dv.getInt16(i * 2, true);
+  } else if (dtype === '<i1' || dtype === '|i1' || dtype === '|u1' || dtype === '<u1') {
+    arr = new Int32Array(total);
+    for (let i = 0; i < total; i++) arr[i] = dv.getInt8(i);
+  } else if (dtype === '<f4') {
+    const f = new Float32Array(arrayBuffer.slice(dataStart, dataStart + total * 4));
+    arr = new Int32Array(total); for (let i = 0; i < total; i++) arr[i] = Math.round(f[i]);
+  } else if (dtype === '<f8') {
+    const f = new Float64Array(arrayBuffer.slice(dataStart, dataStart + total * 8));
+    arr = new Int32Array(total); for (let i = 0; i < total; i++) arr[i] = Math.round(f[i]);
+  } else {
+    throw new Error('Desteklenmeyen dtype: ' + dtype);
+  }
+  return { dtype, shape, data: arr };
+}
+
+function inferKFromName(name) {
+  const m = name.match(/_k(\d+)(?:[_.]|$)/);
+  return m ? parseInt(m[1], 10) : null;
+}
+
+function giniSizes(sizes) {
+  const x = Array.from(sizes).filter(v => v > 0).sort((a, b) => a - b);
+  const n = x.length;
+  if (n === 0) return NaN;
+  const s = x.reduce((a, b) => a + b, 0);
+  if (s <= 0) return NaN;
+  let acc = 0;
+  for (let i = 0; i < n; i++) acc += (2 * (i + 1) - n - 1) * x[i];
+  return acc / (n * s);
+}
+
+function maxLabel(labels) {
+  let mx = -1;
+  for (let i = 0; i < labels.length; i++) if (labels[i] > mx) mx = labels[i];
+  return mx;
+}
+function structureStats(labels, kExpected) {
+  const mx = maxLabel(labels);
+  const cap = Math.max(kExpected, mx + 1);
+  const sizes = new Int32Array(cap);
+  for (let i = 0; i < labels.length; i++) {
+    const v = labels[i];
+    if (v >= 0) sizes[v] += 1;
+  }
+  const sliced = Array.from(sizes.subarray(0, kExpected));
+  const active = sliced.filter(v => v > 0);
+  if (!active.length) return { nActive: 0, nEmpty: kExpected, sMin: NaN, sMax: NaN, sMean: NaN, sStd: NaN, sCV: NaN, gini: NaN };
+  let sMin = active[0], sMax = active[0], sum = 0;
+  for (const v of active) { if (v < sMin) sMin = v; if (v > sMax) sMax = v; sum += v; }
+  const sMean = sum / active.length;
+  let varAcc = 0; for (const v of active) varAcc += (v - sMean) ** 2;
+  const sStd = Math.sqrt(varAcc / active.length);
+  const sCV = sMean > 1e-9 ? sStd / sMean : 0;
+  const gini = giniSizes(active);
+  const nActive = active.length;
+  const nEmpty = Math.max(0, kExpected - nActive);
+  return { nActive, nEmpty, sMin, sMax, sMean, sStd, sCV, gini };
+}
+
+// Pairwise: contingency table → ARI ve NMI
+function pairScores(a, b) {
+  if (a.length !== b.length) return { ari: NaN, nmi: NaN };
+  const n = a.length;
+  const map = new Map(); // key = ai*1e6 + bj
+  const rowSum = new Map();
+  const colSum = new Map();
+  const aMin = Math.min(...a), bMin = Math.min(...b);
+  for (let i = 0; i < n; i++) {
+    const ai = a[i], bj = b[i];
+    const key = ai * 100000 + bj;
+    map.set(key, (map.get(key) || 0) + 1);
+    rowSum.set(ai, (rowSum.get(ai) || 0) + 1);
+    colSum.set(bj, (colSum.get(bj) || 0) + 1);
+  }
+  const c2 = (x) => x * (x - 1) / 2;
+  let sumIJ = 0;
+  for (const v of map.values()) sumIJ += c2(v);
+  let sumI = 0; for (const v of rowSum.values()) sumI += c2(v);
+  let sumJ = 0; for (const v of colSum.values()) sumJ += c2(v);
+  const cN = c2(n);
+  const expected = (cN > 0) ? (sumI * sumJ) / cN : 0;
+  const max = (sumI + sumJ) / 2;
+  const ari = (max - expected !== 0) ? (sumIJ - expected) / (max - expected) : 0;
+
+  // NMI (arithmetic)
+  const log = Math.log;
+  let hX = 0; for (const v of rowSum.values()) { const p = v / n; if (p > 0) hX -= p * log(p); }
+  let hY = 0; for (const v of colSum.values()) { const p = v / n; if (p > 0) hY -= p * log(p); }
+  let mi = 0;
+  for (const [key, nij] of map.entries()) {
+    const ai = Math.floor(key / 100000), bj = key - ai * 100000;
+    const ai_n = rowSum.get(ai), bj_n = colSum.get(bj);
+    if (nij > 0 && ai_n > 0 && bj_n > 0) {
+      mi += (nij / n) * log((nij * n) / (ai_n * bj_n));
+    }
+  }
+  const denom = (hX + hY) / 2;
+  const nmi = denom > 0 ? mi / denom : 0;
+  return { ari, nmi };
+}
+
+// File state
+let CMP_FILES = []; // [{name, labels, kInfer}]
+
+function readFileAsBuffer(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+    r.readAsArrayBuffer(file);
+  });
+}
+
+async function loadCmpFiles(fileList) {
+  const out = [];
+  const errors = [];
+  // Aynı isimli dosyalar için "File 1, File 2..." ek etiket
+  const nameCounts = {};
+  for (const f of fileList) nameCounts[f.name] = (nameCounts[f.name] || 0) + 1;
+  let dupeIdx = 0;
+  for (const f of fileList) {
+    try {
+      const buf = await readFileAsBuffer(f);
+      const parsed = parseNpy(buf);
+      const tag = nameCounts[f.name] > 1 ? `${f.name} #${++dupeIdx}` : f.name;
+      out.push({ name: tag, rawName: f.name, labels: parsed.data, kInfer: inferKFromName(f.name) });
+    } catch (e) {
+      errors.push(`${f.name}: ${e.message}`);
+    }
+  }
+  CMP_FILES = out;
+  const sel = document.getElementById('cmp-ref-file');
+  sel.innerHTML = '<option value="">(ilk dosya)</option>' +
+    out.map((f, i) => `<option value="${i}">${f.name}</option>`).join('');
+  document.getElementById('cmp-files-status').textContent =
+    `${out.length} dosya yüklendi.` + (errors.length ? ' Hatalar: ' + errors.join('; ') : '');
+}
+
+function fmt(v, digits = 3) {
+  if (v == null || Number.isNaN(v)) return '—';
+  if (Number.isInteger(v)) return String(v);
+  return v.toFixed(digits);
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[c]);
+}
+
+function renderCompareResults() {
+  const host = document.getElementById('compare-results');
+  if (!CMP_FILES.length) { host.innerHTML = '<div class="warn-banner">Önce .npy dosyaları yükle.</div>'; return; }
+  if (CMP_FILES.length === 1) { host.innerHTML = '<div class="warn-banner">En az 2 dosya gerekli.</div>'; return; }
+
+  // Aynı n kontrolü
+  const nVals = CMP_FILES.map(f => f.labels.length);
+  const sameN = nVals.every(n => n === nVals[0]);
+
+  // K_expected: override > klasör adından çıkar > max+1
+  const overrideK = parseInt(document.getElementById('cmp-kexp').value || '', 10);
+  const perFileK = CMP_FILES.map(f => {
+    if (!isNaN(overrideK) && overrideK > 0) return overrideK;
+    if (f.kInfer && f.kInfer > 0) return f.kInfer;
+    return maxLabel(f.labels) + 1;
+  });
+
+  // Yapı tablosu
+  const rows = CMP_FILES.map((f, i) => {
+    const k = perFileK[i];
+    const st = structureStats(f.labels, k);
+    return { f, k, st };
+  });
+
+  let html = '';
+  if (!sameN) {
+    html += `<div class="warn-banner">Dikkat: Dosyalardaki kullanıcı sayıları farklı (${nVals.join(', ')}). ARI/NMI hesaplanmaz.</div>`;
+  }
+  html += '<h3 style="color:var(--accent); margin: 4px 0 8px;">Küme yapısı</h3>';
+  html += '<table class="ref"><thead><tr>' +
+    '<th>Dosya</th><th>n</th><th>K</th><th>Aktif</th><th>Boş</th>' +
+    '<th>min</th><th>max</th><th>ort</th><th>CV</th><th>Gini</th>' +
+    '</tr></thead><tbody>';
+  rows.forEach(r => {
+    html += `<tr>
+      <td><code>${escapeHtml(r.f.name)}</code></td>
+      <td>${r.f.labels.length}</td>
+      <td>${r.k}</td>
+      <td>${r.st.nActive}</td>
+      <td>${r.st.nEmpty}</td>
+      <td>${fmt(r.st.sMin, 0)}</td>
+      <td>${fmt(r.st.sMax, 0)}</td>
+      <td>${fmt(r.st.sMean, 1)}</td>
+      <td>${fmt(r.st.sCV, 3)}</td>
+      <td>${fmt(r.st.gini, 3)}</td>
+    </tr>`;
+  });
+  html += '</tbody></table>';
+  html += '<p style="color:var(--muted); font-size:12px; margin: 6px 0 16px;">Aktif/Boş: K dilim; CV düşük = daha dengeli; Gini düşük = daha eşit dağılım.</p>';
+
+  if (sameN && CMP_FILES.length >= 2) {
+    // Pairwise tam matris
+    html += '<h3 style="color:var(--accent); margin: 14px 0 8px;">Çiftler — ARI / NMI matris</h3>';
+    html += '<table class="ref"><thead><tr><th></th>';
+    CMP_FILES.forEach(f => { html += `<th>${escapeHtml(shortName(f.name))}</th>`; });
+    html += '</tr></thead><tbody>';
+    for (let i = 0; i < CMP_FILES.length; i++) {
+      html += `<tr><th>${escapeHtml(shortName(CMP_FILES[i].name))}</th>`;
+      for (let j = 0; j < CMP_FILES.length; j++) {
+        if (i === j) { html += `<td style="color:var(--muted)">— / —</td>`; continue; }
+        const sc = pairScores(CMP_FILES[i].labels, CMP_FILES[j].labels);
+        html += `<td>ARI ${fmt(sc.ari, 3)}<br><span style="color:var(--muted); font-size:11px;">NMI ${fmt(sc.nmi, 3)}</span></td>`;
+      }
+      html += '</tr>';
+    }
+    html += '</tbody></table>';
+
+    // Referansa göre özet
+    const refIdxRaw = document.getElementById('cmp-ref-file').value;
+    const refIdx = refIdxRaw === '' ? 0 : parseInt(refIdxRaw, 10);
+    const refFile = CMP_FILES[refIdx];
+    html += `<h3 style="color:var(--accent); margin: 14px 0 8px;">Referans (${escapeHtml(refFile.name)}) — ARI / NMI</h3>`;
+    html += '<table class="ref"><thead><tr><th>Dosya</th><th>ARI</th><th>NMI</th></tr></thead><tbody>';
+    CMP_FILES.forEach((f, i) => {
+      if (i === refIdx) { html += `<tr><td><code>${escapeHtml(f.name)}</code></td><td class="ok-cell">1.000</td><td class="ok-cell">1.000</td></tr>`; return; }
+      const sc = pairScores(refFile.labels, f.labels);
+      html += `<tr><td><code>${escapeHtml(f.name)}</code></td><td>${fmt(sc.ari, 3)}</td><td>${fmt(sc.nmi, 3)}</td></tr>`;
+    });
+    html += '</tbody></table>';
+    html += '<p style="color:var(--muted); font-size:12px; margin-top:6px;">ARI ~0 rastgele uyum; 1 = aynı bölüşüm. NMI 0..1, yüksek = daha uyumlu.</p>';
+  }
+
+  host.innerHTML = html;
+}
+
+function shortName(name) {
+  const base = name.replace(/\.npy$/i, '');
+  const us = base.indexOf('_');
+  if (us > 0) return base.substring(0, Math.min(us + 6, base.length));
+  return base.length > 18 ? base.substring(0, 18) + '…' : base;
+}
+
+document.getElementById('cmp-files').addEventListener('change', async (e) => {
+  await loadCmpFiles(e.target.files);
+  renderCompareResults();
+});
+document.getElementById('cmp-kexp').addEventListener('input', renderCompareResults);
+document.getElementById('cmp-ref-file').addEventListener('change', renderCompareResults);
+document.getElementById('run-compare').addEventListener('click', renderCompareResults);
+document.getElementById('clear-compare').addEventListener('click', () => {
+  CMP_FILES = [];
+  document.getElementById('cmp-files').value = '';
+  document.getElementById('cmp-files-status').textContent = 'Henüz dosya seçilmedi.';
+  document.getElementById('cmp-ref-file').innerHTML = '<option value="">(ilk dosya)</option>';
+  document.getElementById('compare-results').innerHTML = '';
+});
+
+// İlk render
+regenerateAll();
+</script>
+</body>
+</html>

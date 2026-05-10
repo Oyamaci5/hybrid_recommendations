@@ -102,9 +102,9 @@ DATA_1M         = os.path.join(os.path.dirname(BASE_DIR), 'data', 'ml-1m', 'rati
 ASSIGN_ROOT     = os.path.join(os.path.dirname(BASE_DIR), 'mealpy','results', 'assignments_lof')
 OUT_ROOT        = os.path.join(os.path.dirname(BASE_DIR), 'results', 'wnmf')
 
-# generate_assignments.py ile aynı: K bu değerlerden biriyse klasörde _k{K} eki yok
-ASSIGN_K_DEFAULT_100K = 30
-ASSIGN_K_DEFAULT_1M   = 70
+# generate_assignments.py K_100K_DEFAULT / K_1M_DEFAULT ile aynı olmalı (klasör adı _k{K} eki)
+ASSIGN_K_DEFAULT_100K = 7
+ASSIGN_K_DEFAULT_1M   = 7
 
 LATENT_DIM       = 20
 LEARNING_RATE    = 0.01
@@ -113,12 +113,16 @@ N_EPOCHS_GLOBAL  = 100   # global V ve global baseline için
 N_EPOCHS_CLUSTER = 100   # küme U eğitimi için
 RANDOM_SEED      = 42
 
+# Soft-membership KNN / WNMF: bu eşiğin altındaki küme ağırlıkları ihmal edilir;
+# kalan ağırlıklarla yeniden normalize edilir. Hepsi eşiğin altındaysa hard atamaya dönülür.
+SOFT_MEMBERSHIP_THRESHOLD = 0.05
+
 ALGO_LABELS = [
     'B0_KMEANS',
     'B1_HHO', 'B2_HGS', 'B3_MFO', 'LF_HHO', 'SFOA', 'SFOA_06', 'H1_HHO+HGS', 'H4_MFO+HHO', 'DOA',
-    'H9_QSA+CDO', 'H12_MFO+CDO', 'H13_HHO+GAop',
+    'H9_QSA+CDO', 'H12_MFO+CDO', 'H13_HHO+GAop', 'HA_AVOAHGS',
     # generate_assignments.py ALGO_CONFIG — önce --lof ile atama üretin
-    'LIT_CIRCLESA', 'LIT_GOA', 'LIT_GWO', 'LIT_SSA',
+    'LIT_CIRCLESA', 'LIT_GOA', 'LIT_GWO', 'LIT_SSA', 'LIT_PSO',
 ]
 
 # Yaygın yazım hatası: --algo H1_HGS+HHO → H1_HHO+HGS
@@ -336,6 +340,9 @@ def _algo_assignment_dir(
     """
     default_k = ASSIGN_K_DEFAULT_100K if dataset_name == 'ml100k' else ASSIGN_K_DEFAULT_1M
     suffix    = '' if k_used == default_k else f'_k{k_used}'
+    # assign_suffix ..._k{K} ile bittiğinde (generate_assignments ile aynı) ara _k{K} tekrar etmesin
+    if assign_suffix and assign_suffix.endswith(f'_k{k_used}'):
+        suffix = ''
     return os.path.join(assign_root, dataset_name, f'{label}{suffix}{assign_suffix}')
 
 
@@ -564,11 +571,12 @@ def _membership_weighted_prediction(
     predictor_fn,
     user_id: int,
     item_id: int,
+    soft_threshold: float = SOFT_MEMBERSHIP_THRESHOLD,
 ) -> float:
     num = 0.0
     den = 0.0
     for cid, w in enumerate(np.asarray(memberships_row, dtype=np.float64)):
-        if w <= 0:
+        if w < soft_threshold:
             continue
         profile = profiles.get(int(cid))
         if profile is None:
@@ -576,7 +584,7 @@ def _membership_weighted_prediction(
         pred_k = predictor_fn(profile, int(user_id), int(item_id))
         num += float(w) * float(pred_k)
         den += float(w)
-    if den <= 0:
+    if den < 1e-8:
         return float('nan')
     return float(np.clip(num / den, 1.0, 5.0))
 
@@ -1419,6 +1427,7 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
                     similarity: str = 'pearson',
                     min_common: int = 3,
                     k_neighbors: int = 30,
+                    expand_knn: bool = False,
                     sig_weight: int = 0,
                     sim_amp: float = 1.0,
                     top_n: int = 10,
@@ -1516,56 +1525,52 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
         and memberships.shape[1] >= (int(assignments.max()) + 1)
     )
 
+    def _baseline_ui(u, i):
+        return float(user_means.get(u, global_mean))
+
     def _predict_for_cluster(u, i, cid, similarity='pearson', min_common=3):
-        """
-        Mean-Centered kNN tahmin formülü:
-        pred(u,i) = mean_u +
-                    Σ sim(u,v)*(r_vi - mean_v) / Σ|sim(u,v)|
-
-        Pearson için mean-centered kullan.
-        Cosine için ham rating ortalaması kullan.
-        """
         neighbors = cluster_users.get(cid, [])
-
-        # i'yi değerlendiren komşuları bul ve benzerlik hesapla
         sims = []
         for v in neighbors:
             if v == u:
                 continue
             if i not in user_ratings.get(v, {}):
                 continue
-
-            if similarity == 'pearson':
-                s = pearson_sim(
-                    u,
-                    v,
-                    min_common=min_common,
-                    sig_threshold=sig_weight,
-                    amp=sim_amp,
-                )
-            else:
-                s = cosine_sim(u, v, min_common)
-
-            if abs(s) > 0.0:
+            s = (
+                pearson_sim(u, v, min_common)
+                if similarity == 'pearson'
+                else cosine_sim(u, v, min_common)
+            )
+            if abs(s) > 0:
                 sims.append((s, v))
 
-        if not sims:
-            return float(user_means.get(u, global_mean))
+        if len(sims) < k_neighbors and expand_knn:
+            for other_cid, other_users in cluster_users.items():
+                if other_cid == cid:
+                    continue
+                for v in other_users:
+                    if v == u:
+                        continue
+                    if i not in user_ratings.get(v, {}):
+                        continue
+                    s = (
+                        pearson_sim(u, v, min_common)
+                        if similarity == 'pearson'
+                        else cosine_sim(u, v, min_common)
+                    )
+                    if abs(s) > 0:
+                        sims.append((s, v))
 
-        # En yakın k komşu seç
+        base_u = _baseline_ui(u, i)
+        if not sims:
+            return float(base_u)
         sims.sort(key=lambda x: -abs(x[0]))
         top_k = sims[:k_neighbors]
-
-        # Mean-centered ağırlıklı ortalama
-        num = sum(s * (user_ratings[v][i] - user_means.get(v, global_mean))
-                  for s, v in top_k)
+        num = sum(s * (user_ratings[v][i] - _baseline_ui(v, i)) for s, v in top_k)
         den = sum(abs(s) for s, v in top_k)
-
         if den < 1e-8:
-            return float(user_means.get(u, global_mean))
-
-        pred = user_means.get(u, global_mean) + num / den
-        return float(np.clip(pred, 1.0, 5.0))
+            return float(base_u)
+        return float(np.clip(base_u + num / den, 1.0, 5.0))
 
     def predict(u, i, similarity='pearson', min_common=3):
         if not use_soft:
@@ -1574,13 +1579,21 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
 
         weights = memberships[u]
         pred = 0.0
+        total_w = 0.0
         for cid, w in enumerate(weights):
-            if w <= 0:
+            if w < SOFT_MEMBERSHIP_THRESHOLD:
                 continue
-            pred += float(w) * _predict_for_cluster(
+            p = _predict_for_cluster(
                 u, i, cid, similarity=similarity, min_common=min_common
             )
-        return float(np.clip(pred, 1.0, 5.0))
+            pred += float(w) * p
+            total_w += float(w)
+
+        if total_w < 1e-8:
+            cid = int(assignments[u])
+            return _predict_for_cluster(u, i, cid, similarity=similarity, min_common=min_common)
+
+        return float(np.clip(pred / total_w, 1.0, 5.0))
 
     true_vals, pred_vals = [], []
     gray_true, gray_pred = [], []
@@ -1601,6 +1614,9 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
     all_true = true_vals + gray_true
     all_pred = pred_vals + gray_pred
     mae, rmse = _compute_metrics(all_true, all_pred)
+    accuracy = _compute_binary_accuracy(
+        all_true, all_pred, threshold=relevance_threshold
+    )
 
     gray_mae, gray_rmse = float('nan'), float('nan')
     if gray_true:
@@ -1636,7 +1652,7 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
         'cluster_mae_mean': float('nan'),
         'cluster_mae_min' : float('nan'),
         'cluster_mae_max' : float('nan'),
-        'accuracy'        : float('nan'),
+        'accuracy'        : accuracy,
         'precision_at_10' : precision,
         'recall_at_10'    : recall,
         'f1_at_10'        : f1,
@@ -1740,6 +1756,7 @@ def _mp_run_algo_job(job):
         out_dir,
         run_command,
         ld, lr, reg, eg, ec,
+        mp_args,
     ) = job
 
     # Çocuk süreçte hiperparametre globallerini geçerli değerlere ayarla
@@ -1749,6 +1766,8 @@ def _mp_run_algo_job(job):
     REGULARIZATION   = reg
     N_EPOCHS_GLOBAL  = eg
     N_EPOCHS_CLUSTER = ec
+
+    expand_knn = bool(getattr(mp_args, 'expand_knn', False))
 
     try:
         assignments, gray_mask = load_assignment(assign_dir)
@@ -1770,6 +1789,7 @@ def _mp_run_algo_job(job):
                 similarity=similarity,
                 min_common=min_common,
                 k_neighbors=knn,
+                expand_knn=expand_knn,
                 top_n=top_n,
                 relevance_threshold=relevance_threshold,
             )
@@ -1892,6 +1912,7 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
                 similarity: str = 'pearson',
                 knn: int = 30,
                 min_common: int = 3,
+                expand_knn: bool = False,
                 hybrid_alpha: Optional[float] = None,
                 use_svdpp: bool = False,
                 run_command: Optional[str] = None,
@@ -1996,6 +2017,7 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
                 hybrid_alpha,
                 out_dir, run_command,
                 _ld, _lr, _reg, _eg, _ec,
+                args,
             )
             for label, assign_dir in active_algos
         ]
@@ -2030,6 +2052,7 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
                     similarity=similarity,
                     min_common=min_common,
                     k_neighbors=knn,
+                    expand_knn=expand_knn,
                     top_n=top_n,
                     relevance_threshold=relevance_threshold,
                 )
@@ -2259,9 +2282,9 @@ def parse_args():
     p.add_argument('--dataset', choices=['100k', '1m', 'both'], default='both')
     p.add_argument(
         '--fold', type=int, default=None, metavar='N',
-        help='İsteğe bağlı CV fold (1-5). Verilmezse: ML-100K u1.base/u1.test, ML-1M %%20 holdout, '
-             'sonuçlar .../k{K}/runN. Verilirse: ML-100K u{N}.base/test, ML-1M fold 1=holdout 2-5=KFold, '
-             'sonuçlar .../k{K}/fold{N}/runN.',
+        help='İsteğe bağlı holdout fold (1–5). Verilmezse: ML-100K u1.base/u1.test; ML-1M %%20 holdout; '
+             'sonuçlar results/wnmf/<ds>/k{K}/run*/. Verilirse: ML-100K u{N}.base / u{N}.test; '
+             'ML-1M için load_ratings_1m(fold=N); sonuçlar .../k{K}/fold{N}/run*/.',
     )
     p.add_argument(
         '--algo',
@@ -2413,6 +2436,11 @@ def parse_args():
     p.add_argument(
         '--min-common', type=int, default=3, metavar='N',
         help='ClusterKNN: benzerlik için minimum ortak film sayısı (varsayılan: 3)',
+    )
+    p.add_argument(
+        '--expand-knn',
+        action='store_true',
+        help='Küme sınırını aşarak komşu ara',
     )
     p.add_argument(
         '--sig-weight', type=int, default=0,
@@ -2682,6 +2710,7 @@ if __name__ == '__main__':
                                 similarity=args.similarity,
                                 knn=args.knn,
                                 min_common=args.min_common,
+                                expand_knn=args.expand_knn,
                                 hybrid_alpha=args.hybrid_alpha,
                                 use_svdpp=use_sp,
                                 run_command=RUN_COMMAND,
@@ -2719,6 +2748,7 @@ if __name__ == '__main__':
                             similarity=args.similarity,
                             knn=args.knn,
                             min_common=args.min_common,
+                            expand_knn=args.expand_knn,
                             hybrid_alpha=args.hybrid_alpha,
                             use_svdpp=use_sp,
                             run_command=RUN_COMMAND,
@@ -2773,6 +2803,7 @@ if __name__ == '__main__':
                                 similarity=args.similarity,
                                 knn=args.knn,
                                 min_common=args.min_common,
+                                expand_knn=args.expand_knn,
                                 hybrid_alpha=args.hybrid_alpha,
                                 use_svdpp=use_sp,
                                 run_command=RUN_COMMAND,
@@ -2810,6 +2841,7 @@ if __name__ == '__main__':
                             similarity=args.similarity,
                             knn=args.knn,
                             min_common=args.min_common,
+                            expand_knn=args.expand_knn,
                             hybrid_alpha=args.hybrid_alpha,
                             use_svdpp=use_sp,
                             run_command=RUN_COMMAND,

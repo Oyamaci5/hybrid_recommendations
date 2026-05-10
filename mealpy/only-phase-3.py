@@ -2,8 +2,9 @@
 Sadece Aşama 3 — Tam Matris
 Küratörlü sabit alt küme (TOP10 + literatür + MUST); Aşama 1/2 taraması yok.
 Mealpy tam adları PHASE3_FIXED_ALGORITHM_FULL_NAMES içinde; sınıflar
-get_all_algorithms_v3() ile eşlenir; `SA.GaussianSA` gibi Original olmayan
-sınıflar `_phase3_extra_mealpy_entries()` ile eklenir.
+get_all_algorithms_v3() ile eşlenir; kara listede kalan veya katalogda
+olmayan sınıflar (`SA.GaussianSA`, `FFA.OriginalFFA` vb.)
+`_phase3_extra_mealpy_entries()` ile eklenir.
 N kez tekrar; çıktılar results/phase3/last/<başlangıç..>/ altına yazılır
 (--start-run veya ONLY_PHASE3_RUN_START, varsayılan 7).
 
@@ -29,7 +30,7 @@ PHASE3_DB_PATH = os.path.join(RESULTS_DIR, "assignment_experiments.sqlite")
 PHASE3_DB_TABLE = "mealpy-comparision"
 DB_WRITE_ENABLED = True
 
-# Seçilmiş 27 algoritma (sıra: TOP10 → LİTERATÜR → MUST → ekler); Mealpy full_name
+# Seçilmiş sabit alt küme (sıra: TOP10 → LİTERATÜR → MUST → ekler); Mealpy full_name
 PHASE3_FIXED_ALGORITHM_FULL_NAMES = (
     # TOP10
     "HGS.OriginalHGS",
@@ -45,6 +46,8 @@ PHASE3_FIXED_ALGORITHM_FULL_NAMES = (
     "WOA.OriginalWOA",
     "GWO.OriginalGWO",
     "PSO.OriginalPSO",
+    "DE.OriginalDE",
+    "GA.OriginalGA",
     # MUST
     "OOA.OriginalOOA",
     "SFOA.OriginalSFOA",
@@ -59,7 +62,9 @@ PHASE3_FIXED_ALGORITHM_FULL_NAMES = (
     "GBO.OriginalGBO",
     "ASO.OriginalASO",
     "AVOA.OriginalAVOA",
+    "BA.OriginalBA",
     "SA.GaussianSA",  # Gaussian Simulated Annealing (katalogda yok, aşağıda eklenir)
+    "FFA.OriginalFFA",  # Firefly; kara listede, aşağıda eklenir
 )
 
 # Tekrar sayısı (ardışık klasör: start, start+1, …)
@@ -273,10 +278,11 @@ def l2_normalize_users(matrix):
 
 def _phase3_extra_mealpy_entries():
     """
-    get_all_algorithms_v3 yalnızca sınıf adı Original* olanları toplar.
-    GaussianSA vb. burada tamamlanır.
+    Katalog dışı veya BLACKLIST nedeniyle get_all_algorithms_v3 içinde olmayan
+    sınıflar (GaussianSA, OriginalFFA vb.) burada tamamlanır.
     """
     from mealpy.physics_based import SA
+    from mealpy.swarm_based import FFA
 
     return {
         "SA.GaussianSA": {
@@ -284,6 +290,12 @@ def _phase3_extra_mealpy_entries():
             "module": "mealpy.physics_based.SA",
             "class_name": "GaussianSA",
             "class": SA.GaussianSA,
+        },
+        "FFA.OriginalFFA": {
+            "full_name": "FFA.OriginalFFA",
+            "module": "mealpy.swarm_based.FFA",
+            "class_name": "OriginalFFA",
+            "class": FFA.OriginalFFA,
         },
     }
 
@@ -392,7 +404,7 @@ Bu çalıştırmada üretilen dosyalar:
   - FINAL_RECOMMENDATIONS.csv (üst 5 öneri)
   - behavior_analysis.csv
 
-Kaynak: only-phase-3.py → PHASE3_FIXED_ALGORITHM_FULL_NAMES (25 seçilmiş)
+Kaynak: only-phase-3.py → PHASE3_FIXED_ALGORITHM_FULL_NAMES (sabit alt küme)
 Paralel Aşama 3 işçi: {PHASE3_PARALLEL_WORKERS} (--workers veya ONLY_PHASE3_WORKERS)
 Bu oturum: {run_ordinal}. tekrar / {n_repeats} | Klasör no: {run_idx}
 """
@@ -430,7 +442,7 @@ if __name__ == "__main__":
     )
     full_matrix = l2_normalize_users(full_matrix_raw)
     print("ML-100K matrisine satır-bazlı L2 normalization uygulandı.")
-    # Aşama 1/2 yok: sabit 25'li liste + mealpy sınıf eşlemesi
+    # Aşama 1/2 yok: sabit liste + mealpy sınıf eşlemesi (+ ek katalog girdileri)
     all_algos = get_all_algorithms_v3()
     algos_phase3 = load_algorithms_by_full_names(
         PHASE3_FIXED_ALGORITHM_FULL_NAMES, all_algos

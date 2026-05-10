@@ -37,6 +37,7 @@ import argparse
 import os
 import sys
 import time
+import warnings
 from concurrent.futures import ProcessPoolExecutor
 from typing import Optional
 
@@ -106,7 +107,7 @@ LOF_N_NEIGHBORS   = 20
 LOF_CONTAMINATION = 'auto'
 
 ALGO_CONFIG = [
-    ('B0_KMEANS',  'KMEANS', None),
+    ('B0_KMEANS',  None, None),
     ('B1_HHO',     'HHO.OriginalHHO', None),
     ('B2_HGS',     'HGS.OriginalHGS', None),
     ('H1_HHO+HGS', 'HHO.OriginalHHO', 'HGS.OriginalHGS'),
@@ -124,7 +125,9 @@ ALGO_CONFIG = [
     ('LIT_CIRCLESA', 'CircleSA.OriginalCircleSA', None),
     ('LIT_GOA', 'GOA.OriginalGOA', None),
     ('LIT_GWO', 'GWO.OriginalGWO', None),
-    ('LIT_SSA', 'SSA.DevSSA', None),
+    ('LIT_SSA', 'SSA.OriginalSSA', None),
+    ('LIT_PSO', 'PSO.OriginalPSO', None),
+    ('HA_AVOAHGS', None, None),
 ]
 
 ALGO_LABELS = [c[0] for c in ALGO_CONFIG]
@@ -496,6 +499,26 @@ def run_memetic_hybrid(base_info, matrix, K, init,
 # KAYDET
 # ============================================================
 
+def _sklearn_kmeans_init(args) -> str:
+    """CLI --init değerini sklearn KMeans init= string'ine çevir."""
+    v = 'kmeans++'
+    if args is not None:
+        v = getattr(args, 'init', 'kmeans++') or 'kmeans++'
+    return 'random' if v == 'random' else 'k-means++'
+
+
+def compute_memberships(X, centroids, m=2.0):
+    n_users = X.shape[0]
+    k = centroids.shape[0]
+    memberships = np.zeros((n_users, k), dtype=np.float32)
+    for u in range(n_users):
+        dists = np.linalg.norm(X[u] - centroids, axis=1)
+        dists = np.maximum(dists, 1e-10)
+        inv = 1.0 / (dists ** (2 / (m - 1)))
+        memberships[u] = inv / inv.sum()
+    return memberships
+
+
 def save_assignment(assignments, gray_mask, best_sol, best_fit,
                     save_dir, extra_data=None, label=None, K=None, args=None,
                     run_id=None, seed=None, memberships=None):
@@ -554,12 +577,20 @@ def save_assignment(assignments, gray_mask, best_sol, best_fit,
                 prep_parts.append(f'pca{int(args.pca*100)}pct')
             else:
                 prep_parts.append(f'pca{int(args.pca)}')
-        if getattr(args, 'wnmf_features', None):
-            prep_parts.append(f'wnmf{args.wnmf_features}')
-            prep_parts.append(
-                f"{getattr(args, 'wnmf_init', 'inmed')}_trim"
-                f"{getattr(args, 'inmed_trim_low', 5.0):g}_{getattr(args, 'inmed_trim_high', 95.0):g}"
-            )
+        # WNMF latent boyutu: yeni stilde --feature-extraction wnmf --svd-components N
+        # eski stilde --wnmf-features N. Klasör adıyla tutarlı tek bir wnmf{N} yaz.
+        wnmf_k_for_db = None
+        if getattr(args, 'feature_extraction', None) == 'wnmf':
+            wnmf_k_for_db = getattr(args, 'wnmf_features', None) or getattr(args, 'svd_components', None)
+        elif getattr(args, 'wnmf_features', None):
+            wnmf_k_for_db = args.wnmf_features
+        if wnmf_k_for_db is not None:
+            prep_parts.append(f'wnmf{wnmf_k_for_db}')
+            if getattr(args, 'wnmf_features', None):
+                prep_parts.append(
+                    f"{getattr(args, 'wnmf_init', 'inmed')}_trim"
+                    f"{getattr(args, 'inmed_trim_low', 5.0):g}_{getattr(args, 'inmed_trim_high', 95.0):g}"
+                )
         preprocessing = '_'.join(prep_parts) if prep_parts else 'none'
 
         # dataset adını belirle
@@ -594,6 +625,46 @@ def save_assignment(assignments, gray_mask, best_sol, best_fit,
 # TEK ALGORİTMA ÇALIŞTIR
 # ============================================================
 
+def _refine_centroids_with_kmeans(
+    matrix: np.ndarray,
+    best_sol: np.ndarray,
+    K: int,
+    max_iter: int = 300,
+    seed: int = 42,
+):
+    """Meta-sezgisel centroidleri sklearn KMeans ile rafine eder.
+
+    - init=centroids, n_init=1: HHO/HGS/AVOA gibi optimizer'ın bulduğu noktaları
+      başlangıç olarak kullanır; KMeans birkaç iterasyonda yerel Lloyd optimumuna
+      sürükler ve dejenere/boş kümeleri otomatik onarır.
+    - Geri dönüş: (refined_sol_flat, refined_inertia, refined_labels, n_active).
+    - Hata olursa orijinal best_sol'u döndürür.
+    """
+    try:
+        from sklearn.cluster import KMeans
+
+        n_features = matrix.shape[1]
+        centroids = np.asarray(best_sol, dtype=np.float64).reshape(K, n_features)
+        km = KMeans(
+            n_clusters=K,
+            init=centroids,
+            n_init=1,
+            max_iter=int(max_iter),
+            random_state=int(seed),
+        )
+        km.fit(matrix)
+        n_active = int(len(np.unique(km.labels_)))
+        return (
+            km.cluster_centers_.flatten().astype(best_sol.dtype, copy=False),
+            float(km.inertia_),
+            km.labels_.astype(np.int32, copy=False),
+            n_active,
+        )
+    except Exception as exc:
+        print(f"    KMeans refinement başarısız: {exc}")
+        return None
+
+
 def _run_one_core(
     label,
     g_name,
@@ -625,20 +696,44 @@ def _run_one_core(
         f"\n  [{label}] başlıyor "
         f"(gray sheep: {mode_str}, küme metrik: {cluster_metric}, init: {init_mode})..."
     )
-    t0   = time.time()
-    init = _multi_start_init(
-        matrix, K=K, pop_size=POP_SIZE, seed=seed, n_restarts=10,
-        metric=cluster_metric, init_mode=init_mode,
-    )
-
+    t0 = time.time()
+    # sklearn KMeans dalı `init` popülasyonunu kullanmaz; önceden _multi_start_init
+    # çağırmak gereksiz MkMeans++ maliyeti ve kafa karışıklığı yaratırdı.
     if g_name == 'KMEANS':
+        init = []
+    else:
+        init = _multi_start_init(
+            matrix, K=K, pop_size=POP_SIZE, seed=seed, n_restarts=10,
+            metric=cluster_metric, init_mode=init_mode,
+        )
+
+    if label == 'B0_KMEANS':
+        from sklearn.cluster import KMeans
+
+        user_matrix = matrix
+        km = KMeans(n_clusters=K, n_init=10, max_iter=500, random_state=42)
+        km.fit(user_matrix)
+        best_sol = km.cluster_centers_.flatten()
+        best_fit = float(km.inertia_)
+        assignments = km.labels_
+    elif label == 'HA_AVOAHGS':
+        from optimizers.HA_AVOAHGS import HA_AVOAHGS
+        model = HA_AVOAHGS(epoch=500, pop_size=30, hgs_rate=0.3)
+        problem = _make_problem(matrix, K, metric=cluster_metric)
+        try:
+            model.solve(problem, starting_solutions=init[:pop_size])
+        except TypeError:
+            model.solve(problem)
+        best_sol = model.g_best.solution
+        best_fit = float(model.g_best.target.fitness)
+    elif g_name == 'KMEANS':
         from sklearn.cluster import KMeans
         from sklearn.preprocessing import normalize
 
         matrix_norm = normalize(matrix, norm='l2')
         kmeans = KMeans(
             n_clusters=K,
-            init='k-means++',
+            init=_sklearn_kmeans_init(args),
             n_init=10,
             random_state=seed,
             max_iter=300,
@@ -711,15 +806,49 @@ def _run_one_core(
             metric=cluster_metric,
         )
 
-    memberships = None
-    if g_name != 'KMEANS':
-        _, assignments = compute_wcss_fast(
-            matrix, best_sol, K, metric=cluster_metric,
+    # === KMeans REFINEMENT (opsiyonel) ===
+    # Meta-sezgisel optimizer'ın bulduğu centroidleri sklearn KMeans ile rafine et.
+    # Boş/dejenere kümeleri Lloyd iterasyonuyla onarır; B0_KMEANS ve dahili KMEANS
+    # zaten KMeans olduğundan onlara dokunulmaz.
+    _refined_labels = None  # KMeans Lloyd çıktısı (boş küme garantili yok)
+    refine_enabled = bool(getattr(args, 'kmeans_refine', False))
+    is_kmeans_branch = (label == 'B0_KMEANS') or (g_name == 'KMEANS')
+    if refine_enabled and not is_kmeans_branch:
+        max_iter = int(getattr(args, 'kmeans_refine_iter', 300))
+        result = _refine_centroids_with_kmeans(
+            matrix, best_sol, K, max_iter=max_iter, seed=seed,
         )
+        if result is not None:
+            refined_sol, refined_inertia, refined_labels, n_active = result
+            print(
+                f"    KMeans refinement: aktif küme {n_active}/{K}, "
+                f"inertia={refined_inertia:.4f}"
+            )
+            best_sol = refined_sol
+            _refined_labels = refined_labels
+            # best_fit'i optimizer'ın raporladığı değerde bırak (algoritmalar arası
+            # adil karşılaştırma için). best_wcss aşağıda yine cluster_metric ile
+            # yeniden hesaplanıyor.
+
+    memberships = None
+    if g_name != 'KMEANS' and label != 'B0_KMEANS':
+        if _refined_labels is not None:
+            # KMeans refinement yapıldıysa onun labels'ını kullan
+            # (Lloyd garantili: boş küme yok). cluster_metric ne olursa olsun
+            # geometrik olarak en doğru atama refinement'ın kendi labels'ı.
+            assignments = _refined_labels
+        else:
+            _, assignments = compute_wcss_fast(
+                matrix, best_sol, K, metric=cluster_metric,
+            )
         if cluster_metric == 'fuzzy':
-            _, assignments, memberships = compute_fcm_objective(
+            # FCM membership için yine de centroidlerden hesapla; refined labels
+            # crisp olduğu için soft-membership ayrıca üretilir.
+            _, fcm_assignments, memberships = compute_fcm_objective(
                 matrix, best_sol, K, m=2.0,
             )
+            if _refined_labels is None:
+                assignments = fcm_assignments
     elif cluster_metric == 'fuzzy':
         _, assignments, memberships = compute_fcm_objective(
             matrix, best_sol, K, m=2.0,
@@ -750,6 +879,14 @@ def _run_one_core(
     best_wcss, _ = compute_wcss_fast(
         matrix, best_sol, K, metric=cluster_metric,
     )
+
+    if getattr(args, 'fcm', False):
+        from sklearn.preprocessing import normalize
+
+        X_cluster = normalize(matrix, norm='l2')
+        centroids = best_sol.reshape(K, matrix.shape[1])
+        memberships = compute_memberships(X_cluster, centroids, m=2.0)
+        print(f'FCM memberships kaydedildi: {memberships.shape}')
 
     save_assignment(
         assignments, gray_mask, best_sol, best_wcss,
@@ -1032,7 +1169,7 @@ def prepare_matrix_for_clustering(
     wnmf_init_method='inmed',
     inmed_trim=(5.0, 95.0),
 ):
-    """Sıra: prune → z-score → PCA → WNMF (--pca ile --wnmf-features birlikte CLI’de yasak)."""
+    """Sıra: prune → z-score → PCA → WNMF (--pca ile DEPRECATED --wnmf-features birlikte CLI’de yasak)."""
     from sklearn.preprocessing import MinMaxScaler, normalize
 
     matrix = prune_sparse_matrix(
@@ -1060,15 +1197,25 @@ def prepare_matrix_for_clustering(
         R_matrix = MaxAbsScaler().fit_transform(R_matrix)
 
     if feature_extraction == 'svd':
-        from sklearn.decomposition import TruncatedSVD
+        from sklearn.decomposition import NMF
         from sklearn.preprocessing import normalize
-        svd = TruncatedSVD(n_components=svd_components, random_state=42)
-        X_cluster = normalize(svd.fit_transform(R_matrix))
+        nmf = NMF(
+            n_components=svd_components,
+            random_state=42,
+            max_iter=1000,
+            init='nndsvda',
+        )
+        X_cluster = normalize(nmf.fit_transform(R_matrix))
+        print(f"NMF reconstruction error: {nmf.reconstruction_err_:.2f}")
     elif feature_extraction == 'nmf':
         from sklearn.decomposition import NMF
         from sklearn.preprocessing import normalize
         nmf = NMF(n_components=svd_components, random_state=42, max_iter=300)
-        X_cluster = normalize(nmf.fit_transform(R_matrix))
+        R_nmf = np.asarray(R_matrix, dtype=np.float32)
+        min_val = float(np.min(R_nmf))
+        if min_val < 0.0:
+            R_nmf = np.maximum(R_nmf, 0.0)  # sıfırla, kaydırma
+        X_cluster = normalize(nmf.fit_transform(R_nmf))
     elif feature_extraction == 'pca':
         from sklearn.decomposition import PCA
         from sklearn.preprocessing import normalize
@@ -1113,11 +1260,14 @@ def run_dataset(dataset_name, matrix, K, out_root, algo_filter=None,
     print(f"Init modu   : {init_mode}")
     print(f"{'='*60}")
 
-    # K=default için suffix yok, farklı K için _k{K} eklenir
+    # K=default için suffix yok, farklı K için _k{K} eklenir (assign_suffix boşken)
     default_k = K_100K_DEFAULT if dataset_name == 'ml100k' else K_1M_DEFAULT
     k_suffix  = '' if K == default_k else f'_k{K}'
 
+    skip_existing = bool(getattr(args, 'skip_existing', False)) if args is not None else False
+
     jobs_meta = []
+    skipped_existing = []
     for label, g_name, l_name in ALGO_CONFIG:
         if algo_filter and label not in algo_filter:
             print(f"  [{label}] atlandı (filtre)")
@@ -1125,11 +1275,29 @@ def run_dataset(dataset_name, matrix, K, out_root, algo_filter=None,
         assign_suffix = ''
         if args is not None:
             assign_suffix = f'_{args.preprocess}_{args.feature_extraction}{args.svd_components}_k{K}'
+            # KMeans refinement aktifse klasör adında belirt (B0_KMEANS hariç,
+            # zaten KMeans olduğu için refinement uygulanmaz).
+            if getattr(args, 'kmeans_refine', False) and label != 'B0_KMEANS':
+                assign_suffix += '_kmref'
+            # K zaten assign_suffix sonunda; klasörde ..._k{K}_..._k{K} tekrar etmesin
+            k_suffix = ''
         save_dir = os.path.join(out_root, dataset_name, f"{label}{k_suffix}{out_suffix}{assign_suffix}")
+
+        if skip_existing and os.path.exists(os.path.join(save_dir, 'assignments.npy')):
+            print(f"  [{label}] atlandı (--skip-existing) -> {save_dir}")
+            skipped_existing.append((label, save_dir))
+            continue
+
         jobs_meta.append((label, g_name, l_name, save_dir))
 
     if not jobs_meta:
-        print(f"\n{dataset_name.upper()} — çalıştırılacak algoritma yok.")
+        if skipped_existing:
+            print(
+                f"\n{dataset_name.upper()} — tüm algoritmalar mevcut "
+                f"({len(skipped_existing)} klasör --skip-existing ile atlandı)."
+            )
+        else:
+            print(f"\n{dataset_name.upper()} — çalıştırılacak algoritma yok.")
         return
 
     nw = _resolve_pool_workers(max_workers, len(jobs_meta))
@@ -1234,6 +1402,11 @@ def parse_args():
         help="LOF tabanlı gray sheep kullan (default: sabit 80. percentile)"
     )
     p.add_argument(
+        '--skip-existing', action='store_true',
+        help='Hedef klasörde assignments.npy varsa o algoritmayı yeniden çalıştırma, '
+             'mevcut yolu yazıp atla.',
+    )
+    p.add_argument(
         '--no-gray-sheep', action='store_true',
         help='Gray sheep tespitini tamamen kapat (LOF/percentile yok)',
     )
@@ -1251,6 +1424,16 @@ def parse_args():
              "Verilmezse paper-mode'da random, diğer modlarda mkpp.",
     )
     p.add_argument(
+        '--init',
+        choices=['random', 'kmeans++'],
+        default='kmeans++',
+        help='Başlangıç merkezi seçim yöntemi (yalnızca sklearn KMeans, B0_KMEANS)',
+    )
+    p.add_argument(
+        '--fcm', action='store_true',
+        help='FCM soft membership üret',
+    )
+    p.add_argument(
         '--min-user-ratings', type=int, default=5, metavar='N',
         help='Veri budama: kullanıcı başına minimum rating sayısı (default: 5)',
     )
@@ -1261,13 +1444,13 @@ def parse_args():
     p.add_argument(
         '--wnmf-features', type=int, default=None,
         metavar='K',
-        help='WNMF ile K boyutlu kullanıcı latent matris çıkar. '
-             'Bu matris metasezgisel clustering girişi olur. '
-             'Öneri için ham rating kullanılır. (örn: --wnmf-features 20)'
+        help='[DEPRECATED] WNMF latent boyutu. Kaldırılacak; yerine '
+             '--feature-extraction wnmf --svd-components K kullanın. '
+             'Geçici olarak verilirse otomatik olarak bu eşdeğere dönüştürülür.',
     )
     p.add_argument(
         '--wnmf-init', choices=['random', 'inmed'], default='inmed',
-        help='--wnmf-features için WNMF başlangıcı: random veya inmed (default: inmed)',
+        help='WNMF (--feature-extraction wnmf) başlangıcı: random veya inmed (default: inmed)',
     )
     p.add_argument(
         '--inmed-trim-low', type=float, default=5.0, metavar='P',
@@ -1285,13 +1468,14 @@ def parse_args():
     )
     p.add_argument(
         '--save-wnmf-u', type=str, default=None, metavar='DIR',
-        help='--wnmf-features ile: U matrisini DIR içine ml100k_U.npy / ml1m_U.npy olarak kaydet.',
+        help='--feature-extraction wnmf iken: WNMF U matrisini DIR içine '
+             'ml100k_U.npy / ml1m_U.npy olarak kaydet.',
     )
     p.add_argument(
         '--pca', type=float, default=None, metavar='VAR',
         dest='pca_variance',
         help='PCA: birikimli açıklanan varyans eşiği (0–1, örn: 0.80). '
-             '--wnmf-features ile birlikte kullanılamaz.',
+             'DEPRECATED --wnmf-features ile birlikte kullanılamaz.',
     )
     p.add_argument(
         '--k', nargs='+', type=int, default=None, metavar='K',
@@ -1332,6 +1516,16 @@ def parse_args():
         help='Boyut indirgeme yöntemi')
     p.add_argument('--svd-components', type=int, default=20,
         help='SVD/PCA/NMF bileşen sayısı')
+    p.add_argument(
+        '--kmeans-refine', action='store_true',
+        help='Meta-sezgisel optimizer bittikten sonra centroidleri sklearn KMeans '
+             '(init=centroids, n_init=1) ile rafine et. Boş/dejenere kümeleri '
+             'Lloyd iterasyonuyla onarır. B0_KMEANS / dahili KMEANS dallarına etkisi yok.'
+    )
+    p.add_argument(
+        '--kmeans-refine-iter', type=int, default=300, metavar='N',
+        help='KMeans refinement için max_iter (default: 300; önerilen 100-500).'
+    )
     args = p.parse_args()
     if args.k is not None and (args.k_100k is not None or args.k_1m is not None):
         p.error('--k (tek veya çoklu) ile --k-100k / --k-1m birlikte kullanılamaz')
@@ -1339,7 +1533,29 @@ def parse_args():
         if not (0 < args.pca_variance <= 1):
             p.error('--pca (0, 1] aralığında olmalı (örn. 0.80)')
     if args.pca_variance is not None and args.wnmf_features is not None:
-        p.error('--pca ile --wnmf-features birlikte kullanılamaz')
+        p.error('--pca ile DEPRECATED --wnmf-features birlikte kullanılamaz')
+    # Eski API köprüsü: --wnmf-features verilmişse feature-extraction'ı zorla
+    # ve --svd-components ile senkronla. Böylece klasör adında tek bir _wnmf{N}
+    # yer alır ve latent boyut çakışması (wnmf_features != svd_components) imkânsızlaşır.
+    if args.wnmf_features is not None:
+        warnings.warn(
+            '--wnmf-features is deprecated and will be removed in a future version; '
+            'use --feature-extraction wnmf --svd-components N instead.',
+            FutureWarning,
+            stacklevel=2,
+        )
+        if args.feature_extraction != 'wnmf':
+            print(
+                f"  Not: --wnmf-features={args.wnmf_features} verildi; "
+                f"--feature-extraction otomatik olarak 'wnmf' yapıldı."
+            )
+            args.feature_extraction = 'wnmf'
+        if args.svd_components != args.wnmf_features:
+            print(
+                f"  Not: --svd-components={args.svd_components} -> "
+                f"{args.wnmf_features} olarak güncellendi (--wnmf-features ile eşleşti)."
+            )
+            args.svd_components = args.wnmf_features
     if args.min_user_ratings < 0:
         p.error('--min-user-ratings 0 veya daha büyük olmalı')
     if args.min_item_ratings < 0:
@@ -1348,14 +1564,18 @@ def parse_args():
         p.error('--inmed-trim-low ve --inmed-trim-high için 0 <= low < high <= 100 olmalı')
     args.pca = args.pca_variance
     if args.cluster_metric == 'auto':
-        args.cluster_metric = 'euclidean' if args.wnmf_features else 'pearson'
+        args.cluster_metric = (
+            'euclidean'
+            if (args.wnmf_features is not None or args.feature_extraction == 'wnmf')
+            else 'pearson'
+        )
     if args.no_gray_sheep and args.lof:
         print('  Uyarı: --no-gray-sheep aktif; --lof yok sayılıyor.')
         args.lof = False
     user_init_mode = args.init_mode
     if args.paper_mode:
         if args.wnmf_features is not None:
-            p.error('--paper-mode ile --wnmf-features birlikte kullanılamaz (PCA preset kullanılır)')
+            p.error('--paper-mode ile DEPRECATED --wnmf-features birlikte kullanılamaz (PCA preset kullanılır)')
         if args.lof:
             print('  Uyarı: --paper-mode aktif; --lof yok sayılıyor (gray sheep kapalı).')
             args.lof = False
@@ -1425,11 +1645,17 @@ if __name__ == '__main__':
                     prep_parts.append(f'pca{int(args.pca * 100)}pct')
                 else:
                     prep_parts.append(f'pca{int(args.pca)}')
-            if getattr(args, 'wnmf_features', None):
-                prep_parts.append(f'wnmf{args.wnmf_features}')
-                prep_parts.append(
-                    f"{args.wnmf_init}_trim{args.inmed_trim_low:g}_{args.inmed_trim_high:g}"
-                )
+            wnmf_k_for_db_run = None
+            if getattr(args, 'feature_extraction', None) == 'wnmf':
+                wnmf_k_for_db_run = getattr(args, 'wnmf_features', None) or getattr(args, 'svd_components', None)
+            elif getattr(args, 'wnmf_features', None):
+                wnmf_k_for_db_run = args.wnmf_features
+            if wnmf_k_for_db_run is not None:
+                prep_parts.append(f'wnmf{wnmf_k_for_db_run}')
+                if getattr(args, 'wnmf_features', None):
+                    prep_parts.append(
+                        f"{args.wnmf_init}_trim{args.inmed_trim_low:g}_{args.inmed_trim_high:g}"
+                    )
             preprocessing_run = '_'.join(prep_parts) if prep_parts else 'none'
             db_run_id = start_run(
                 command=' '.join(sys.argv),
@@ -1527,8 +1753,12 @@ if __name__ == '__main__':
         f'_pca{int(round(args.pca_variance * 100))}pct'
         if args.pca_variance is not None else ''
     )
+    # WNMF init / trim parametre etiketi. Latent boyut zaten assign_suffix'in
+    # `_wnmf{svd_components}` kısmında bir kez yazılıyor; burada tekrar etmiyoruz.
+    # Eski API köprüsü (parse_args içinde) sayesinde --wnmf-features verildiğinde
+    # feature-extraction='wnmf' ve svd_components otomatik senkronlanmıştır.
     wnmf_suffix = (
-        f'_wnmf{args.wnmf_features}_{args.wnmf_init}_trim{args.inmed_trim_low:g}_{args.inmed_trim_high:g}'
+        f'_{args.wnmf_init}_trim{args.inmed_trim_low:g}_{args.inmed_trim_high:g}'
         if args.wnmf_features is not None else ''
     )
     metric_suffix_map = {
@@ -1560,7 +1790,7 @@ if __name__ == '__main__':
                 wnmf_init_method=args.wnmf_init,
                 inmed_trim=(args.inmed_trim_low, args.inmed_trim_high),
             )
-            if args.save_wnmf_u and args.wnmf_features:
+            if args.save_wnmf_u and args.feature_extraction == 'wnmf':
                 os.makedirs(args.save_wnmf_u, exist_ok=True)
                 u_path = os.path.join(args.save_wnmf_u, 'ml100k_U.npy')
                 np.save(u_path, matrix_100k)
@@ -1613,7 +1843,7 @@ if __name__ == '__main__':
                 wnmf_init_method=args.wnmf_init,
                 inmed_trim=(args.inmed_trim_low, args.inmed_trim_high),
             )
-            if args.save_wnmf_u and args.wnmf_features:
+            if args.save_wnmf_u and args.feature_extraction == 'wnmf':
                 os.makedirs(args.save_wnmf_u, exist_ok=True)
                 u_path = os.path.join(args.save_wnmf_u, 'ml1m_U.npy')
                 np.save(u_path, matrix_1m)

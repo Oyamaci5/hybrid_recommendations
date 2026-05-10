@@ -245,6 +245,20 @@ def make_fitness_function(matrix, K, metric='pearson'):
         nonlocal baseline
         wcss, assignments = compute_wcss_fast(matrix, solution, K, metric=metric)
 
+        # === YENİ CEZA SİSTEMİ ===
+        # min_cluster_size: ortalama küme boyutunun ~%20'si, ama en az 3.
+        # K=14, n=943 → 943//(14*5)=13 → 3 ile max → 13.
+        min_cluster_size = max(3, len(matrix) // (K * 5))
+        cluster_sizes = np.bincount(assignments, minlength=K)
+
+        # 1. Tamamen boş kümeler
+        n_empty = int(np.sum(cluster_sizes == 0))
+        # 2. Çok küçük kümeler (min_cluster_size altı, boş hariç)
+        n_tiny = int(np.sum((cluster_sizes > 0) & (cluster_sizes < min_cluster_size)))
+        # 3. Aşırı büyük kümeler (ortalamanın 3 katı üstü)
+        avg_size = len(matrix) / K
+        n_huge = int(np.sum(cluster_sizes > avg_size * 3))
+
         idx = _sample_indices(len(matrix), max_n=300)
         sub_x = matrix[idx]
         sub_y = assignments[idx]
@@ -277,9 +291,14 @@ def make_fitness_function(matrix, K, metric='pearson'):
         norm_sil = obj_sil / baseline['sil']
         norm_ch = obj_ch / baseline['ch']
         fitness_base = float(0.50 * norm_wcss + 0.25 * norm_sil + 0.25 * norm_ch)
-        active_clusters = len(np.unique(assignments))
-        missing_ratio = max(0.0, 1.0 - active_clusters / K)
-        penalty = fitness_base * missing_ratio * 2.0
+
+        # === SABİT + ORANSAL KARMA CEZA ===
+        penalty = 0.0
+        penalty += n_empty * 0.5                              # boş küme başına sabit ceza
+        penalty += n_tiny  * 0.3                              # küçük küme başına sabit ceza
+        penalty += n_huge  * 0.2                              # devasa küme başına sabit ceza
+        penalty += fitness_base * (n_empty + n_tiny) * 0.5    # oransal ek ceza
+
         return float(fitness_base + penalty)
 
     def fitness(solution):
