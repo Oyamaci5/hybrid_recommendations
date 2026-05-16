@@ -517,51 +517,45 @@
       <details>
         <summary>Early Stop (mealpy tek-algoritma)</summary>
 
-        <motion class="row" style="display:none"></motion>
-        <motion></motion>
-
-        <motion></motion>
-
         <div class="row">
-          <motion></motion>
-          <motion></motion>
-          <motion></motion>
-          <motion></motion>
-        </div>
-
-        <div class="row">
-          <motion></motion>
           <div class="label">Early stop açık
             <span class="arg">--early-stop</span>
-            <motion></motion>
-            <motion></motion>
             <div class="desc">HHO, GWO, MFO vb. tek-algoritma koşularında epoch'ları
               <code>--early-stop-block</code> boyutunda çalıştırır; iyileşme durunca durur.
-              Hibrit (<code>H4_MFO+HHO</code>) ve özel optimizer'lar (IWO_HHO, LF_HHO) etkilenmez.</motion>
+              Hibrit (<code>H4_MFO+HHO</code>) ve özel optimizer'lar (IWO_HHO, LF_HHO) etkilenmez.</div>
           </div>
           <div class="control">
             <label class="check"><input type="checkbox" data-arg="--early-stop" /> Açık</label>
-          </motion>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Max epoch
+            <span class="arg">--early-stop-max-epoch</span>
+            <div class="desc">Erken durmazsa bu epoch'ta biter (default: 200).</div>
+          </div>
+          <div class="control">
+            <input type="number" data-arg="--early-stop-max-epoch" data-default="200" placeholder="200" min="1" />
+          </div>
         </div>
 
         <div class="row">
           <div class="label">Patience (blok)
             <span class="arg">--early-stop-patience</span>
-            <motion></motion>
-            <div class="desc">Ardışık kaç blok iyileşme yoksa dur (default: 10).</div>
+            <div class="desc">Ardışık kaç blok iyileşme yoksa dur (default: 8 → 40 epoch).</div>
           </div>
           <div class="control">
-            <input type="number" data-arg="--early-stop-patience" data-default="10" placeholder="10" min="1" />
+            <input type="number" data-arg="--early-stop-patience" data-default="8" placeholder="8" min="1" />
           </div>
         </div>
 
         <div class="row">
           <div class="label">Tolerance
             <span class="arg">--early-stop-tolerance</span>
-            <div class="desc">Minimum fitness iyileşmesi (default: 1e-6).</motion>
+            <div class="desc">Minimum fitness iyileşmesi (default: 1e-5).</div>
           </div>
           <div class="control">
-            <input type="text" data-arg="--early-stop-tolerance" data-default="1e-6" placeholder="1e-6" />
+            <input type="text" data-arg="--early-stop-tolerance" data-default="1e-5" placeholder="1e-5" />
           </div>
         </div>
 
@@ -570,7 +564,6 @@
             <span class="arg">--early-stop-block</span>
             <div class="desc">Her blokta kaç epoch çalıştırılır (default: 5).</div>
           </div>
-          <motion></motion>
           <div class="control">
             <input type="number" data-arg="--early-stop-block" data-default="5" placeholder="5" min="1" />
           </div>
@@ -875,6 +868,7 @@
           <div class="control">
             <select data-arg="--similarity" data-default="pearson">
               <option value="pearson" selected>pearson</option>
+              <option value="pearson_iuf">pearson_iuf (IUF)</option>
               <option value="cosine">cosine</option>
             </select>
           </div>
@@ -1712,7 +1706,7 @@
             <tr><td><code>--no-cluster-avg</code></td><td>Cluster-average baseline'ı kapatır.</td></tr>
             <tr><td><code>--no-cluster-knn</code></td><td>Cluster-KNN'i kapatır.</td></tr>
             <tr><td><code>--knn N</code></td><td>Her tahmin için en fazla N komşu. <b>Küme boyutu ile sınırlanır</b>; küme küçükse N'e ulaşamaz.</td></tr>
-            <tr><td><code>--similarity pearson|cosine</code></td><td>KNN benzerlik metriği.</td></tr>
+            <tr><td><code>--similarity pearson|pearson_iuf|cosine</code></td><td>KNN benzerlik metriği (pearson_iuf = IUF ağırlıklı Pearson).</td></tr>
             <tr><td><code>--min-common N</code></td><td>İki kullanıcı arası benzerlik için minimum ortak film sayısı.</td></tr>
             <tr><td><code>--knn-mode cluster|full_soft</code></td><td><code>cluster</code>: küme içi / soft-blend; <code>full_soft</code>: tüm kullanıcılar, membership×rating (<code>memberships.npy</code> gerekir).</td></tr>
             <tr><td><code>--expand-knn</code></td><td>Küme içinde N komşu yoksa diğer kümelerden de bak. <code>full_soft</code> modunda yok sayılır.</td></tr>

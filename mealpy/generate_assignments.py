@@ -104,6 +104,12 @@ BASELINE_EPOCH = 100
 POP_SIZE       = 30
 SEED           = 42
 
+# Early-stop (--early-stop): blok bazlı kontrol; erken durmazsa max epoch'ta biter
+EARLY_STOP_MAX_EPOCH = 200   # 8 blok × patience 8 = en fazla 40 epoch erken; üst sınır 200
+EARLY_STOP_BLOCK_SIZE = 5
+EARLY_STOP_PATIENCE = 8      # 8 blok = 40 epoch iyileşme yoksa dur
+EARLY_STOP_TOLERANCE = 1e-5
+
 LOF_N_NEIGHBORS   = 20
 LOF_CONTAMINATION = 'auto'
 
@@ -326,9 +332,9 @@ def run_single_with_early_stop(
     max_epoch,
     pop_size,
     metric: str = 'pearson',
-    patience: int = 10,
-    tolerance: float = 1e-6,
-    block_size: int = 5,
+    patience: int = EARLY_STOP_PATIENCE,
+    tolerance: float = EARLY_STOP_TOLERANCE,
+    block_size: int = EARLY_STOP_BLOCK_SIZE,
 ):
     """
     mealpy epoch callback olmadığı için optimizasyonu bloklar halinde çalıştırır.
@@ -343,6 +349,7 @@ def run_single_with_early_stop(
     best_sol = None
     no_improve = 0
     actual_epochs = 0
+    convergence_history: list[dict] = []
 
     lb = np.array(problem["bounds"].lb)
     ub = np.array(problem["bounds"].ub)
@@ -370,6 +377,11 @@ def run_single_with_early_stop(
 
         new_fit = float(block_model.g_best.target.fitness)
         actual_epochs += epochs
+        convergence_history.append({
+            'epoch': actual_epochs,
+            'fitness': new_fit,
+            'block': block_idx,
+        })
 
         pop = getattr(block_model, 'pop', None)
         if pop:
@@ -419,9 +431,9 @@ def run_single_with_early_stop(
 
     print(
         f"    {algo_short} WCSS: {best_fit:.4f} "
-        f"({actual_epochs}/{max_epoch} epoch)"
+        f"({actual_epochs}/{max_epoch} epoch, {len(convergence_history)} blok)"
     )
-    return best_sol, best_fit, actual_epochs
+    return best_sol, best_fit, actual_epochs, convergence_history
 
 
 def run_hybrid(g_info, l_info, matrix, K, init, g_epoch, l_epoch, pop_size,
@@ -651,6 +663,10 @@ def save_assignment(assignments, gray_mask, best_sol, best_fit,
     if extra_data and 'lof_scores' in extra_data:
         np.save(os.path.join(save_dir, 'lof_scores.npy'), extra_data['lof_scores'])
         df_dict['lof_score'] = extra_data['lof_scores']
+    if extra_data and extra_data.get('convergence_history'):
+        pd.DataFrame(extra_data['convergence_history']).to_csv(
+            os.path.join(save_dir, 'convergence_history.csv'), index=False,
+        )
 
     pd.DataFrame(df_dict).to_csv(
         os.path.join(save_dir, 'assignment_summary.csv'), index=False
@@ -807,6 +823,8 @@ def _run_one_core(
         f"(gray sheep: {mode_str}, küme metrik: {cluster_metric}, init: {init_mode})..."
     )
     t0 = time.time()
+    convergence_history = None
+    actual_epochs = None
     # sklearn KMeans dalı `init` popülasyonunu kullanmaz; önceden _multi_start_init
     # çağırmak gereksiz MkMeans++ maliyeti ve kafa karışıklığı yaratırdı.
     if g_name == 'KMEANS':
@@ -920,14 +938,17 @@ def _run_one_core(
         )
     elif l_name is None:
         if args is not None and getattr(args, 'early_stop', False):
-            best_sol, best_fit, actual_epochs = run_single_with_early_stop(
-                algo_map[g_name], matrix, K, init, baseline_epoch, pop_size,
-                metric=cluster_metric,
-                patience=getattr(args, 'early_stop_patience', 10),
-                tolerance=getattr(args, 'early_stop_tolerance', 1e-6),
-                block_size=getattr(args, 'early_stop_block', 5),
+            es_max = getattr(args, 'early_stop_max_epoch', EARLY_STOP_MAX_EPOCH)
+            best_sol, best_fit, actual_epochs, convergence_history = (
+                run_single_with_early_stop(
+                    algo_map[g_name], matrix, K, init, es_max, pop_size,
+                    metric=cluster_metric,
+                    patience=getattr(args, 'early_stop_patience', EARLY_STOP_PATIENCE),
+                    tolerance=getattr(args, 'early_stop_tolerance', EARLY_STOP_TOLERANCE),
+                    block_size=getattr(args, 'early_stop_block', EARLY_STOP_BLOCK_SIZE),
+                )
             )
-            print(f"    Early-stop epoch: {actual_epochs}/{baseline_epoch}")
+            print(f"    Early-stop epoch: {actual_epochs}/{es_max}")
         else:
             best_sol, best_fit = run_single(
                 algo_map[g_name], matrix, K, init, baseline_epoch, pop_size,
@@ -1013,6 +1034,13 @@ def _run_one_core(
         )
         gray_mask  = gs_info['gray_sheep_mask']
         extra_data = {'threshold': gs_info['threshold']}
+
+    if convergence_history is not None:
+        extra_data = {
+            **(extra_data or {}),
+            'convergence_history': convergence_history,
+            'early_stop_epochs': actual_epochs,
+        }
 
     # DB'de WCSS kolonu her zaman gerçek kümeleme hedefini taşısın;
     # optimizer'ın iç objective'i (kompozit vb.) ile karışmasın.
@@ -1701,16 +1729,21 @@ def parse_args():
         help='Tek-algoritma (l_name=None) mealpy koşularında blok bazlı erken durdurma',
     )
     p.add_argument(
-        '--early-stop-patience', type=int, default=10, metavar='N',
-        help='Early-stop: ardışık blok sayısı (default: 10)',
+        '--early-stop-max-epoch', type=int, default=EARLY_STOP_MAX_EPOCH, metavar='N',
+        help=f'Early-stop üst sınır epoch (default: {EARLY_STOP_MAX_EPOCH})',
     )
     p.add_argument(
-        '--early-stop-tolerance', type=float, default=1e-6,
-        help='Early-stop: minimum fitness iyileşmesi (default: 1e-6)',
+        '--early-stop-patience', type=int, default=EARLY_STOP_PATIENCE, metavar='N',
+        help=f'Early-stop: ardışık blok (default: {EARLY_STOP_PATIENCE} → '
+             f'{EARLY_STOP_PATIENCE * EARLY_STOP_BLOCK_SIZE} epoch)',
     )
     p.add_argument(
-        '--early-stop-block', type=int, default=5, metavar='N',
-        help='Early-stop: her kontrol öncesi epoch bloğu (default: 5)',
+        '--early-stop-tolerance', type=float, default=EARLY_STOP_TOLERANCE,
+        help=f'Early-stop: min fitness iyileşmesi (default: {EARLY_STOP_TOLERANCE})',
+    )
+    p.add_argument(
+        '--early-stop-block', type=int, default=EARLY_STOP_BLOCK_SIZE, metavar='N',
+        help=f'Early-stop: blok başına epoch (default: {EARLY_STOP_BLOCK_SIZE})',
     )
     args = p.parse_args()
     if args.k is not None and (args.k_100k is not None or args.k_1m is not None):

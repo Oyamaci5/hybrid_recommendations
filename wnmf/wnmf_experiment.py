@@ -1401,6 +1401,88 @@ def run_cluster_average(train, test, assignments, gray_mask,
     }
 
 
+def build_item_popularity(train=None, user_ratings=None):
+    """Train satırlarından veya user_ratings sözlüğünden film popülerliği."""
+    item_popularity = {}
+    if train is not None:
+        for row in train:
+            i = int(row[1])
+            item_popularity[i] = item_popularity.get(i, 0) + 1
+    elif user_ratings is not None:
+        for items in user_ratings.values():
+            for i in items:
+                item_popularity[i] = item_popularity.get(i, 0) + 1
+    return item_popularity
+
+
+def iuf_weight(item_id: int, item_popularity: dict) -> float:
+    n = item_popularity.get(item_id, 1)
+    return 1.0 / np.log(1 + n)
+
+
+def knn_user_similarity(
+    ua: int,
+    va: int,
+    *,
+    similarity: str,
+    user_ratings: dict,
+    user_means: dict,
+    item_popularity: dict,
+    min_common: int = 3,
+    sig_threshold: int = 0,
+    sim_amp: float = 1.0,
+) -> float:
+    """kNN kullanıcı–kullanıcı benzerliği: pearson | pearson_iuf | cosine."""
+    u_items = set(user_ratings.get(ua, {}).keys())
+    v_items = set(user_ratings.get(va, {}).keys())
+    common = list(u_items & v_items)
+    if len(common) < min_common:
+        return 0.0
+
+    if similarity == 'cosine':
+        u_r = np.array([user_ratings[ua][ix] for ix in common], dtype=np.float32)
+        v_r = np.array([user_ratings[va][ix] for ix in common], dtype=np.float32)
+        denom = np.sqrt((u_r ** 2).sum()) * np.sqrt((v_r ** 2).sum())
+        if denom < 1e-8:
+            return 0.0
+        return float(np.clip(np.dot(u_r, v_r) / denom, 0.0, 1.0))
+
+    if similarity not in ('pearson', 'pearson_iuf'):
+        raise ValueError(f"desteklenmeyen similarity: {similarity}")
+
+    u_c = np.array(
+        [user_ratings[ua][ix] - user_means[ua] for ix in common],
+        dtype=np.float64,
+    )
+    v_c = np.array(
+        [user_ratings[va][ix] - user_means[va] for ix in common],
+        dtype=np.float64,
+    )
+
+    if similarity == 'pearson_iuf':
+        weights = np.array(
+            [iuf_weight(ix, item_popularity) for ix in common],
+            dtype=np.float64,
+        )
+        num = float(np.sum(weights * u_c * v_c))
+        norm_u = np.sqrt(float(np.sum(weights * u_c ** 2)))
+        norm_v = np.sqrt(float(np.sum(weights * v_c ** 2)))
+    else:
+        num = float(np.dot(u_c, v_c))
+        norm_u = np.sqrt(float(np.sum(u_c ** 2)))
+        norm_v = np.sqrt(float(np.sum(v_c ** 2)))
+
+    if norm_u < 1e-8 or norm_v < 1e-8:
+        return 0.0
+
+    sim = float(np.clip(num / (norm_u * norm_v), -1.0, 1.0))
+    if sig_threshold > 0:
+        sim = sim * min(len(common), sig_threshold) / float(sig_threshold)
+    if sim_amp != 1.0:
+        sim = float(np.sign(sim) * (abs(sim) ** sim_amp))
+    return sim
+
+
 def _predict_knn(
     u: int,
     i: int,
@@ -1412,51 +1494,12 @@ def _predict_knn(
     k_neighbors: int = 30,
     min_common: int = 3,
     global_mean: float = 3.0,
+    item_popularity: Optional[dict] = None,
 ) -> float:
     """Küme içi kNN tek (u,i) tahmini — run_cluster_knn ile aynı mantık (hard cluster)."""
     k_neighbors = max(1, int(k_neighbors))
-
-    def pearson_sim(ua, va, mc: int = 3) -> float:
-        u_items = set(user_ratings.get(ua, {}).keys())
-        v_items = set(user_ratings.get(va, {}).keys())
-        common = list(u_items & v_items)
-
-        if len(common) < mc:
-            return 0.0
-
-        u_c = np.array([user_ratings[ua][ix] - user_means[ua]
-                        for ix in common], dtype=np.float32)
-        v_c = np.array([user_ratings[va][ix] - user_means[va]
-                        for ix in common], dtype=np.float32)
-
-        norm_u = np.sqrt((u_c**2).sum())
-        norm_v = np.sqrt((v_c**2).sum())
-
-        if norm_u < 1e-8 or norm_v < 1e-8:
-            return 0.0
-
-        return float(np.clip(np.dot(u_c, v_c) / (norm_u * norm_v),
-                             -1.0, 1.0))
-
-    def cosine_sim(ua, va, mc: int = 3) -> float:
-        u_items = set(user_ratings.get(ua, {}).keys())
-        v_items = set(user_ratings.get(va, {}).keys())
-        common = list(u_items & v_items)
-
-        if len(common) < mc:
-            return 0.0
-
-        u_r = np.array([user_ratings[ua][ix] for ix in common],
-                       dtype=np.float32)
-        v_r = np.array([user_ratings[va][ix] for ix in common],
-                       dtype=np.float32)
-
-        denom = np.sqrt((u_r**2).sum()) * np.sqrt((v_r**2).sum())
-        if denom < 1e-8:
-            return 0.0
-
-        return float(np.clip(np.dot(u_r, v_r) / denom,
-                             0.0, 1.0))
+    if item_popularity is None:
+        item_popularity = build_item_popularity(user_ratings=user_ratings)
 
     neighbors = cluster_users.get(cid, [])
     sims = []
@@ -1466,10 +1509,14 @@ def _predict_knn(
         if i not in user_ratings.get(v, {}):
             continue
 
-        if similarity == 'pearson':
-            s = pearson_sim(u, v, min_common)
-        else:
-            s = cosine_sim(u, v, min_common)
+        s = knn_user_similarity(
+            u, v,
+            similarity=similarity,
+            user_ratings=user_ratings,
+            user_means=user_means,
+            item_popularity=item_popularity,
+            min_common=min_common,
+        )
 
         if abs(s) > 0.0:
             sims.append((s, v))
@@ -1511,44 +1558,7 @@ def _predict_full_soft_knn(
     """
     k_neighbors = max(1, int(k_neighbors))
     mu = np.asarray(memberships[u], dtype=np.float64)
-
-    def pearson_sim(ua: int, va: int, mc: int = 3) -> float:
-        u_items = set(user_ratings.get(ua, {}).keys())
-        v_items = set(user_ratings.get(va, {}).keys())
-        common = list(u_items & v_items)
-        if len(common) < mc:
-            return 0.0
-        u_c = np.array(
-            [user_ratings[ua][ix] - user_means[ua] for ix in common],
-            dtype=np.float32,
-        )
-        v_c = np.array(
-            [user_ratings[va][ix] - user_means[va] for ix in common],
-            dtype=np.float32,
-        )
-        norm_u = np.sqrt((u_c ** 2).sum())
-        norm_v = np.sqrt((v_c ** 2).sum())
-        if norm_u < 1e-8 or norm_v < 1e-8:
-            return 0.0
-        sim = float(np.clip(np.dot(u_c, v_c) / (norm_u * norm_v), -1.0, 1.0))
-        if sig_weight > 0:
-            sim = sim * min(len(common), sig_weight) / float(sig_weight)
-        if sim_amp != 1.0:
-            sim = float(np.sign(sim) * (abs(sim) ** sim_amp))
-        return sim
-
-    def cosine_sim(ua: int, va: int, mc: int = 3) -> float:
-        u_items = set(user_ratings.get(ua, {}).keys())
-        v_items = set(user_ratings.get(va, {}).keys())
-        common = list(u_items & v_items)
-        if len(common) < mc:
-            return 0.0
-        u_r = np.array([user_ratings[ua][ix] for ix in common], dtype=np.float32)
-        v_r = np.array([user_ratings[va][ix] for ix in common], dtype=np.float32)
-        denom = np.sqrt((u_r ** 2).sum()) * np.sqrt((v_r ** 2).sum())
-        if denom < 1e-8:
-            return 0.0
-        return float(np.clip(np.dot(u_r, v_r) / denom, 0.0, 1.0))
+    item_popularity = build_item_popularity(user_ratings=user_ratings)
 
     sims: List[Tuple[float, int]] = []
     for v in candidate_users:
@@ -1556,10 +1566,15 @@ def _predict_full_soft_knn(
             continue
         if i not in user_ratings.get(v, {}):
             continue
-        p_sim = (
-            pearson_sim(u, v, min_common)
-            if similarity == 'pearson'
-            else cosine_sim(u, v, min_common)
+        p_sim = knn_user_similarity(
+            u, v,
+            similarity=similarity,
+            user_ratings=user_ratings,
+            user_means=user_means,
+            item_popularity=item_popularity,
+            min_common=min_common,
+            sig_threshold=sig_weight,
+            sim_amp=sim_amp,
         )
         if abs(p_sim) < 1e-8:
             continue
@@ -1608,6 +1623,7 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
         u: float(np.mean(list(d.values())))
         for u, d in user_ratings.items()
     }
+    item_popularity = build_item_popularity(user_ratings=user_ratings)
 
     n_users = len(assignments)
     cluster_users = {}
@@ -1615,71 +1631,17 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
         cid = int(assignments[u])
         cluster_users.setdefault(cid, []).append(u)
 
-    def pearson_sim(u, v, min_common=3, sig_threshold=50, amp=1.5):
-        """
-        Pearson Korelasyon Katsayısı (PCC).
-        Sadece iki kullanıcının ortak izlediği filmler üzerinden.
-
-        sim(u,v) = Σ(r_ui - mean_u)(r_vi - mean_v) /
-                   √[Σ(r_ui - mean_u)² × Σ(r_vi - mean_v)²]
-
-        Ortak film < min_common ise 0 döndür (güvenilmez).
-        """
-        u_items = set(user_ratings.get(u, {}).keys())
-        v_items = set(user_ratings.get(v, {}).keys())
-        common = list(u_items & v_items)
-
-        if len(common) < min_common:
-            return 0.0
-
-        u_c = np.array([user_ratings[u][i] - user_means[u]
-                        for i in common], dtype=np.float32)
-        v_c = np.array([user_ratings[v][i] - user_means[v]
-                        for i in common], dtype=np.float32)
-
-        norm_u = np.sqrt((u_c**2).sum())
-        norm_v = np.sqrt((v_c**2).sum())
-
-        if norm_u < 1e-8 or norm_v < 1e-8:
-            return 0.0
-
-        sim = float(np.clip(np.dot(u_c, v_c) / (norm_u * norm_v), -1.0, 1.0))
-
-        if sig_threshold > 0:
-            sim = sim * min(len(common), sig_threshold) / float(sig_threshold)
-
-        if amp != 1.0:
-            sim = float(np.sign(sim) * (abs(sim) ** amp))
-
-        return sim
-
-    def cosine_sim(u, v, min_common=3):
-        """
-        Kosinüs Benzerliği.
-        Sadece ortak filmler üzerinden (PCC'den farkı:
-        mean çıkarılmaz, ham rating kullanılır).
-
-        sim(u,v) = Σ r_ui*r_vi /
-                   √[Σ r_ui² × Σ r_vi²]
-        """
-        u_items = set(user_ratings.get(u, {}).keys())
-        v_items = set(user_ratings.get(v, {}).keys())
-        common = list(u_items & v_items)
-
-        if len(common) < min_common:
-            return 0.0
-
-        u_r = np.array([user_ratings[u][i] for i in common],
-                       dtype=np.float32)
-        v_r = np.array([user_ratings[v][i] for i in common],
-                       dtype=np.float32)
-
-        denom = np.sqrt((u_r**2).sum()) * np.sqrt((v_r**2).sum())
-        if denom < 1e-8:
-            return 0.0
-
-        return float(np.clip(np.dot(u_r, v_r) / denom,
-                             0.0, 1.0))
+    def _pair_sim(u, v, mc=None):
+        return knn_user_similarity(
+            u, v,
+            similarity=similarity,
+            user_ratings=user_ratings,
+            user_means=user_means,
+            item_popularity=item_popularity,
+            min_common=mc if mc is not None else min_common,
+            sig_threshold=sig_weight,
+            sim_amp=sim_amp,
+        )
 
     knn_mode_norm = (knn_mode or 'cluster').strip().lower()
     use_full_soft = knn_mode_norm == 'full_soft'
@@ -1722,11 +1684,7 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
                 continue
             if i not in user_ratings.get(v, {}):
                 continue
-            s = (
-                pearson_sim(u, v, min_common)
-                if similarity == 'pearson'
-                else cosine_sim(u, v, min_common)
-            )
+            s = _pair_sim(u, v)
             if abs(s) > 0:
                 sims.append((s, v))
 
@@ -1739,11 +1697,7 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
                         continue
                     if i not in user_ratings.get(v, {}):
                         continue
-                    s = (
-                        pearson_sim(u, v, min_common)
-                        if similarity == 'pearson'
-                        else cosine_sim(u, v, min_common)
-                    )
+                    s = _pair_sim(u, v)
                     if abs(s) > 0:
                         sims.append((s, v))
 
@@ -2781,9 +2735,9 @@ def parse_args():
     )
     p.add_argument(
         '--similarity',
-        choices=['pearson', 'cosine'],
+        choices=['pearson', 'pearson_iuf', 'cosine'],
         default='pearson',
-        help='kNN benzerlik metriği: pearson (default) veya cosine'
+        help='kNN benzerlik: pearson (default), pearson_iuf (IUF ağırlıklı), cosine'
     )
     p.add_argument(
         '--knn', nargs='+', type=int, default=[30], metavar='K',
