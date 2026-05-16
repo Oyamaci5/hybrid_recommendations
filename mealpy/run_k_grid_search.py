@@ -102,6 +102,8 @@ def _assign_suffix(c: Combo, ns: argparse.Namespace) -> str:
     if c.feature == "wnmf":
         parts.append(f"_wnmf{ns.wnmf_features}_{ns.wnmf_init}_trim{ns.inmed_trim_low:g}_{ns.inmed_trim_high:g}")
     parts.append(_metric_suffix(ns.cluster_metric))
+    init_m = (getattr(c, "init_mode", None) or "mkpp").strip().lower()
+    parts.append("_irand" if init_m == "random" else "_imkpp")
     if c.mode == "paper":
         parts.append("_paper")
     elif c.gray == "no_gray":

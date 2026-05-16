@@ -54,7 +54,7 @@ import sys as _sys
 import time
 from concurrent.futures import ProcessPoolExecutor
 from itertools import product
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -113,13 +113,13 @@ N_EPOCHS_GLOBAL  = 100   # global V ve global baseline için
 N_EPOCHS_CLUSTER = 100   # küme U eğitimi için
 RANDOM_SEED      = 42
 
-# Soft-membership KNN / WNMF: bu eşiğin altındaki küme ağırlıkları ihmal edilir;
-# kalan ağırlıklarla yeniden normalize edilir. Hepsi eşiğin altındaysa hard atamaya dönülür.
-SOFT_MEMBERSHIP_THRESHOLD = 0.05
+# Soft-membership (FCM): bu eşiğin altındaki küme ağırlıkları ihmal edilir.
+# Kalan ağırlıklarla yeniden normalize edilir; hiçbiri geçmezse argmax küme kullanılır.
+SOFT_MEMBERSHIP_THRESHOLD = 0.10
 
 ALGO_LABELS = [
     'B0_KMEANS',
-    'B1_HHO', 'B2_HGS', 'B3_MFO', 'LF_HHO', 'SFOA', 'SFOA_06', 'H1_HHO+HGS', 'H4_MFO+HHO', 'DOA',
+    'B1_HHO', 'B2_HGS', 'B3_MFO', 'LF_HHO', 'IWO_HHO', 'SFOA', 'SFOA_06', 'H1_HHO+HGS', 'H4_MFO+HHO', 'DOA',
     'H9_QSA+CDO', 'H12_MFO+CDO', 'H13_HHO+GAop', 'HA_AVOAHGS',
     # generate_assignments.py ALGO_CONFIG — önce --lof ile atama üretin
     'LIT_CIRCLESA', 'LIT_GOA', 'LIT_GWO', 'LIT_SSA', 'LIT_PSO',
@@ -157,15 +157,24 @@ def _epoch_cartesian_pairs(eg: List[int], ec: List[int]) -> List[Tuple[int, int]
     return list(product(eg, ec))
 
 
-def _format_hyperparam_tag(k_used: int) -> str:
+def _format_hyperparam_tag(
+    k_used: int,
+    cknn_suffix: Optional[int] = None,
+) -> str:
     """CSV / dosya adlarında hangi hiperparametre koşusunun olduğunu gösterir."""
-    return (
+    base = (
         f"k{k_used}_ld{LATENT_DIM}_eg{N_EPOCHS_GLOBAL}_ec{N_EPOCHS_CLUSTER}_"
         f"lr{LEARNING_RATE:g}_r{REGULARIZATION:g}"
     )
+    if cknn_suffix is not None:
+        base += f"_cknn{int(cknn_suffix)}"
+    return base
 
 
-def _result_row_meta(k_used: int) -> dict:
+def _result_row_meta(
+    k_used: int,
+    cknn_suffix: Optional[int] = None,
+) -> dict:
     return {
         'assignment_k'    : k_used,
         'latent_dim'      : LATENT_DIM,
@@ -173,7 +182,7 @@ def _result_row_meta(k_used: int) -> dict:
         'regularization'  : REGULARIZATION,
         'epochs_global'   : N_EPOCHS_GLOBAL,
         'epochs_cluster'  : N_EPOCHS_CLUSTER,
-        'hyperparam_tag'  : _format_hyperparam_tag(k_used),
+        'hyperparam_tag'  : _format_hyperparam_tag(k_used, cknn_suffix),
     }
 
 
@@ -301,6 +310,12 @@ def _should_skip_existing_run(
     """
     if not getattr(args, 'skip_existing', False):
         return False
+    knn_list = getattr(args, 'knn', [30])
+    if isinstance(knn_list, int):
+        knn_list = [knn_list]
+    if len(list(knn_list)) > 1:
+        # Farklı kNN değerleri farklı satırlarda; tek etiketle güvenilir eşleşme olmaz
+        return False
     tag = _format_hyperparam_tag(k_used)
     if use_cv_mean_branch:
         for p in _iter_cv_mean_result_paths(dataset_name, k_used, mode):
@@ -326,6 +341,43 @@ def _resolved_assignment_k(
     return default_k
 
 
+# KMeans refinement klasör etiketi (generate_assignments: B0_KMEANS hariç _kmref eklenir)
+_ASSIGN_KMREF_SUFFIX = '_kmref'
+
+
+def _assign_suffix_strip_trailing_kmref(assign_suffix: str) -> Optional[str]:
+    """Sonda _kmref varsa kaldırılmış sonek; yoksa None."""
+    if assign_suffix.endswith(_ASSIGN_KMREF_SUFFIX):
+        return assign_suffix[: -len(_ASSIGN_KMREF_SUFFIX)]
+    return None
+
+
+def _assign_suffix_trailing_cluster_k(assign_suffix: str) -> Optional[int]:
+    """
+    generate_assignments yeni klasör adının sonundaki küme K'sı: ..._k{K} veya ..._k{K}_kmref.
+    _wnmf30 gibi latent etiketleri ile karışmaz (son token _k{digits} olmalı).
+    """
+    if not assign_suffix:
+        return None
+    base = assign_suffix
+    if base.endswith(_ASSIGN_KMREF_SUFFIX):
+        base = base[: -len(_ASSIGN_KMREF_SUFFIX)]
+    m = re.search(r'_k(\d+)$', base)
+    return int(m.group(1)) if m else None
+
+
+def _assign_suffix_contains_cluster_k(assign_suffix: str, k_used: int) -> bool:
+    """--assign-suffix sondaki küme K'sı k_used ile aynı mı (geriye dönük)."""
+    trailing = _assign_suffix_trailing_cluster_k(assign_suffix)
+    if trailing is not None:
+        return trailing == int(k_used)
+    if not assign_suffix:
+        return False
+    return (
+        re.search(rf'_k{int(k_used)}(?=_|$)', assign_suffix) is not None
+    )
+
+
 def _algo_assignment_dir(
     assign_root: str,
     dataset_name: str,
@@ -334,16 +386,20 @@ def _algo_assignment_dir(
     assign_suffix: str = '',
 ) -> str:
     """
-    Örnek: k_used=70, default 90 ise → .../ml100k/B1_HHO_k70
-    k_used=90, default 90 ise → .../ml100k/B1_HHO
-    assign_suffix: örn. _wnmf20, _zscore (generate_assignments ile aynı klasör adları)
+    Assignment klasörü: {label}{assign_suffix} veya eski düzen {label}_k{K}{assign_suffix}.
+
+    Yeni düzen (suffix sonunda _k{K}): label önüne _k{K} eklenmez; --k ile suffix K'sı
+    farklı olsa bile klasör eşlemesi suffix sondaki K'ya göre yapılır.
     """
     default_k = ASSIGN_K_DEFAULT_100K if dataset_name == 'ml100k' else ASSIGN_K_DEFAULT_1M
-    suffix    = '' if k_used == default_k else f'_k{k_used}'
-    # assign_suffix ..._k{K} ile bittiğinde (generate_assignments ile aynı) ara _k{K} tekrar etmesin
-    if assign_suffix and assign_suffix.endswith(f'_k{k_used}'):
-        suffix = ''
-    return os.path.join(assign_root, dataset_name, f'{label}{suffix}{assign_suffix}')
+    trailing_k = _assign_suffix_trailing_cluster_k(assign_suffix)
+    if trailing_k is not None:
+        label_k = ''
+    elif k_used == default_k:
+        label_k = ''
+    else:
+        label_k = f'_k{k_used}'
+    return os.path.join(assign_root, dataset_name, f'{label}{label_k}{assign_suffix}')
 
 
 def _next_run_index(k_dir: str) -> int:
@@ -585,7 +641,12 @@ def _membership_weighted_prediction(
         num += float(w) * float(pred_k)
         den += float(w)
     if den < 1e-8:
-        return float('nan')
+        w_row = np.asarray(memberships_row, dtype=np.float64)
+        cid = int(np.argmax(w_row))
+        profile = profiles.get(cid)
+        if profile is None:
+            return float('nan')
+        return predictor_fn(profile, int(user_id), int(item_id))
     return float(np.clip(num / den, 1.0, 5.0))
 
 
@@ -1269,8 +1330,16 @@ def run_cluster_average(train, test, assignments, gray_mask,
     for row in test:
         u, i, r = int(row[0]), int(row[1]), float(row[2])
         if use_soft:
-            w = memberships[u]
-            pred = float(np.clip(np.dot(w, cluster_item_means[:, i]), 1.0, 5.0))
+            w = np.asarray(memberships[u], dtype=np.float64)
+            active = w >= SOFT_MEMBERSHIP_THRESHOLD
+            if not np.any(active) or float(w[active].sum()) < 1e-8:
+                pred = float(np.clip(
+                    cluster_item_means[int(np.argmax(w)), i], 1.0, 5.0,
+                ))
+            else:
+                w_use = np.where(active, w, 0.0)
+                w_use /= w_use.sum()
+                pred = float(np.clip(np.dot(w_use, cluster_item_means[:, i]), 1.0, 5.0))
         else:
             cid = int(assignments[u])
             pred = float(np.clip(cluster_item_means[cid, i], 1.0, 5.0))
@@ -1422,6 +1491,98 @@ def _predict_knn(
     return float(np.clip(pred, 1.0, 5.0))
 
 
+def _predict_full_soft_knn(
+    u: int,
+    i: int,
+    memberships: np.ndarray,
+    candidate_users: Sequence[int],
+    user_ratings: dict,
+    user_means: dict,
+    global_mean: float,
+    similarity: str = 'pearson',
+    min_common: int = 3,
+    k_neighbors: int = 30,
+    sig_weight: int = 0,
+    sim_amp: float = 1.0,
+) -> float:
+    """
+    Tam soft komşuluk: aday kullanıcılar arasında rating benzerliği × üyelik uyumu.
+    combined_sim = p_sim * (1 + dot(memberships[u], memberships[v]))
+    """
+    k_neighbors = max(1, int(k_neighbors))
+    mu = np.asarray(memberships[u], dtype=np.float64)
+
+    def pearson_sim(ua: int, va: int, mc: int = 3) -> float:
+        u_items = set(user_ratings.get(ua, {}).keys())
+        v_items = set(user_ratings.get(va, {}).keys())
+        common = list(u_items & v_items)
+        if len(common) < mc:
+            return 0.0
+        u_c = np.array(
+            [user_ratings[ua][ix] - user_means[ua] for ix in common],
+            dtype=np.float32,
+        )
+        v_c = np.array(
+            [user_ratings[va][ix] - user_means[va] for ix in common],
+            dtype=np.float32,
+        )
+        norm_u = np.sqrt((u_c ** 2).sum())
+        norm_v = np.sqrt((v_c ** 2).sum())
+        if norm_u < 1e-8 or norm_v < 1e-8:
+            return 0.0
+        sim = float(np.clip(np.dot(u_c, v_c) / (norm_u * norm_v), -1.0, 1.0))
+        if sig_weight > 0:
+            sim = sim * min(len(common), sig_weight) / float(sig_weight)
+        if sim_amp != 1.0:
+            sim = float(np.sign(sim) * (abs(sim) ** sim_amp))
+        return sim
+
+    def cosine_sim(ua: int, va: int, mc: int = 3) -> float:
+        u_items = set(user_ratings.get(ua, {}).keys())
+        v_items = set(user_ratings.get(va, {}).keys())
+        common = list(u_items & v_items)
+        if len(common) < mc:
+            return 0.0
+        u_r = np.array([user_ratings[ua][ix] for ix in common], dtype=np.float32)
+        v_r = np.array([user_ratings[va][ix] for ix in common], dtype=np.float32)
+        denom = np.sqrt((u_r ** 2).sum()) * np.sqrt((v_r ** 2).sum())
+        if denom < 1e-8:
+            return 0.0
+        return float(np.clip(np.dot(u_r, v_r) / denom, 0.0, 1.0))
+
+    sims: List[Tuple[float, int]] = []
+    for v in candidate_users:
+        if v == u:
+            continue
+        if i not in user_ratings.get(v, {}):
+            continue
+        p_sim = (
+            pearson_sim(u, v, min_common)
+            if similarity == 'pearson'
+            else cosine_sim(u, v, min_common)
+        )
+        if abs(p_sim) < 1e-8:
+            continue
+        m_sim = float(np.dot(mu, np.asarray(memberships[v], dtype=np.float64)))
+        combined = p_sim * (1.0 + m_sim)
+        sims.append((combined, v))
+
+    base_u = float(user_means.get(u, global_mean))
+    if not sims:
+        return float(np.clip(base_u, 1.0, 5.0))
+
+    sims.sort(key=lambda x: -abs(x[0]))
+    top_k = sims[:k_neighbors]
+    num = sum(
+        s * (user_ratings[v][i] - user_means.get(v, global_mean))
+        for s, v in top_k
+    )
+    den = sum(abs(s) for s, _ in top_k)
+    if den < 1e-8:
+        return float(np.clip(base_u, 1.0, 5.0))
+    return float(np.clip(base_u + num / den, 1.0, 5.0))
+
+
 def run_cluster_knn(train, test, assignments, gray_mask, memberships,
                     n_items, algo_label,
                     similarity: str = 'pearson',
@@ -1430,6 +1591,7 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
                     expand_knn: bool = False,
                     sig_weight: int = 0,
                     sim_amp: float = 1.0,
+                    knn_mode: str = 'cluster',
                     top_n: int = 10,
                     relevance_threshold: float = 4.0):
     t0 = time.time()
@@ -1519,11 +1681,35 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
         return float(np.clip(np.dot(u_r, v_r) / denom,
                              0.0, 1.0))
 
+    knn_mode_norm = (knn_mode or 'cluster').strip().lower()
+    use_full_soft = knn_mode_norm == 'full_soft'
+    if use_full_soft:
+        if memberships is None:
+            print(
+                f"  [{algo_label}] uyarı: --knn-mode full_soft için memberships.npy yok; "
+                f"cluster moduna düşülüyor.",
+                flush=True,
+            )
+            use_full_soft = False
+        elif memberships.shape[0] < len(assignments):
+            print(
+                f"  [{algo_label}] uyarı: memberships satır sayısı yetersiz; "
+                f"cluster moduna düşülüyor.",
+                flush=True,
+            )
+            use_full_soft = False
+
     use_soft = (
-        memberships is not None
+        not use_full_soft
+        and memberships is not None
         and memberships.shape[0] >= len(assignments)
         and memberships.shape[1] >= (int(assignments.max()) + 1)
     )
+
+    knn_candidates = [
+        v for v in range(n_users)
+        if not gray_mask[v]
+    ]
 
     def _baseline_ui(u, i):
         return float(user_means.get(u, global_mean))
@@ -1573,25 +1759,49 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
         return float(np.clip(base_u + num / den, 1.0, 5.0))
 
     def predict(u, i, similarity='pearson', min_common=3):
+        if use_full_soft:
+            return _predict_full_soft_knn(
+                u,
+                i,
+                memberships,
+                knn_candidates,
+                user_ratings,
+                user_means,
+                global_mean,
+                similarity=similarity,
+                min_common=min_common,
+                k_neighbors=k_neighbors,
+                sig_weight=sig_weight,
+                sim_amp=sim_amp,
+            )
+
         if not use_soft:
             cid = int(assignments[u])
-            return _predict_for_cluster(u, i, cid, similarity=similarity, min_common=min_common)
+            return _predict_for_cluster(
+                u, i, cid, similarity=similarity, min_common=min_common,
+            )
 
-        weights = memberships[u]
+        weights = np.asarray(memberships[u], dtype=np.float64)
+        active = [
+            (cid, float(w))
+            for cid, w in enumerate(weights)
+            if w >= SOFT_MEMBERSHIP_THRESHOLD
+        ]
+
+        if not active:
+            cid = int(np.argmax(weights))
+            return _predict_for_cluster(
+                u, i, cid, similarity=similarity, min_common=min_common,
+            )
+
         pred = 0.0
         total_w = 0.0
-        for cid, w in enumerate(weights):
-            if w < SOFT_MEMBERSHIP_THRESHOLD:
-                continue
+        for cid, w in active:
             p = _predict_for_cluster(
-                u, i, cid, similarity=similarity, min_common=min_common
+                u, i, cid, similarity=similarity, min_common=min_common,
             )
-            pred += float(w) * p
-            total_w += float(w)
-
-        if total_w < 1e-8:
-            cid = int(assignments[u])
-            return _predict_for_cluster(u, i, cid, similarity=similarity, min_common=min_common)
+            pred += w * p
+            total_w += w
 
         return float(np.clip(pred / total_w, 1.0, 5.0))
 
@@ -1632,11 +1842,12 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
     )
 
     elapsed = time.time() - t0
-    print(f"  [{algo_label} | ClusterKNN|{similarity}|k={k_neighbors}] MAE={mae:.4f} "
+    _knn_tag = 'ClusterKNN-fullsoft' if use_full_soft else 'ClusterKNN'
+    print(f"  [{algo_label} | {_knn_tag}|{similarity}|k={k_neighbors}] MAE={mae:.4f} "
           f"RMSE={rmse:.4f} | Gray MAE={gray_mae:.4f} ({elapsed:.1f}s)")
 
     return {
-        'scenario'    : 'cluster_knn',
+        'scenario'    : 'cluster_knn_full_soft' if use_full_soft else 'cluster_knn',
         'algo_label'  : algo_label,
         'mae'         : mae,
         'rmse'        : rmse,
@@ -1659,6 +1870,7 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
         'ndcg_at_10'      : ndcg,
         'similarity'      : similarity,
         'k_neighbors'     : k_neighbors,
+        'knn_mode'        : 'full_soft' if use_full_soft else 'cluster',
     }
 
 
@@ -1750,7 +1962,7 @@ def _mp_run_algo_job(job):
         top_n,
         relevance_threshold,
         similarity,
-        knn,
+        knn_spec,
         min_common,
         hybrid_alpha,
         out_dir,
@@ -1768,6 +1980,12 @@ def _mp_run_algo_job(job):
     N_EPOCHS_CLUSTER = ec
 
     expand_knn = bool(getattr(mp_args, 'expand_knn', False))
+    knn_mode = str(getattr(mp_args, 'knn_mode', 'cluster') or 'cluster')
+
+    if isinstance(knn_spec, int):
+        _knv = [knn_spec]
+    else:
+        _knv = list(knn_spec)
 
     try:
         assignments, gray_mask = load_assignment(assign_dir)
@@ -1784,17 +2002,21 @@ def _mp_run_algo_job(job):
             rows.append(row)
 
         if do_cluster_knn_flag:
-            row = run_cluster_knn(
-                train, test, assignments, gray_mask, memberships, n_items, label,
-                similarity=similarity,
-                min_common=min_common,
-                k_neighbors=knn,
-                expand_knn=expand_knn,
-                top_n=top_n,
-                relevance_threshold=relevance_threshold,
-            )
-            row['dataset'] = dataset_name
-            rows.append(row)
+            for kv in _knv:
+                row = run_cluster_knn(
+                    train, test, assignments, gray_mask, memberships, n_items, label,
+                    similarity=similarity,
+                    min_common=min_common,
+                    k_neighbors=int(kv),
+                    expand_knn=expand_knn,
+                    knn_mode=knn_mode,
+                    sig_weight=int(getattr(mp_args, 'sig_weight', 0) or 0),
+                    sim_amp=float(getattr(mp_args, 'sim_amp', 1.0) or 1.0),
+                    top_n=top_n,
+                    relevance_threshold=relevance_threshold,
+                )
+                row['dataset'] = dataset_name
+                rows.append(row)
 
         if mode in ('full', 'all'):
             row = run_cluster_full(
@@ -1910,9 +2132,10 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
                 top_n: int = 10,
                 relevance_threshold: float = 4.0,
                 similarity: str = 'pearson',
-                knn: int = 30,
+                knn: Union[int, Sequence[int]] = 30,
                 min_common: int = 3,
                 expand_knn: bool = False,
+                knn_mode: str = 'cluster',
                 hybrid_alpha: Optional[float] = None,
                 use_svdpp: bool = False,
                 run_command: Optional[str] = None,
@@ -1929,8 +2152,9 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
         'full'      — baselines + her küme ayrı U+V WNMF
         'all'       — baselines + full + sharedV
 
-    Assignment klasörü: mealpy/results/assignments_lof/{dataset}/{label} veya
-    K ≠ varsayılan ise {label}_k{K} (generate_assignments ile aynı kural).
+    Assignment klasörü: mealpy/results/assignments_lof/{dataset}/{label}{assign_suffix}
+    veya (yalnızca eski / soneksiz düzen) K ≠ varsayılan ve suffix'te _k{K} yoksa
+    {label}_k{K}{assign_suffix}.
     """
     print(f"\n{'='*60}")
     print(f"DATASET: {dataset_name.upper()}  |  mode={mode}")
@@ -1940,12 +2164,40 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
     dk   = ASSIGN_K_DEFAULT_100K if dataset_name == 'ml100k' else ASSIGN_K_DEFAULT_1M
     k_ds = assignment_k_100k if dataset_name == 'ml100k' else assignment_k_1m
     k_used = _resolved_assignment_k(k_ds, assignment_k, dk)
-    print(f"Assignment K  : {k_used} (klasör eki: {'yok' if k_used == dk else f'_k{k_used}'})")
+    suffix_k = _assign_suffix_trailing_cluster_k(assign_suffix)
+    if suffix_k is not None and suffix_k != k_used:
+        print(
+            f"  Uyarı: --k {k_used} ile --assign-suffix sondaki _k{suffix_k} farklı; "
+            f"assignment klasörü _k{suffix_k} ile eşleştiriliyor.",
+            file=sys.stderr,
+        )
+        k_used = suffix_k
+    if suffix_k is not None:
+        _dir_note = f'yok (suffix sonu _k{suffix_k})'
+    elif k_used == dk:
+        _dir_note = 'yok'
+    else:
+        _dir_note = f'_k{k_used} (eski düzen)'
+    print(f"Assignment K  : {k_used} (label ön eki: {_dir_note})")
     print(f"Assignment kök: {root}")
 
     # CV/holdout'ta testte train'de görülmeyen item olabilir; item boyutunu
     # train+test birleşik maksimum ID'den al ki predict sırasında taşma olmasın.
     n_items = int(max(train[:, 1].max(), test[:, 1].max())) + 1
+
+    knn_vals: List[int]
+    if isinstance(knn, int):
+        knn_vals = [knn]
+    else:
+        knn_vals = list(knn)
+    if not knn_vals or any(kv < 1 for kv in knn_vals):
+        raise ValueError('knn değerleri boş olamaz ve her biri en az 1 olmalı')
+    multi_knn_sweep = len(knn_vals) > 1
+    if multi_knn_sweep and do_cluster_knn:
+        print(f"ClusterKNN k sırası: {knn_vals}")
+    if do_cluster_knn and (knn_mode or 'cluster').strip().lower() == 'full_soft':
+        print("ClusterKNN modu: full_soft (tüm kullanıcılar, membership×rating benzerliği)")
+
     results = []
     if fold is None:
         k_dir = os.path.join(OUT_ROOT, dataset_name, f'k{k_used}')
@@ -1997,7 +2249,28 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
         assign_dir = _algo_assignment_dir(
             root, dataset_name, label, k_used, assign_suffix=assign_suffix,
         )
-        if not os.path.exists(assign_dir):
+        if (
+            not os.path.isdir(assign_dir)
+            and label == 'B0_KMEANS'
+        ):
+            alt_suffix = _assign_suffix_strip_trailing_kmref(assign_suffix)
+            if alt_suffix is not None:
+                cand = _algo_assignment_dir(
+                    root,
+                    dataset_name,
+                    label,
+                    k_used,
+                    assign_suffix=alt_suffix,
+                )
+                if os.path.isdir(cand):
+                    print(
+                        f"\n  [{label}] Not: --assign-suffix {_ASSIGN_KMREF_SUFFIX!r} "
+                        f"B0_KMEANS klasöründe yok (refinement uygulanmaz); "
+                        f"soneksiz kullanılıyor: …{alt_suffix}",
+                        flush=True,
+                    )
+                    assign_dir = cand
+        if not os.path.isdir(assign_dir):
             print(f"\n  [{label}] ATLANDI — assignment bulunamadı: {assign_dir}")
             continue
 
@@ -2012,7 +2285,8 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
                 label, assign_dir,
                 train, test, n_items, dataset_name, mode,
                 eff_cluster_workers, weighted_v, use_bias, use_cluster_bias, use_svdpp,
-                run_cluster_avg, do_cluster_knn, top_n, relevance_threshold, similarity, knn,
+                run_cluster_avg, do_cluster_knn, top_n, relevance_threshold, similarity,
+                tuple(knn_vals),
                 min_common,
                 hybrid_alpha,
                 out_dir, run_command,
@@ -2047,19 +2321,23 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
                 _save_row_to_db(dataset_name, row, k_used, args, fold_override=fold)
 
             if do_cluster_knn:
-                row = run_cluster_knn(
-                    train, test, assignments, gray_mask, memberships, n_items, label,
-                    similarity=similarity,
-                    min_common=min_common,
-                    k_neighbors=knn,
-                    expand_knn=expand_knn,
-                    top_n=top_n,
-                    relevance_threshold=relevance_threshold,
-                )
-                row['dataset'] = dataset_name
-                results.append(row)
+                for kv in knn_vals:
+                    row = run_cluster_knn(
+                        train, test, assignments, gray_mask, memberships, n_items, label,
+                        similarity=similarity,
+                        min_common=min_common,
+                        k_neighbors=int(kv),
+                        expand_knn=expand_knn,
+                        knn_mode=knn_mode,
+                        sig_weight=int(getattr(args, 'sig_weight', 0) or 0) if args else 0,
+                        sim_amp=float(getattr(args, 'sim_amp', 1.0) or 1.0) if args else 1.0,
+                        top_n=top_n,
+                        relevance_threshold=relevance_threshold,
+                    )
+                    row['dataset'] = dataset_name
+                    results.append(row)
 
-                _save_row_to_db(dataset_name, row, k_used, args, fold_override=fold)
+                    _save_row_to_db(dataset_name, row, k_used, args, fold_override=fold)
 
             if mode in ('full', 'all'):
                 row = run_cluster_full(
@@ -2093,12 +2371,17 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
 
                 _save_row_to_db(dataset_name, row, k_used, args, fold_override=fold)
 
-    meta = _result_row_meta(k_used)
     sub = os.path.basename(out_dir)
-    results = [
-        {**meta, **r, 'result_subdir': sub, 'use_svdpp': bool(use_svdpp)}
-        for r in results
-    ]
+    tagged: List[dict] = []
+    for r in results:
+        ck_tag: Optional[int] = None
+        if multi_knn_sweep and r.get('scenario') in ('cluster_knn', 'cluster_knn_full_soft'):
+            knv = r.get('k_neighbors')
+            if knv is not None:
+                ck_tag = int(knv)
+        meta = _result_row_meta(k_used, cknn_suffix=ck_tag)
+        tagged.append({**meta, **r, 'result_subdir': sub, 'use_svdpp': bool(use_svdpp)})
+    results = tagged
 
     # Kaydet ve özet yazdır (her koşu: results/wnmf/{dataset}/k{K}/run{N}/...)
     save_results(
@@ -2125,8 +2408,59 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
         )
 
     _print_summary(results, dataset_name)
+    _print_knn_cluster_mae_matrix(results, title=f'{dataset_name.upper()} · ClusterKNN MAE özeti')
 
     return results
+
+
+def _print_knn_cluster_mae_matrix(results: List[dict], *,
+                                  title: str = 'ClusterKNN · k seçimi') -> None:
+    """cluster_knn satırlarından algoritma × k_neighbors pivot (MAE ve RMSE)."""
+    ck = [
+        r for r in results
+        if r.get('scenario') in ('cluster_knn', 'cluster_knn_full_soft')
+        and r.get('k_neighbors') is not None
+    ]
+    if not ck:
+        return
+    knn_seen: List[int] = []
+    algo_seen: List[str] = []
+    for r in ck:
+        k = int(r['k_neighbors'])
+        if k not in knn_seen:
+            knn_seen.append(k)
+        al = str(r.get('algo_label', ''))
+        if al not in algo_seen:
+            algo_seen.append(al)
+    knn_seen.sort()
+    if len(knn_seen) <= 1:
+        return
+    cell_map: Dict[Tuple[str, int], Tuple[float, float]] = {}
+    for r in ck:
+        key = (str(r.get('algo_label', '')), int(r['k_neighbors']))
+        cell_map[key] = (float(r.get('mae', float('nan'))), float(r.get('rmse', float('nan'))))
+
+    cw = max(8, max(len(str(kv)) for kv in knn_seen) + 2)
+    al_w = max(14, max((len(a) for a in algo_seen), default=14))
+
+    def _fmt(v: float) -> str:
+        if isinstance(v, float) and np.isnan(v):
+            return f'{"—":>{cw}}'
+        return f'{v:>{cw}.4f}'
+
+    print(f"\n{'='*72}")
+    print(title)
+    print(f"{'Algoritma':<{al_w}} " + ''.join(f'{kv:>{cw}}' for kv in knn_seen))
+    print('—' * (al_w + 1 + cw * len(knn_seen)))
+    print('MAE')
+    for al in algo_seen:
+        parts = ''.join(_fmt(cell_map.get((al, kv), (float('nan'), float('nan')))[0]) for kv in knn_seen)
+        print(f"{al:<{al_w}} {parts}")
+    print('RMSE')
+    for al in algo_seen:
+        parts = ''.join(_fmt(cell_map.get((al, kv), (float('nan'), float('nan')))[1]) for kv in knn_seen)
+        print(f"{al:<{al_w}} {parts}")
+    print('=' * 72)
 
 
 # ============================================================
@@ -2138,20 +2472,39 @@ def _print_summary(results, dataset_name):
     print(f"ÖZET — {dataset_name.upper()}")
     print(f"{'='*60}")
     tag_hdr = 'hyperparam_tag' if results and 'hyperparam_tag' in results[0] else None
+    show_knn = bool(
+        results
+        and any(
+            r.get('scenario') in ('cluster_knn', 'cluster_knn_full_soft')
+            and r.get('k_neighbors') is not None
+            for r in results
+        )
+    )
+    _kpref = (f"{'kNN':>5} ") if show_knn else ''
+
+    def _row_knn_part(r):
+        if not show_knn:
+            return ''
+        if r.get('k_neighbors') is not None:
+            return f"{int(r['k_neighbors']):>5} "
+        return f"{'—':>5} "
+
     if tag_hdr:
         print(
-            f"{'tag':<36} {'Algoritma':<16} {'Senaryo':<14} {'MAE':>8} {'RMSE':>8} "
+            f"{'tag':<36} {'Algoritma':<16} {'Senaryo':<14} {_kpref}"
+            f"{'MAE':>8} {'RMSE':>8} "
             f"{'ClStd':>8} {'GS MAE':>8} {'Wh MAE':>8} "
             f"{'Acc':>8} {'Prec':>8} {'Rec':>8} {'F1':>8} {'NDCG':>8}"
         )
-        w = 36 + 16 + 14 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 6
+        w = 36 + 16 + 14 + len(_kpref) + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 6
     else:
         print(
-            f"{'Algoritma':<20} {'Senaryo':<16} {'MAE':>8} {'RMSE':>8} "
+            f"{'Algoritma':<20} {'Senaryo':<16} {_kpref}"
+            f"{'MAE':>8} {'RMSE':>8} "
             f"{'ClStd':>8} {'GS MAE':>8} {'Wh MAE':>8} "
             f"{'Acc':>8} {'Prec':>8} {'Rec':>8} {'F1':>8} {'NDCG':>8}"
         )
-        w = 72 + 8 + 8 + 8 + 8 + 8
+        w = 72 + len(_kpref) + 8 + 8 + 8 + 8 + 8
     print("-" * max(w, 72))
 
     for r in results:
@@ -2181,6 +2534,7 @@ def _print_summary(results, dataset_name):
                 f"{tg:<36} "
                 f"{r['algo_label']:<16} "
                 f"{r['scenario']:<14} "
+                f"{_row_knn_part(r)}"
                 f"{r['mae']:>8.4f} "
                 f"{r['rmse']:>8.4f} "
                 f"{cms_str:>8} "
@@ -2196,6 +2550,7 @@ def _print_summary(results, dataset_name):
             print(
                 f"{r['algo_label']:<20} "
                 f"{r['scenario']:<16} "
+                f"{_row_knn_part(r)}"
                 f"{r['mae']:>8.4f} "
                 f"{r['rmse']:>8.4f} "
                 f"{cms_str:>8} "
@@ -2232,6 +2587,7 @@ def _aggregate_fold_results(rows: List[dict], n_splits: int) -> List[dict]:
             row.get('assignment_k'),
             row.get('hyperparam_tag'),
             row.get('use_svdpp'),
+            row.get('k_neighbors'),
         )
         grouped.setdefault(key, []).append(row)
 
@@ -2430,8 +2786,9 @@ def parse_args():
         help='kNN benzerlik metriği: pearson (default) veya cosine'
     )
     p.add_argument(
-        '--knn', type=int, default=30, metavar='K',
-        help='ClusterKNN: küme içi en fazla K komşu (varsayılan: 30)',
+        '--knn', nargs='+', type=int, default=[30], metavar='K',
+        help='ClusterKNN: küme içi komşu sayısı; birden fazla: --knn 5 10 15 20 '
+             '(her K için ayrı satır; çoklu K iken --skip-existing bu koşu için devre dışı). Varsayılan: 30.',
     )
     p.add_argument(
         '--min-common', type=int, default=3, metavar='N',
@@ -2441,6 +2798,14 @@ def parse_args():
         '--expand-knn',
         action='store_true',
         help='Küme sınırını aşarak komşu ara',
+    )
+    p.add_argument(
+        '--knn-mode',
+        choices=['cluster', 'full_soft'],
+        default='cluster',
+        help='cluster (varsayılan): küme içi kNN veya soft-blend; '
+             'full_soft: tüm kullanıcılar, sim = pearson×(1+⟨m_u,m_v⟩) '
+             '(memberships.npy gerekir)',
     )
     p.add_argument(
         '--sig-weight', type=int, default=0,
@@ -2477,8 +2842,8 @@ def parse_args():
         help='Bu run için açıklama notu (örn: "zscore karşılaştırma")',
     )
     args = p.parse_args()
-    if args.knn < 1:
-        p.error('--knn en az 1 olmalı')
+    if any(k < 1 for k in args.knn):
+        p.error('--knn içindeki her değer en az 1 olmalı')
     if args.min_common < 1:
         p.error('--min-common en az 1 olmalı')
     if args.assignment_k is not None and (
@@ -2711,6 +3076,7 @@ if __name__ == '__main__':
                                 knn=args.knn,
                                 min_common=args.min_common,
                                 expand_knn=args.expand_knn,
+                                knn_mode=args.knn_mode,
                                 hybrid_alpha=args.hybrid_alpha,
                                 use_svdpp=use_sp,
                                 run_command=RUN_COMMAND,
@@ -2749,6 +3115,7 @@ if __name__ == '__main__':
                             knn=args.knn,
                             min_common=args.min_common,
                             expand_knn=args.expand_knn,
+                            knn_mode=args.knn_mode,
                             hybrid_alpha=args.hybrid_alpha,
                             use_svdpp=use_sp,
                             run_command=RUN_COMMAND,
@@ -2804,6 +3171,7 @@ if __name__ == '__main__':
                                 knn=args.knn,
                                 min_common=args.min_common,
                                 expand_knn=args.expand_knn,
+                                knn_mode=args.knn_mode,
                                 hybrid_alpha=args.hybrid_alpha,
                                 use_svdpp=use_sp,
                                 run_command=RUN_COMMAND,
@@ -2842,6 +3210,7 @@ if __name__ == '__main__':
                             knn=args.knn,
                             min_common=args.min_common,
                             expand_knn=args.expand_knn,
+                            knn_mode=args.knn_mode,
                             hybrid_alpha=args.hybrid_alpha,
                             use_svdpp=use_sp,
                             run_command=RUN_COMMAND,

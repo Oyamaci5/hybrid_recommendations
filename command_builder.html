@@ -265,7 +265,7 @@
           <div class="label">Centroid başlatma (meta)
             <span class="arg">--init-mode</span>
             <div class="desc">Meta-sezgiseller için ilk popülasyon stratejisi.
-              <code>mkpp</code> = MkMeans++; <code>random</code>.</div>
+              <code>mkpp</code> → <code>_imkpp</code>; <code>random</code> → <code>_irand</code> (klasör adı).</div>
           </div>
           <div class="control">
             <select data-arg="--init-mode" data-default="">
@@ -321,22 +321,27 @@
         </div>
 
         <div class="row">
-          <div class="label">Min kullanıcı rating
-            <span class="arg">--min-user-ratings</span>
-            <div class="desc">Bu sayıdan az rating veren kullanıcıları at.</div>
+          <div class="label">Seyreklik budama (prune)
+            <span class="arg">--no-prune</span>
+            <div class="desc">Kapalıyken az rating’li kullanıcı/film atılmaz; klasör adında
+              <code>_pruneu…</code> olmaz. Açıkken eşikler:
+              <code>--min-user-ratings</code> / <code>--min-item-ratings</code>
+              (ikisi de 0 = budama yok).</div>
           </div>
           <div class="control">
-            <input type="number" data-arg="--min-user-ratings" data-default="5" value="5" min="0" />
+            <label class="check"><input type="checkbox" data-arg="--no-prune" id="ga-no-prune" /> Budama kapalı</label>
           </div>
         </div>
 
-        <div class="row">
-          <div class="label">Min film rating
+        <div class="row" id="ga-prune-thresholds">
+          <div class="label">Min kullanıcı / film rating
+            <span class="arg">--min-user-ratings</span>
             <span class="arg">--min-item-ratings</span>
-            <div class="desc">Bu sayıdan az rating alan filmleri at.</div>
+            <div class="desc">Budama açıkken: bu sayıdan az oylayan kullanıcı veya film çıkarılır.</div>
           </div>
-          <div class="control">
-            <input type="number" data-arg="--min-item-ratings" data-default="10" value="10" min="0" />
+          <div class="control" style="display:flex; gap:8px; align-items:center;">
+            <input type="number" data-arg="--min-user-ratings" data-default="5" value="5" min="0" title="min user" />
+            <input type="number" data-arg="--min-item-ratings" data-default="10" value="10" min="0" title="min item" />
           </div>
         </div>
 
@@ -509,6 +514,69 @@
         </div>
       </details>
 
+      <details>
+        <summary>Early Stop (mealpy tek-algoritma)</summary>
+
+        <motion class="row" style="display:none"></motion>
+        <motion></motion>
+
+        <motion></motion>
+
+        <div class="row">
+          <motion></motion>
+          <motion></motion>
+          <motion></motion>
+          <motion></motion>
+        </div>
+
+        <div class="row">
+          <motion></motion>
+          <div class="label">Early stop açık
+            <span class="arg">--early-stop</span>
+            <motion></motion>
+            <motion></motion>
+            <div class="desc">HHO, GWO, MFO vb. tek-algoritma koşularında epoch'ları
+              <code>--early-stop-block</code> boyutunda çalıştırır; iyileşme durunca durur.
+              Hibrit (<code>H4_MFO+HHO</code>) ve özel optimizer'lar (IWO_HHO, LF_HHO) etkilenmez.</motion>
+          </div>
+          <div class="control">
+            <label class="check"><input type="checkbox" data-arg="--early-stop" /> Açık</label>
+          </motion>
+        </div>
+
+        <div class="row">
+          <div class="label">Patience (blok)
+            <span class="arg">--early-stop-patience</span>
+            <motion></motion>
+            <div class="desc">Ardışık kaç blok iyileşme yoksa dur (default: 10).</div>
+          </div>
+          <div class="control">
+            <input type="number" data-arg="--early-stop-patience" data-default="10" placeholder="10" min="1" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Tolerance
+            <span class="arg">--early-stop-tolerance</span>
+            <div class="desc">Minimum fitness iyileşmesi (default: 1e-6).</motion>
+          </div>
+          <div class="control">
+            <input type="text" data-arg="--early-stop-tolerance" data-default="1e-6" placeholder="1e-6" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Block size (epoch)
+            <span class="arg">--early-stop-block</span>
+            <div class="desc">Her blokta kaç epoch çalıştırılır (default: 5).</div>
+          </div>
+          <motion></motion>
+          <div class="control">
+            <input type="number" data-arg="--early-stop-block" data-default="5" placeholder="5" min="1" />
+          </div>
+        </div>
+      </details>
+
       <details open>
         <summary>KMeans Refinement (mode-collapse onarımı)</summary>
 
@@ -617,7 +685,7 @@
   <div class="layout">
     <div class="panel" id="form-wnmf">
       <div class="preset-bar">
-        <button class="btn" data-wpreset="soft-knn">Soft-Membership KNN (sadece KNN)</button>
+        <button class="btn" data-wpreset="soft-knn">Full-Soft KNN (baselines, --knn-mode full_soft)</button>
         <button class="btn" data-wpreset="sharedV">SharedV (WNMF eğit)</button>
         <button class="btn" data-wpreset="all">All (KNN + sharedV + full)</button>
         <button class="btn" data-wpreset="reset">Temizle</button>
@@ -832,9 +900,25 @@
         </div>
 
         <div class="row">
+          <div class="label">KNN modu
+            <span class="arg">--knn-mode</span>
+            <div class="desc"><code>cluster</code>: küme içi veya üyelikle çoklu küme blend.
+              <code>full_soft</code>: tüm kullanıcılar, sim = rating × (1+⟨m_u,m_v⟩);
+              <code>memberships.npy</code> gerekir (fuzzy atama).</div>
+          </div>
+          <div class="control">
+            <select data-arg="--knn-mode" data-default="cluster">
+              <option value="cluster" selected>cluster (varsayılan)</option>
+              <option value="full_soft">full_soft (tam soft komşuluk)</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="row">
           <div class="label">Küme dışına genişle
             <span class="arg">--expand-knn</span>
-            <div class="desc">Küme içinde yeterli komşu yoksa diğer kümelerden de bak.</div>
+            <div class="desc">Küme içinde yeterli komşu yoksa diğer kümelerden de bak.
+              <code>full_soft</code> modunda yok sayılır.</div>
           </div>
           <div class="control">
             <label class="check"><input type="checkbox" data-arg="--expand-knn" /> Açık</label>
@@ -1067,7 +1151,7 @@
     <div class="panel" id="form-grid">
       <div class="info-banner">
         Birden fazla değeri <b>boşlukla ayır</b> (örn. <code>7 14 30 70</code>).
-        Toplam kombinasyon = <code>K × (her senaryoda alt-kombinasyon sayısı toplamı) × gray-sheep modu sayısı × (tahmin: knn × sim × fold)</code>.
+        Toplam kombinasyon = <code>K × (her senaryoda alt-kombinasyon sayısı toplamı) × gray-sheep modu sayısı × (tahmin: knn × knn-mode × sim × fold)</code>.
       </div>
       <div class="warn-banner">
         Toplam kombinasyon: <b id="grid-total">—</b>.
@@ -1171,6 +1255,12 @@
           </div>
         </div>
         <div class="row">
+          <div class="label">Prune <span class="arg">--no-prune</span></div>
+          <div class="control">
+            <label class="check"><input type="checkbox" data-grid-flag="--no-prune" /> Budama kapalı</label>
+          </div>
+        </div>
+        <div class="row">
           <div class="label">Min user / item ratings</div>
           <div class="control" style="display:flex; gap:8px;">
             <input type="number" data-grid-val="--min-user-ratings" value="5" min="0" />
@@ -1235,6 +1325,15 @@
           <div class="control">
             <input type="text" id="grid-pred-sim" data-axis="sim" value="pearson" />
             <div class="help">Tek değer veya boşlukla iki: <code>pearson cosine</code></div>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">--knn-mode
+            <div class="desc">Boşlukla ayır: <code>cluster</code> veya <code>cluster full_soft</code></div>
+          </div>
+          <div class="control">
+            <input type="text" id="grid-pred-knn-mode" data-axis="knn-mode" value="cluster" />
           </div>
         </div>
 
@@ -1615,7 +1714,8 @@
             <tr><td><code>--knn N</code></td><td>Her tahmin için en fazla N komşu. <b>Küme boyutu ile sınırlanır</b>; küme küçükse N'e ulaşamaz.</td></tr>
             <tr><td><code>--similarity pearson|cosine</code></td><td>KNN benzerlik metriği.</td></tr>
             <tr><td><code>--min-common N</code></td><td>İki kullanıcı arası benzerlik için minimum ortak film sayısı.</td></tr>
-            <tr><td><code>--expand-knn</code></td><td>Küme içinde N komşu yoksa diğer kümelerden de bak.</td></tr>
+            <tr><td><code>--knn-mode cluster|full_soft</code></td><td><code>cluster</code>: küme içi / soft-blend; <code>full_soft</code>: tüm kullanıcılar, membership×rating (<code>memberships.npy</code> gerekir).</td></tr>
+            <tr><td><code>--expand-knn</code></td><td>Küme içinde N komşu yoksa diğer kümelerden de bak. <code>full_soft</code> modunda yok sayılır.</td></tr>
             <tr><td><code>--sig-weight K</code></td><td>Significance weighting eşiği (0=kapalı, 50=önerilen). Az ortak filme dayanan benzerlikleri zayıflatır.</td></tr>
             <tr><td><code>--sim-amp E</code></td><td>Similarity amplification üssü (1.0=kapalı, 1.5=önerilen). Yüksek benzerliklere daha çok ağırlık.</td></tr>
             <tr><td><code>--hybrid-alpha A</code></td><td>SharedV + KNN harmanı; 0=sadece WNMF, 1=sadece KNN, 0.3 önerilen.</td></tr>
@@ -1970,7 +2070,7 @@ const ALGOS = [
   'H1_HHO+HGS', 'H4_MFO+HHO',
   'H9_QSA+CDO', 'H12_MFO+CDO', 'H13_HHO+GAop',
   'H5_GAHHO', 'H5_EliteGA+HHO',
-  'DOA', 'LF_HHO', 'SFOA', 'SFOA_06',
+  'DOA', 'LF_HHO', 'IWO_HHO', 'SFOA', 'SFOA_06',
   'LIT_CIRCLESA', 'LIT_GOA', 'LIT_GWO', 'LIT_SSA', 'LIT_PSO',
   'HA_AVOAHGS',
 ];
@@ -2040,10 +2140,22 @@ function isDefault(el) {
 // =============================================================
 // Suffix üretici (generate_assignments.py mantığını birebir taklit eder)
 // =============================================================
+function pruneSuffixPart(ga) {
+  if (ga['--no-prune']) return '';
+  const minU = parseInt(ga['--min-user-ratings'] ?? '5', 10);
+  const minI = parseInt(ga['--min-item-ratings'] ?? '10', 10);
+  if ((minU || 0) <= 0 && (minI || 0) <= 0) return '';
+  return `_pruneu${minU}_i${minI}`;
+}
+
+function metaInitSuffixPart(ga) {
+  const raw = (ga['--init-mode'] || '').trim();
+  const im = raw || (ga['--paper-mode'] ? 'random' : 'mkpp');
+  return im === 'random' ? '_irand' : '_imkpp';
+}
+
 function buildAssignmentSuffix(ga) {
-  const minU = ga['--min-user-ratings'] || '5';
-  const minI = ga['--min-item-ratings'] || '10';
-  let suffix = `_pruneu${minU}_i${minI}`;
+  let suffix = pruneSuffixPart(ga);
 
   if (ga['--zscore']) suffix += '_zscore';
 
@@ -2066,6 +2178,8 @@ function buildAssignmentSuffix(ga) {
   const cm = ga['--cluster-metric'] || 'auto';
   if (cm === 'fuzzy') suffix += '_fuzzy';
   else if (cm === 'euclidean') suffix += '_euc';
+
+  suffix += metaInitSuffixPart(ga);
 
   if (ga['--paper-mode']) suffix += '_paper';
   else if (ga['--no-gray-sheep']) suffix += '_nogs';
@@ -2105,6 +2219,9 @@ function buildCommand(scriptPath, formId, opts = {}) {
   for (const el of argEls) {
     const arg = el.dataset.arg;
     if (arg.startsWith('__')) continue; // bias gibi özel
+    if (arg === '--min-user-ratings' || arg === '--min-item-ratings') {
+      if (v['--no-prune']) continue;
+    }
     if (el.type === 'checkbox') {
       if (el.checked) lines.push(`  ${arg}`);
       continue;
@@ -2365,6 +2482,19 @@ document.getElementById('algo-list-wnmf').addEventListener('change', () => {
 });
 
 // Tüm form alanlarına input listener
+function syncPruneThresholdUi() {
+  const off = document.getElementById('ga-no-prune')?.checked;
+  const box = document.getElementById('ga-prune-thresholds');
+  if (!box) return;
+  box.querySelectorAll('input').forEach(inp => { inp.disabled = !!off; });
+  box.style.opacity = off ? '0.45' : '1';
+}
+document.getElementById('ga-no-prune')?.addEventListener('change', () => {
+  syncPruneThresholdUi();
+  regenerateAll();
+});
+syncPruneThresholdUi();
+
 document.querySelectorAll('#form-ga, #form-wnmf').forEach(form => {
   form.addEventListener('input', regenerateAll);
   form.addEventListener('change', regenerateAll);
@@ -2483,10 +2613,11 @@ document.querySelectorAll('[data-wpreset]').forEach(b => {
       setW('--k', '14');
       setW('--mode', 'baselines');
       setW('--no-global', true);
-      setW('--no-cluster-avg', false);
+      setW('--no-cluster-avg', true);
       setW('--no-cluster-knn', false);
       setW('--similarity', 'pearson');
       setW('--knn', '14');
+      setW('--knn-mode', 'full_soft');
     } else if (p === 'sharedV') {
       setW('--dataset', '100k');
       setW('--k', '14');
@@ -2580,6 +2711,7 @@ const PS_SUFFIX_FUNC = `
 function Get-AssignSuffix {
   param(
     [int]$MinU, [int]$MinI,
+    [bool]$NoPrune = $false,
     [bool]$Zscore,
     [string]$Pca,
     [int]$WnmfFeat,
@@ -2588,10 +2720,14 @@ function Get-AssignSuffix {
     [bool]$Paper, [bool]$NoGs,
     [string]$Preprocess, [string]$Fe, [int]$Components,
     [int]$K,
+    [string]$InitMode = "mkpp",
     [bool]$KmRefine = $false,
     [string]$Algo = ""
   )
-  $s = "_pruneu$($MinU)_i$($MinI)"
+  $s = ""
+  if (-not $NoPrune -and ($MinU -gt 0 -or $MinI -gt 0)) {
+    $s = "_pruneu$($MinU)_i$($MinI)"
+  }
   if ($Zscore) { $s += "_zscore" }
   if ($Pca -ne "") { $s += "_pca$([int][math]::Round([double]$Pca * 100))pct" }
   # Yol A.2: legacy --wnmf-features verildiyse SADECE init/trim etiketi düşer.
@@ -2601,6 +2737,7 @@ function Get-AssignSuffix {
   }
   if ($Metric -eq "fuzzy")    { $s += "_fuzzy" }
   elseif ($Metric -eq "euclidean") { $s += "_euc" }
+  if ($InitMode -eq "random") { $s += "_irand" } else { $s += "_imkpp" }
   if ($Paper) { $s += "_paper" }
   elseif ($NoGs) { $s += "_nogs" }
   $s += "_$($Preprocess)_$($Fe)$($Components)_k$($K)"
@@ -2671,13 +2808,14 @@ function buildGridScript() {
   // Tahmin
   const chain = document.getElementById('grid-chain-predict').checked;
   const knns  = chain ? gridSplit(document.getElementById('grid-pred-knn').value) : [];
+  const knnModes = chain ? gridSplit(document.getElementById('grid-pred-knn-mode').value) : [];
   const sims  = chain ? gridSplit(document.getElementById('grid-pred-sim').value) : [];
   const foldInp = chain ? (document.getElementById('grid-pred-fold')?.value || '').trim() : '';
   const predFolds = chain ? (foldInp ? gridSplit(foldInp) : ['']) : [''];
 
   let total = ks.length * combos.length * gsModes.length;
   if (chain) {
-    total *= Math.max(1, knns.length) * Math.max(1, sims.length) * predFolds.length;
+    total *= Math.max(1, knns.length) * Math.max(1, knnModes.length) * Math.max(1, sims.length) * predFolds.length;
   }
   document.getElementById('grid-total').textContent = total;
 
@@ -2695,6 +2833,7 @@ function buildGridScript() {
 
   const minU = vals['--min-user-ratings'] || '5';
   const minI = vals['--min-item-ratings'] || '10';
+  const flagNoPrune = flags['--no-prune'] ? '$true' : '$false';
   const initMode = vals['--init-mode'] || '';
   const jobs = vals['--jobs'] || '';
   const flagF = flags['--fcm'] ? '$true' : '$false';
@@ -2706,6 +2845,7 @@ function buildGridScript() {
   lines.push(`$dataset    = "${dataset}"`);
   lines.push(`$minU       = ${minU}`);
   lines.push(`$minI       = ${minI}`);
+  lines.push(`$noPrune    = ${flagNoPrune}`);
   lines.push(`$initMode   = "${initMode}"`);
   lines.push(`$jobs       = "${jobs}"`);
   lines.push(`$useFcm     = ${flagF}`);
@@ -2735,6 +2875,7 @@ function buildGridScript() {
 
   if (chain) {
     lines.push(`$knns = @(${(knns.length ? knns : ['14']).map(x => `"${x}"`).join(', ')})`);
+    lines.push(`$knnModes = @(${(knnModes.length ? knnModes : ['cluster']).map(x => `"${x}"`).join(', ')})`);
     lines.push(`$sims = @(${(sims.length ? sims : ['pearson']).map(x => `"${x}"`).join(', ')})`);
     lines.push(`$predMode      = "${document.getElementById('grid-pred-mode').value}"`);
     lines.push(`$predNoAvg     = ${document.getElementById('grid-pred-no-avg').checked ? '$true' : '$false'}`);
@@ -2773,10 +2914,11 @@ function buildGridScript() {
   lines.push(`        "--preprocess", $sc.Pp,`);
   lines.push(`        "--feature-extraction", $sc.Fe,`);
   lines.push(`        "--svd-components", $sc.Dim,`);
-  lines.push(`        "--cluster-metric", $sc.Cm,`);
-  lines.push(`        "--min-user-ratings", $minU,`);
-  lines.push(`        "--min-item-ratings", $minI`);
+  lines.push(`        "--cluster-metric", $sc.Cm`);
   lines.push(`      )`);
+  lines.push(`      if (-not $noPrune) {`);
+  lines.push(`        $args += @("--min-user-ratings", $minU, "--min-item-ratings", $minI)`);
+  lines.push(`      } else { $args += "--no-prune" }`);
   lines.push(`      if ($sc.Zscore)    { $args += "--zscore" }`);
   lines.push(`      if ($useLof)       { $args += "--lof" }`);
   lines.push(`      if ($noGraySheep)  { $args += "--no-gray-sheep" }`);
@@ -2793,33 +2935,40 @@ function buildGridScript() {
 
   if (chain) {
     lines.push(`      # Atama klasörü suffix'i (kmref durumunda B0_KMEANS hariç _kmref eklenir)`);
-    lines.push(`      $suffixBase = Get-AssignSuffix -MinU $minU -MinI $minI \``);
+    lines.push(`      $effInit = if ($initMode) { $initMode } else { "mkpp" }`);
+    lines.push(`      $suffixBase = Get-AssignSuffix -MinU $minU -MinI $minI -NoPrune $noPrune \``);
     lines.push(`        -Zscore $sc.Zscore -Pca $sc.Pca \``);
     lines.push(`        -WnmfFeat 0 -WnmfInit "inmed" -TrimLow 5.0 -TrimHigh 95.0 \``);
     lines.push(`        -Metric $sc.Cm -Paper $false -NoGs $noGraySheep \``);
     lines.push(`        -Preprocess $sc.Pp -Fe $sc.Fe -Components ([int]$sc.Dim) -K ([int]$k) \``);
-    lines.push(`        -KmRefine $false -Algo "B0_KMEANS"`);
-    lines.push(`      $suffixRefined = Get-AssignSuffix -MinU $minU -MinI $minI \``);
+    lines.push(`        -InitMode $effInit -KmRefine $false -Algo "B0_KMEANS"`);
+    lines.push(`      $suffixRefined = Get-AssignSuffix -MinU $minU -MinI $minI -NoPrune $noPrune \``);
     lines.push(`        -Zscore $sc.Zscore -Pca $sc.Pca \``);
     lines.push(`        -WnmfFeat 0 -WnmfInit "inmed" -TrimLow 5.0 -TrimHigh 95.0 \``);
     lines.push(`        -Metric $sc.Cm -Paper $false -NoGs $noGraySheep \``);
     lines.push(`        -Preprocess $sc.Pp -Fe $sc.Fe -Components ([int]$sc.Dim) -K ([int]$k) \``);
-    lines.push(`        -KmRefine $kmRefine -Algo "OTHER"`);
+    lines.push(`        -InitMode $effInit -KmRefine $kmRefine -Algo "OTHER"`);
     lines.push('');
     lines.push(`      $algosBase    = $algos | Where-Object { $_ -eq "B0_KMEANS" }`);
     lines.push(`      $algosRefined = $algos | Where-Object { $_ -ne "B0_KMEANS" }`);
+    lines.push(`      $splitWnmfBySuffix = $kmRefine -and ($suffixBase -ne $suffixRefined)`);
     lines.push('');
     lines.push(`      foreach ($fd in $predFolds) {`);
+    lines.push(`        foreach ($knnMode in $knnModes) {`);
     lines.push(`        foreach ($knn in $knns) {`);
     lines.push(`          foreach ($sim in $sims) {`);
-    lines.push(`            Write-Host "  -> tahmin: fold=$fd knn=$knn sim=$sim mode=$predMode" -ForegroundColor Yellow`);
+    lines.push(`            Write-Host "  -> tahmin: fold=$fd knn-mode=$knnMode knn=$knn sim=$sim mode=$predMode" -ForegroundColor Yellow`);
     lines.push('');
     lines.push(`            $predGroups = @()`);
-    lines.push(`            if ($algosRefined.Count -gt 0) {`);
-    lines.push(`              $predGroups += ,@{ Algos = $algosRefined; Suffix = $suffixRefined }`);
-    lines.push(`            }`);
-    lines.push(`            if ($algosBase.Count -gt 0) {`);
-    lines.push(`              $predGroups += ,@{ Algos = $algosBase; Suffix = $suffixBase }`);
+    lines.push(`            if ($splitWnmfBySuffix) {`);
+    lines.push(`              if ($algosRefined.Count -gt 0) {`);
+    lines.push(`                $predGroups += ,@{ Algos = $algosRefined; Suffix = $suffixRefined }`);
+    lines.push(`              }`);
+    lines.push(`              if ($algosBase.Count -gt 0) {`);
+    lines.push(`                $predGroups += ,@{ Algos = $algosBase; Suffix = $suffixBase }`);
+    lines.push(`              }`);
+    lines.push(`            } else {`);
+    lines.push(`              $predGroups += ,@{ Algos = $algos; Suffix = $suffixBase }`);
     lines.push(`            }`);
     lines.push('');
     lines.push(`            foreach ($grp in $predGroups) {`);
@@ -2832,8 +2981,9 @@ function buildGridScript() {
     lines.push(`                "--mode", $predMode,`);
     lines.push(`                "--similarity", $sim,`);
     lines.push(`                "--knn", $knn,`);
-    lines.push(`                "--algo"`);
-    lines.push(`              ) + $grp.Algos`);
+    lines.push(`              )`);
+    lines.push(`              if ($knnMode -eq "full_soft") { $pargs += @("--knn-mode", "full_soft") }`);
+    lines.push(`              $pargs += @("--algo") + $grp.Algos`);
     lines.push(`              if ($predNoAvg)    { $pargs += "--no-cluster-avg" }`);
     lines.push(`              if ($predNoGlobal) { $pargs += "--no-global" }`);
     lines.push(`              if ($predAlgoJobs -ne "") { $pargs += @("--algo-jobs", $predAlgoJobs) }`);
@@ -2841,6 +2991,7 @@ function buildGridScript() {
     lines.push(`              python @pargs`);
     lines.push(`            }`);
     lines.push(`          }`);
+    lines.push(`        }`);
     lines.push(`        }`);
     lines.push(`      }`);
   }

@@ -40,6 +40,8 @@ def _parse_child_flags(extra: Sequence[str]) -> dict:
         "zscore": False,
         "min_user_ratings": 5,
         "min_item_ratings": 10,
+        "no_prune": False,
+        "init_mode": "mkpp",
         "wnmf_init": "inmed",
         "inmed_trim_low": 5.0,
         "inmed_trim_high": 95.0,
@@ -64,6 +66,16 @@ def _parse_child_flags(extra: Sequence[str]) -> dict:
             i += 1
             continue
         if a in ("-j", "--jobs") and i + 1 < len(it):
+            i += 2
+            continue
+        if a == "--no-prune":
+            o["no_prune"] = True
+            o["min_user_ratings"] = 0
+            o["min_item_ratings"] = 0
+            i += 1
+            continue
+        if a == "--init-mode" and i + 1 < len(it):
+            o["init_mode"] = it[i + 1]
             i += 2
             continue
         if a == "--min-user-ratings" and i + 1 < len(it):
@@ -122,7 +134,12 @@ def _resolve_cluster_metric(raw: str, wnmf_dim: int) -> str:
 def _build_out_suffix(wnmf_dim: int, fl: dict) -> str:
     """generate_assignments.py out_suffix ile aynı (satır 1329–1344)."""
     m = _resolve_cluster_metric(fl["cluster_metric"], wnmf_dim)
-    prune = f"_pruneu{fl['min_user_ratings']}_i{fl['min_item_ratings']}"
+    mu, mi = int(fl["min_user_ratings"]), int(fl["min_item_ratings"])
+    prune = (
+        ""
+        if fl.get("no_prune") or (mu <= 0 and mi <= 0)
+        else f"_pruneu{mu}_i{mi}"
+    )
     z = "_zscore" if fl["zscore"] else ""
     pca = fl["pca_variance"]
     pca_s = (
@@ -134,7 +151,9 @@ def _build_out_suffix(wnmf_dim: int, fl: dict) -> str:
     )
     metric_map = {"euclidean": "_euc", "fuzzy": "_fuzzy"}
     met_s = metric_map.get(m, "")
-    return prune + z + pca_s + wnmf_s + met_s
+    init_m = (fl.get("init_mode") or "mkpp").strip().lower()
+    init_s = "_irand" if init_m == "random" else "_imkpp"
+    return prune + z + pca_s + wnmf_s + met_s + init_s
 
 
 def _k_folder_suffix(k: int, default_k: int) -> str:

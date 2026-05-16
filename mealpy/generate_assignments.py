@@ -14,8 +14,9 @@ Gray sheep tespiti:
 
     Her ikisinde de:
     ├── ml100k/
-    │   ├── B1_HHO/              ← K=90 (default)
-    │   ├── B1_HHO_k70/          ← K=70 (--k 70)
+    │   ├── B1_HHO/              ← K=7 (default, eski düzen)
+    │   ├── B1_HHO_pruneu5_..._minmax_svd20_k14/  ← --k 14 (yeni düzen)
+    │   ├── B1_HHO_k70/          ← K=70 (eski düzen, args yok)
     │   └── H4_MFO+HHO/
     └── ml1m/
         └── ...
@@ -99,7 +100,7 @@ K_1M_DEFAULT   = 7
 
 GLOBAL_EPOCH   = 30
 LOCAL_EPOCH    = 20
-BASELINE_EPOCH = 50
+BASELINE_EPOCH = 100
 POP_SIZE       = 30
 SEED           = 42
 
@@ -120,6 +121,7 @@ ALGO_CONFIG = [
     ('H5_EliteGA+HHO', 'GA.EliteMultiGA', 'HHO.OriginalHHO'),
     ('DOA', 'DOA.OriginalDOA', None),
     ('LF_HHO', 'LF_HHO', None),
+    ('IWO_HHO', 'IWO_HHO', None),
     ('SFOA', 'SFOA', None),
     ('SFOA_06', 'SFOA_06', None),
     ('LIT_CIRCLESA', 'CircleSA.OriginalCircleSA', None),
@@ -314,6 +316,112 @@ def run_single(algo_info, matrix, K, init, epoch, pop_size, metric: str = 'pears
     best_fit = float(model.g_best.target.fitness)
     print(f"    {algo_info['full_name'].split('.')[0]} WCSS: {best_fit:.4f}")
     return model.g_best.solution, best_fit
+
+
+def run_single_with_early_stop(
+    algo_info,
+    matrix,
+    K,
+    init,
+    max_epoch,
+    pop_size,
+    metric: str = 'pearson',
+    patience: int = 10,
+    tolerance: float = 1e-6,
+    block_size: int = 5,
+):
+    """
+    mealpy epoch callback olmadığı için optimizasyonu bloklar halinde çalıştırır.
+    patience ardışık blok boyunca tolerance altında iyileşme yoksa durur.
+    """
+    problem = _make_problem(matrix, K, metric=metric)
+    block_size = max(1, int(block_size))
+    max_epoch = max(1, int(max_epoch))
+    patience = max(1, int(patience))
+
+    best_fit = float('inf')
+    best_sol = None
+    no_improve = 0
+    actual_epochs = 0
+
+    lb = np.array(problem["bounds"].lb)
+    ub = np.array(problem["bounds"].ub)
+    rng = np.random.default_rng(SEED)
+    current_pop = [
+        np.asarray(s, dtype=np.float64).copy() for s in init[:pop_size]
+    ]
+    while len(current_pop) < pop_size:
+        current_pop.append(rng.uniform(lb, ub))
+
+    algo_short = algo_info['full_name'].split('.')[0]
+
+    def _run_block(epochs: int, block_idx: int) -> bool:
+        """Bir blok çalıştır. True dönerse early stop tetiklendi."""
+        nonlocal best_fit, best_sol, no_improve, actual_epochs, current_pop
+
+        sp_block = get_special_params(algo_info['full_name'], epochs, pop_size)
+        block_model = algo_info['class'](
+            **(sp_block or {'epoch': epochs, 'pop_size': pop_size})
+        )
+        try:
+            block_model.solve(problem, starting_solutions=current_pop)
+        except TypeError:
+            block_model.solve(problem)
+
+        new_fit = float(block_model.g_best.target.fitness)
+        actual_epochs += epochs
+
+        pop = getattr(block_model, 'pop', None)
+        if pop:
+            current_pop = [
+                np.asarray(a.solution, dtype=np.float64).copy() for a in pop
+            ]
+        else:
+            current_pop[0] = np.asarray(
+                block_model.g_best.solution, dtype=np.float64,
+            ).copy()
+
+        improvement = best_fit - new_fit
+        if improvement > tolerance:
+            best_fit = new_fit
+            best_sol = np.asarray(
+                block_model.g_best.solution, dtype=np.float64,
+            ).copy()
+            no_improve = 0
+        else:
+            no_improve += 1
+
+        print(
+            f"    Block {block_idx}: fitness={new_fit:.6f}, "
+            f"improvement={improvement:.2e}, "
+            f"no_improve={no_improve}/{patience}"
+        )
+        return no_improve >= patience
+
+    n_blocks = max_epoch // block_size
+    remainder = max_epoch % block_size
+    stopped = False
+
+    for block in range(n_blocks):
+        if _run_block(block_size, block + 1):
+            print(f"    Early stop: {actual_epochs} epoch'ta converge")
+            stopped = True
+            break
+
+    if not stopped and remainder > 0 and actual_epochs < max_epoch:
+        if _run_block(remainder, n_blocks + 1):
+            print(f"    Early stop: {actual_epochs} epoch'ta converge")
+
+    if best_sol is None:
+        raise RuntimeError(
+            f"{algo_info['full_name']}: early-stop sonrası geçerli çözüm yok"
+        )
+
+    print(
+        f"    {algo_short} WCSS: {best_fit:.4f} "
+        f"({actual_epochs}/{max_epoch} epoch)"
+    )
+    return best_sol, best_fit, actual_epochs
 
 
 def run_hybrid(g_info, l_info, matrix, K, init, g_epoch, l_epoch, pop_size,
@@ -567,11 +675,13 @@ def save_assignment(assignments, gray_mask, best_sol, best_fit,
     if _DB_AVAILABLE:
         # preprocessing label belirle
         prep_parts = []
-        prep_parts.append(
-            f"prune_u{getattr(args, 'min_user_ratings', 5)}_i{getattr(args, 'min_item_ratings', 10)}"
-        )
+        _pu = getattr(args, 'min_user_ratings', 5)
+        _pi = getattr(args, 'min_item_ratings', 10)
+        if _pu > 0 or _pi > 0:
+            prep_parts.append(f"prune_u{_pu}_i{_pi}")
         if getattr(args, 'zscore', False):
             prep_parts.append('zscore')
+        prep_parts.append(f"init_{getattr(args, 'init_mode', 'mkpp')}")
         if getattr(args, 'pca', None):
             if args.pca < 1.0:
                 prep_parts.append(f'pca{int(args.pca*100)}pct')
@@ -718,7 +828,12 @@ def _run_one_core(
         assignments = km.labels_
     elif label == 'HA_AVOAHGS':
         from optimizers.HA_AVOAHGS import HA_AVOAHGS
-        model = HA_AVOAHGS(epoch=500, pop_size=30, hgs_rate=0.3)
+
+        model = HA_AVOAHGS(
+            epoch=baseline_epoch,
+            pop_size=pop_size,
+            hgs_rate=0.3,
+        )
         problem = _make_problem(matrix, K, metric=cluster_metric)
         try:
             model.solve(problem, starting_solutions=init[:pop_size])
@@ -772,6 +887,21 @@ def _run_one_core(
         best_fit, _ = compute_wcss_fast(
             matrix, best_sol, K, metric=cluster_metric,
         )
+    elif g_name == 'IWO_HHO' or label == 'IWO_HHO':
+        from optimizers.iwo_hho import IWO_HHO_Clustering
+
+        problem = _make_problem(matrix, K, metric=cluster_metric)
+        iwo_hho = IWO_HHO_Clustering(
+            epoch=baseline_epoch,
+            pop_size=pop_size,
+            seed=seed,
+        )
+        try:
+            best_sol, best_fit = iwo_hho.solve(
+                problem, starting_solutions=init[:pop_size],
+            )
+        except TypeError:
+            best_sol, best_fit = iwo_hho.solve(problem)
     elif label in ('SFOA', 'SFOA_06') or g_name in ('SFOA', 'SFOA_06'):
         gp_map = {'SFOA': 0.5, 'SFOA_06': 0.6}
         sfoa_key = label if label in gp_map else g_name
@@ -789,10 +919,20 @@ def _run_one_core(
             matrix, best_sol, K, metric=cluster_metric,
         )
     elif l_name is None:
-        best_sol, best_fit = run_single(
-            algo_map[g_name], matrix, K, init, baseline_epoch, pop_size,
-            metric=cluster_metric,
-        )
+        if args is not None and getattr(args, 'early_stop', False):
+            best_sol, best_fit, actual_epochs = run_single_with_early_stop(
+                algo_map[g_name], matrix, K, init, baseline_epoch, pop_size,
+                metric=cluster_metric,
+                patience=getattr(args, 'early_stop_patience', 10),
+                tolerance=getattr(args, 'early_stop_tolerance', 1e-6),
+                block_size=getattr(args, 'early_stop_block', 5),
+            )
+            print(f"    Early-stop epoch: {actual_epochs}/{baseline_epoch}")
+        else:
+            best_sol, best_fit = run_single(
+                algo_map[g_name], matrix, K, init, baseline_epoch, pop_size,
+                metric=cluster_metric,
+            )
     elif '||' in label:
         best_sol, best_fit = run_parallel_hybrid(
             algo_map[g_name], algo_map[l_name],
@@ -1024,6 +1164,23 @@ def load_movielens_1m(path):
     return matrix
 
 
+def format_prune_folder_suffix(min_user_ratings: int, min_item_ratings: int) -> str:
+    """Klasör out_suffix: budama kapalıysa boş, aksi halde _pruneu{N}_i{M}."""
+    if int(min_user_ratings) <= 0 and int(min_item_ratings) <= 0:
+        return ''
+    return f'_pruneu{int(min_user_ratings)}_i{int(min_item_ratings)}'
+
+
+def format_init_mode_folder_suffix(init_mode: str) -> str:
+    """Meta-sezgisel centroid başlatma (--init-mode): _imkpp veya _irand."""
+    mode = (init_mode or 'mkpp').strip().lower()
+    if mode == 'random':
+        return '_irand'
+    if mode != 'mkpp':
+        raise ValueError(f"init_mode bilinmiyor: {init_mode!r} (mkpp | random)")
+    return '_imkpp'
+
+
 def prune_sparse_matrix(matrix, min_user_ratings=5, min_item_ratings=10):
     """
     İteratif seyreklik budama:
@@ -1180,9 +1337,16 @@ def prepare_matrix_for_clustering(
     if zscore:
         matrix = zscore_normalize(matrix)
         print("  Z-score normalizasyon uygulandı")
+        rated = matrix != 0
+        if np.any(rated):
+            min_val = float(matrix[rated].min())
+            if min_val < 0:
+                matrix = matrix.copy()
+                matrix[rated] = matrix[rated] - min_val
+                print(f"  Shift uygulandı: {min_val:.4f} kaydırıldı")
         # Pearson benzerliği ile K-Means (L2/Euclidean) geometrisini hizala.
         matrix = normalize(matrix, norm='l2', axis=1).astype(np.float32, copy=False)
-        print("  L2 normalization uygulandı (axis=1)")
+        print("  L2 normalization uygulandı")
     if pca_var is not None:
         matrix = pca_variance_reduce(matrix, pca_var)
     R_matrix = matrix
@@ -1260,9 +1424,9 @@ def run_dataset(dataset_name, matrix, K, out_root, algo_filter=None,
     print(f"Init modu   : {init_mode}")
     print(f"{'='*60}")
 
-    # K=default için suffix yok, farklı K için _k{K} eklenir (assign_suffix boşken)
+    # Yeni düzen: K yalnızca assign_suffix sonunda (..._k{K}); label önünde _k{K} yok.
+    # Eski düzen (args yok): K ≠ varsayılan → label_k{K} + out_suffix.
     default_k = K_100K_DEFAULT if dataset_name == 'ml100k' else K_1M_DEFAULT
-    k_suffix  = '' if K == default_k else f'_k{K}'
 
     skip_existing = bool(getattr(args, 'skip_existing', False)) if args is not None else False
 
@@ -1273,14 +1437,15 @@ def run_dataset(dataset_name, matrix, K, out_root, algo_filter=None,
             print(f"  [{label}] atlandı (filtre)")
             continue
         assign_suffix = ''
+        k_suffix = ''
         if args is not None:
-            assign_suffix = f'_{args.preprocess}_{args.feature_extraction}{args.svd_components}_k{K}'
-            # KMeans refinement aktifse klasör adında belirt (B0_KMEANS hariç,
-            # zaten KMeans olduğu için refinement uygulanmaz).
+            assign_suffix = (
+                f'_{args.preprocess}_{args.feature_extraction}{args.svd_components}_k{K}'
+            )
             if getattr(args, 'kmeans_refine', False) and label != 'B0_KMEANS':
                 assign_suffix += '_kmref'
-            # K zaten assign_suffix sonunda; klasörde ..._k{K}_..._k{K} tekrar etmesin
-            k_suffix = ''
+        else:
+            k_suffix = '' if K == default_k else f'_k{K}'
         save_dir = os.path.join(out_root, dataset_name, f"{label}{k_suffix}{out_suffix}{assign_suffix}")
 
         if skip_existing and os.path.exists(os.path.join(save_dir, 'assignments.npy')):
@@ -1434,12 +1599,17 @@ def parse_args():
         help='FCM soft membership üret',
     )
     p.add_argument(
+        '--no-prune', action='store_true',
+        help='Kullanıcı/film budamasını kapatır (min-user ve min-item 0). '
+             'Klasör adında _pruneu... eklenmez. Eşdeğer: --min-user-ratings 0 --min-item-ratings 0.',
+    )
+    p.add_argument(
         '--min-user-ratings', type=int, default=5, metavar='N',
-        help='Veri budama: kullanıcı başına minimum rating sayısı (default: 5)',
+        help='Veri budama: kullanıcı başına minimum rating sayısı (default: 5; 0=budama yok)',
     )
     p.add_argument(
         '--min-item-ratings', type=int, default=10, metavar='N',
-        help='Veri budama: film başına minimum rating sayısı (default: 10)',
+        help='Veri budama: film başına minimum rating sayısı (default: 10; 0=budama yok)',
     )
     p.add_argument(
         '--wnmf-features', type=int, default=None,
@@ -1526,6 +1696,22 @@ def parse_args():
         '--kmeans-refine-iter', type=int, default=300, metavar='N',
         help='KMeans refinement için max_iter (default: 300; önerilen 100-500).'
     )
+    p.add_argument(
+        '--early-stop', action='store_true',
+        help='Tek-algoritma (l_name=None) mealpy koşularında blok bazlı erken durdurma',
+    )
+    p.add_argument(
+        '--early-stop-patience', type=int, default=10, metavar='N',
+        help='Early-stop: ardışık blok sayısı (default: 10)',
+    )
+    p.add_argument(
+        '--early-stop-tolerance', type=float, default=1e-6,
+        help='Early-stop: minimum fitness iyileşmesi (default: 1e-6)',
+    )
+    p.add_argument(
+        '--early-stop-block', type=int, default=5, metavar='N',
+        help='Early-stop: her kontrol öncesi epoch bloğu (default: 5)',
+    )
     args = p.parse_args()
     if args.k is not None and (args.k_100k is not None or args.k_1m is not None):
         p.error('--k (tek veya çoklu) ile --k-100k / --k-1m birlikte kullanılamaz')
@@ -1556,6 +1742,9 @@ def parse_args():
                 f"{args.wnmf_features} olarak güncellendi (--wnmf-features ile eşleşti)."
             )
             args.svd_components = args.wnmf_features
+    if getattr(args, 'no_prune', False):
+        args.min_user_ratings = 0
+        args.min_item_ratings = 0
     if args.min_user_ratings < 0:
         p.error('--min-user-ratings 0 veya daha büyük olmalı')
     if args.min_item_ratings < 0:
@@ -1637,9 +1826,13 @@ if __name__ == '__main__':
     if _DB_AVAILABLE and start_run is not None:
         try:
             prep_parts = []
-            prep_parts.append(f"prune_u{args.min_user_ratings}_i{args.min_item_ratings}")
+            if args.min_user_ratings > 0 or args.min_item_ratings > 0:
+                prep_parts.append(
+                    f"prune_u{args.min_user_ratings}_i{args.min_item_ratings}"
+                )
             if getattr(args, 'zscore', False):
                 prep_parts.append('zscore')
+            prep_parts.append(f"init_{args.init_mode}")
             if getattr(args, 'pca', None):
                 if args.pca < 1.0:
                     prep_parts.append(f'pca{int(args.pca * 100)}pct')
@@ -1708,7 +1901,12 @@ if __name__ == '__main__':
     print(f"Epoch       : baseline={BASELINE_EPOCH}, global={GLOBAL_EPOCH}, local={LOCAL_EPOCH}")
     print(f"Pop size    : {POP_SIZE}  |  Seed: {SEED}")
     feat_bits = []
-    feat_bits.append(f"Prune(u>={args.min_user_ratings}, i>={args.min_item_ratings})")
+    if args.min_user_ratings <= 0 and args.min_item_ratings <= 0:
+        feat_bits.append('Prune: kapalı')
+    else:
+        feat_bits.append(
+            f"Prune(u>={args.min_user_ratings}, i>={args.min_item_ratings})"
+        )
     if args.zscore:
         feat_bits.append('Z-score')
     if args.pca_variance is not None:
@@ -1747,7 +1945,9 @@ if __name__ == '__main__':
             return None  # otomatik: _resolve_pool_workers CPU sayısını kullanır
         return args.jobs
 
-    prune_suffix = f"_pruneu{args.min_user_ratings}_i{args.min_item_ratings}"
+    prune_suffix = format_prune_folder_suffix(
+        args.min_user_ratings, args.min_item_ratings,
+    )
     zscore_suffix = '_zscore' if args.zscore else ''
     pca_suffix = (
         f'_pca{int(round(args.pca_variance * 100))}pct'
@@ -1766,11 +1966,12 @@ if __name__ == '__main__':
         'fuzzy': '_fuzzy',
     }
     metric_suffix = metric_suffix_map.get(args.cluster_metric, '')
+    init_suffix = format_init_mode_folder_suffix(args.init_mode)
     paper_suffix = '_paper' if args.paper_mode else ''
     no_gs_suffix = '_nogs' if args.disable_gray_sheep and not args.paper_mode else ''
     out_suffix = (
         prune_suffix + zscore_suffix + pca_suffix + wnmf_suffix
-        + metric_suffix + paper_suffix + no_gs_suffix
+        + metric_suffix + init_suffix + paper_suffix + no_gs_suffix
     )
 
     try:
