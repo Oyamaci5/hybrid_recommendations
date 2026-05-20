@@ -202,6 +202,14 @@ def _ensure_wnmf_results_columns(conn):
         'fold_mae_values': 'ALTER TABLE wnmf_results ADD COLUMN fold_mae_values TEXT',
         'fold_rmse_values': 'ALTER TABLE wnmf_results ADD COLUMN fold_rmse_values TEXT',
         'ndcg_at_10': 'ALTER TABLE wnmf_results ADD COLUMN ndcg_at_10 REAL',
+        # JOIN olmadan doğrudan sorgulanabilsin diye denormalize kolonlar
+        'algo':          'ALTER TABLE wnmf_results ADD COLUMN algo TEXT',
+        'dataset':       'ALTER TABLE wnmf_results ADD COLUMN dataset TEXT',
+        'k':             'ALTER TABLE wnmf_results ADD COLUMN k INTEGER',
+        'assign_suffix': 'ALTER TABLE wnmf_results ADD COLUMN assign_suffix TEXT',
+        'knn':           'ALTER TABLE wnmf_results ADD COLUMN knn INTEGER',
+        'similarity':    'ALTER TABLE wnmf_results ADD COLUMN similarity TEXT',
+        'fold':          'ALTER TABLE wnmf_results ADD COLUMN fold INTEGER',
     }
     for col, sql in needed.items():
         if col not in existing:
@@ -518,6 +526,10 @@ def save_wnmf_result(
     fold_rmse_values=None,
     run_id=None,
     assignment_id_override=None,
+    assign_suffix=None,
+    knn=None,
+    similarity=None,
+    fold=None,
 ):
     assignment_id = (
         assignment_id_override
@@ -531,8 +543,9 @@ def save_wnmf_result(
          white_mae, white_rmse, precision_at_10, recall_at_10, f1_at_10, ndcg_at_10,
          n_train, n_test, latent_dim, epochs_global, epochs_cluster,
          reg, lr, time_seconds, cv_fold, cv_n_splits, is_cv_mean,
-         mean_mae, mean_rmse, fold_mae_values, fold_rmse_values, created_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         mean_mae, mean_rmse, fold_mae_values, fold_rmse_values, created_at,
+         algo, dataset, k, assign_suffix, knn, similarity, fold)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """
     with get_connection() as conn:
         conn.execute(
@@ -567,6 +580,13 @@ def save_wnmf_result(
                 fold_mae_values,
                 fold_rmse_values,
                 now,
+                algo,
+                dataset,
+                k,
+                assign_suffix,
+                knn,
+                similarity,
+                fold,
             ),
         )
 
@@ -623,38 +643,55 @@ if __name__ == '__main__':
             run = conn.execute(
                 "SELECT * FROM runs WHERE id=?", (rid,)
             ).fetchone()
+            # Önce denormalize kolonlardan oku (JOIN gerekmez, assignment_id NULL olsa bile çalışır)
             results = conn.execute(
-                """SELECT a.algo, a.preprocessing, r.scenario,
-                          r.mae, r.gray_mae, r.white_mae
+                """SELECT
+                       COALESCE(r.algo, a.algo, '?')         AS algo,
+                       COALESCE(r.assign_suffix, a.preprocessing, '?') AS suffix,
+                       COALESCE(r.k, a.k, 0)                 AS k,
+                       r.scenario,
+                       r.similarity,
+                       r.knn,
+                       r.fold,
+                       r.mae, r.rmse,
+                       r.gray_mae, r.white_mae,
+                       r.precision_at_10, r.recall_at_10, r.ndcg_at_10,
+                       r.cv_fold, r.time_seconds
                    FROM wnmf_results r
-                   JOIN assignments a ON a.id = r.assignment_id
+                   LEFT JOIN assignments a ON a.id = r.assignment_id
                    WHERE r.run_id=?
-                   ORDER BY r.mae""",
+                   ORDER BY r.algo, r.mae""",
                 (rid,),
             ).fetchall()
         if run:
             print(f"\nRun #{rid}")
             print(f"  Komut    : {run['command']}")
-            print(f"  Başladı  : {run['started_at']}")
+            print(f"  Basladı  : {run['started_at']}")
             print(f"  Bitti    : {run['finished_at'] or 'devam ediyor'}")
             print(f"  Durum    : {run['status']}")
             if run['note']:
                 print(f"  Not      : {run['note']}")
-            print(f"\n  Sonuçlar ({len(results)} satır):")
+            print(f"\n  Sonuclar ({len(results)} satir):")
             print(
-                f"  {'Algoritma':<18} {'Prep':<15} {'Senaryo':<20} "
-                f"{'MAE':>7} {'GrayMAE':>8} {'WhiteMAE':>9}"
+                f"  {'Algo':<18} {'K':>3} {'Senaryo':<22} {'Sim':<12} {'KNN':>4} "
+                f"{'MAE':>7} {'RMSE':>7} {'P@10':>6} {'R@10':>6} {'NDCG':>6} "
+                f"{'Fold':>5} {'Sn':>6}"
             )
-            print('  ' + '-' * 80)
+            print('  ' + '-' * 110)
             for r in results:
+                fold_s = str(r['fold'] or r['cv_fold'] or '')
+                sim_s = (r['similarity'] or '')[:11]
+                knn_s = str(r['knn'] or '')
                 print(
-                    f"  {r['algo']:<18} {r['preprocessing']:<15} "
-                    f"{r['scenario']:<20} "
-                    f"{_fmt_mae(r['mae'])} {_fmt_gray(r['gray_mae'])} "
-                    f"{_fmt_white(r['white_mae'])}"
+                    f"  {(r['algo'] or '?'):<18} {(r['k'] or 0):>3} "
+                    f"{(r['scenario'] or ''):<22} {sim_s:<12} {knn_s:>4} "
+                    f"{_fmt_mae(r['mae'])} {_fmt_mae(r['rmse'])} "
+                    f"{_fmt_mae(r['precision_at_10'])} {_fmt_mae(r['recall_at_10'])} "
+                    f"{_fmt_mae(r['ndcg_at_10'])} "
+                    f"{fold_s:>5} {(r['time_seconds'] or 0):>6.1f}"
                 )
         else:
-            print(f"Run #{rid} bulunamadı.", file=sys.stderr)
+            print(f"Run #{rid} bulunamadi.", file=sys.stderr)
             sys.exit(1)
 
     elif cmd == 'stats':
@@ -686,8 +723,60 @@ if __name__ == '__main__':
             )
             sys.exit(2)
 
+    elif cmd == 'results':
+        # python assignment_db.py results [algo] [dataset]
+        # Tüm wnmf_results satırlarını algo/dataset filtresiyle göster — JOIN gerektirmez
+        algo_filter = sys.argv[2] if len(sys.argv) > 2 else None
+        ds_filter   = sys.argv[3] if len(sys.argv) > 3 else None
+        where_parts = []
+        params_r = []
+        if algo_filter:
+            where_parts.append('r.algo LIKE ?')
+            params_r.append(f'%{algo_filter}%')
+        if ds_filter:
+            where_parts.append('r.dataset=?')
+            params_r.append(ds_filter)
+        where_sql = ('WHERE ' + ' AND '.join(where_parts)) if where_parts else ''
+        with get_connection() as conn:
+            rows = conn.execute(
+                f"""SELECT r.run_id,
+                           COALESCE(r.algo, a.algo, '?')  AS algo,
+                           COALESCE(r.dataset, a.dataset, '?') AS ds,
+                           COALESCE(r.k, a.k, 0)          AS k,
+                           r.scenario, r.similarity, r.knn, r.fold,
+                           r.mae, r.rmse,
+                           r.precision_at_10, r.ndcg_at_10,
+                           r.assign_suffix, r.created_at
+                    FROM wnmf_results r
+                    LEFT JOIN assignments a ON a.id = r.assignment_id
+                    {where_sql}
+                    ORDER BY r.created_at DESC
+                    LIMIT 200""",
+                params_r,
+            ).fetchall()
+        print(
+            f"\n  {'RunID':>6} {'Algo':<18} {'DS':<7} {'K':>3} "
+            f"{'Senaryo':<22} {'Sim':<12} {'KNN':>4} {'Fold':>5} "
+            f"{'MAE':>7} {'RMSE':>7} {'P@10':>6} {'NDCG':>6}  Suffix"
+        )
+        print('  ' + '-' * 115)
+        for r in rows:
+            fold_s = str(r['fold'] or '')
+            sim_s  = (r['similarity'] or '')[:11]
+            knn_s  = str(r['knn'] or '')
+            suffix_s = (r['assign_suffix'] or '')[:35]
+            print(
+                f"  {(r['run_id'] or 0):>6} {(r['algo'] or '?'):<18} "
+                f"{(r['ds'] or '?'):<7} {(r['k'] or 0):>3} "
+                f"{(r['scenario'] or ''):<22} {sim_s:<12} {knn_s:>4} {fold_s:>5} "
+                f"{_fmt_mae(r['mae'])} {_fmt_mae(r['rmse'])} "
+                f"{_fmt_mae(r['precision_at_10'])} {_fmt_mae(r['ndcg_at_10'])}  "
+                f"{suffix_s}"
+            )
+        print(f"\n  Toplam: {len(rows)} satir")
+
     else:
         print(
-            'Kullanım: python assignment_db.py runs | run <id> | stats <ds> <algo> <k> <prep> '
-            '(repo kökünden çalıştırın)'
+            'Kullanim: python assignment_db.py runs | run <id> | results [algo] [dataset] '
+            '| stats <ds> <algo> <k> <prep>  (repo kokundan calistirin)'
         )

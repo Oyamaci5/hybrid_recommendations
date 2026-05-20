@@ -52,14 +52,14 @@ class HA_AVOAHGS(OriginalAVOA):
         self,
         epoch: int = 500,
         pop_size: int = 30,
-        p1: float = 0.6,
+        p1: float = 0.4,    # grid search optimum: 0.40 (varsayılan 0.6'dan güncellendi)
         p2: float = 0.4,
         p3: float = 0.6,
         alpha: float = 0.8,
         gama: float = 2.5,
         PUP: float = 0.08,
         LH: float = 10000,
-        hgs_rate: float = 0.3,
+        hgs_rate: float = 0.7,  # grid search optimum: 0.70 (varsayılan 0.3'ten güncellendi)
         **kwargs,
     ) -> None:
         super().__init__(

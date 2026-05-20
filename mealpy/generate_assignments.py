@@ -32,6 +32,8 @@ Kullanım:
     python generate_assignments.py --lof --n-neighbors 15 --contamination 0.1
     python generate_assignments.py --jobs 4              # algoritmaları paralel süreçte
     python generate_assignments.py --dataset 100k --paper-mode --algo LIT_GOA --k 30
+    python generate_assignments.py --dataset 100k --algo B_AVOA --cluster-metric fuzzy --no-gray-sheep --k 13
+    #   → AVOA, FCM objective minimize eder; FCM iterasyonuyla centroid rafine edilir; argmax hard assignment
 """
 
 import argparse
@@ -77,6 +79,8 @@ from mealpy_comparison_v2 import (
     detect_gray_sheep,
     get_all_algorithms_v3,
     get_special_params,
+    euclidean_distance_batch,
+    _fcm_memberships_from_dist,
 )
 from mealpy import FloatVar
 from mealpy.evolutionary_based import GA
@@ -136,6 +140,7 @@ ALGO_CONFIG = [
     ('LIT_SSA', 'SSA.OriginalSSA', None),
     ('LIT_PSO', 'PSO.OriginalPSO', None),
     ('HA_AVOAHGS', None, None),
+    ('B_AVOA', 'AVOA.OriginalAVOA', None),
 ]
 
 ALGO_LABELS = [c[0] for c in ALGO_CONFIG]
@@ -627,17 +632,52 @@ def _sklearn_kmeans_init(args) -> str:
     return 'random' if v == 'random' else 'k-means++'
 
 
-def compute_memberships(X, centroids, m=2.0):
-    n_users = X.shape[0]
-    k = centroids.shape[0]
-    memberships = np.zeros((n_users, k), dtype=np.float32)
-    for u in range(n_users):
-        dists = np.linalg.norm(X[u] - centroids, axis=1)
-        dists = np.maximum(dists, 1e-10)
-        inv = 1.0 / (dists ** (2 / (m - 1)))
-        memberships[u] = inv / inv.sum()
-    return memberships
+def compute_memberships(X, centroids, m=2.0, max_iter=50, tol=1e-6):
+    """
+    Gerçek FCM iterasyonu: membership + centroid güncelleme döngüsü.
+    GWO+FCM makalesiyle tam uyumlu:
+        c_k = Σ(u_ik^m × x_i) / Σ(u_ik^m)
+    
+    Parametreler
+    ------------
+    X         : (n_users, n_features) kümeleme matrisi
+    centroids : (K, n_features) başlangıç centroidleri
+    m         : fuzzifier (genellikle 2.0)
+    max_iter  : maksimum iterasyon
+    tol       : centroid değişim eşiği (convergence)
+    
+    Döndürür
+    --------
+    memberships : (n_users, K) float32
+    """
+    centroids = np.asarray(centroids, dtype=np.float64).copy()
+    X = np.asarray(X, dtype=np.float64)
+    K = centroids.shape[0]
 
+    for iteration in range(max_iter):
+        old_centroids = centroids.copy()
+
+        # Adım 1: Mesafe → Membership
+        d2 = euclidean_distance_batch(X, centroids)   # (n_users, K)
+        d  = np.sqrt(np.maximum(d2, 0.0))             # (n_users, K)
+        memberships = _fcm_memberships_from_dist(d, m=m)  # (n_users, K)
+
+        # Adım 2: Centroid güncelle — gerçek FCM formülü
+        weights = memberships ** float(m)              # (n_users, K)
+        denom   = weights.sum(axis=0)                  # (K,)
+        for k in range(K):
+            if denom[k] > 1e-10:
+                centroids[k] = (weights[:, k:k+1] * X).sum(axis=0) / denom[k]
+
+        # Adım 3: Convergence kontrolü
+        change = float(np.linalg.norm(centroids - old_centroids))
+        if change < tol:
+            print(f"    FCM converge: {iteration+1} iterasyonda (change={change:.2e})")
+            break
+    else:
+        print(f"    FCM max_iter={max_iter} tamamlandı (son change={change:.2e})")
+
+    return memberships.astype(np.float32)
 
 def save_assignment(assignments, gray_mask, best_sol, best_fit,
                     save_dir, extra_data=None, label=None, K=None, args=None,
@@ -850,7 +890,8 @@ def _run_one_core(
         model = HA_AVOAHGS(
             epoch=baseline_epoch,
             pop_size=pop_size,
-            hgs_rate=0.3,
+            p1=0.4,
+            hgs_rate=0.7,
         )
         problem = _make_problem(matrix, K, metric=cluster_metric)
         try:
@@ -1051,10 +1092,16 @@ def _run_one_core(
     if getattr(args, 'fcm', False):
         from sklearn.preprocessing import normalize
 
-        X_cluster = normalize(matrix, norm='l2')
-        centroids = best_sol.reshape(K, matrix.shape[1])
-        memberships = compute_memberships(X_cluster, centroids, m=2.0)
-        print(f'FCM memberships kaydedildi: {memberships.shape}')
+        X_cluster  = normalize(matrix, norm='l2')
+        centroids  = best_sol.reshape(K, matrix.shape[1])
+        # Gerçek FCM: centroid + membership iterate ediyor
+        memberships = compute_memberships(
+            X_cluster, centroids, m=2.0, max_iter=50, tol=1e-6
+        )
+        # Hard assignment membership'ten
+        assignments = np.argmax(memberships, axis=1).astype(np.int32)
+        print(f'FCM memberships kaydedildi: {memberships.shape}, '
+          f'aktif küme: {len(np.unique(assignments))}/{K}')
 
     save_assignment(
         assignments, gray_mask, best_sol, best_wcss,
@@ -1365,13 +1412,6 @@ def prepare_matrix_for_clustering(
     if zscore:
         matrix = zscore_normalize(matrix)
         print("  Z-score normalizasyon uygulandı")
-        rated = matrix != 0
-        if np.any(rated):
-            min_val = float(matrix[rated].min())
-            if min_val < 0:
-                matrix = matrix.copy()
-                matrix[rated] = matrix[rated] - min_val
-                print(f"  Shift uygulandı: {min_val:.4f} kaydırıldı")
         # Pearson benzerliği ile K-Means (L2/Euclidean) geometrisini hizala.
         matrix = normalize(matrix, norm='l2', axis=1).astype(np.float32, copy=False)
         print("  L2 normalization uygulandı")

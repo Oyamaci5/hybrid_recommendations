@@ -28,6 +28,7 @@ euclidean_distance_batch = _mod.euclidean_distance_batch
 _compute_metrics = _mod._compute_metrics
 get_all_algorithms_v3 = _mod.get_all_algorithms_v3
 get_special_params = _mod.get_special_params
+_fcm_memberships_from_dist = _mod._fcm_memberships_from_dist
 
 __all__ = [
     "load_movielens",
@@ -42,4 +43,5 @@ __all__ = [
     "_compute_metrics",
     "get_all_algorithms_v3",
     "get_special_params",
+    "_fcm_memberships_from_dist",
 ]

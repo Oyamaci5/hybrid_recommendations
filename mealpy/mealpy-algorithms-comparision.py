@@ -197,20 +197,44 @@ def _fcm_memberships_from_dist(dist_matrix, m: float = 2.0, eps: float = 1e-12):
     return memberships
 
 
-def compute_fcm_objective(matrix, solution, K, m: float = 2.0):
+def compute_fcm_objective(matrix, solution, K, m: float = 2.0,
+                          max_iter: int = 5, tol: float = 1e-4):
     """
-    FCM amaç fonksiyonu:
-        J = sum_i sum_j (u_ij^m) * (d_ij^2)
-    Burada d_ij Öklid mesafesi, d_ij^2 için squared Euclidean kullanılır.
+    Gerçek FCM iterasyonu ile centroid + membership optimize edilir.
+    GWO+FCM makalesiyle tam uyumlu pipeline:
+      1. solution → başlangıç centroidleri
+      2. FCM iterasyonu (membership + centroid güncelle)
+      3. Final J, hard_assignments, memberships döndür
     """
-    centroids = solution.reshape(K, matrix.shape[1])
-    d2 = euclidean_distance_batch(matrix, centroids)   # squared Euclidean
-    d = np.sqrt(np.maximum(d2, 0.0))
-    memberships = _fcm_memberships_from_dist(d, m=m)
-    j_val = float(np.sum((memberships ** float(m)) * d2))
-    hard_assignments = np.argmax(memberships, axis=1).astype(np.int32)
-    return j_val, hard_assignments, memberships
+    centroids = solution.reshape(K, matrix.shape[1]).copy().astype(np.float64)
+    X = matrix.astype(np.float64)
 
+    for iteration in range(max_iter):
+        old_centroids = centroids.copy()
+
+        # Adım 1: Mesafe → Membership
+        d2 = euclidean_distance_batch(X, centroids)
+        d  = np.sqrt(np.maximum(d2, 0.0))
+        memberships = _fcm_memberships_from_dist(d, m=m)
+
+        # Adım 2: Centroid güncelle
+        weights = memberships ** float(m)
+        denom   = weights.sum(axis=0)
+        for k in range(K):
+            if denom[k] > 1e-10:
+                centroids[k] = (weights[:, k:k+1] * X).sum(axis=0) / denom[k]
+
+        # Adım 3: Convergence
+        change = float(np.linalg.norm(centroids - old_centroids))
+        if change < tol:
+            break
+
+    # Final J
+    d2_final = euclidean_distance_batch(X, centroids)
+    j_val    = float(np.sum((memberships ** float(m)) * d2_final))
+    hard_assignments = np.argmax(memberships, axis=1).astype(np.int32)
+
+    return j_val, hard_assignments, memberships.astype(np.float32)
 
 def compute_wcss_fast(matrix, solution, K, metric='pearson'):
     """

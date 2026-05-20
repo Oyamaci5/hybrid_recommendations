@@ -83,9 +83,12 @@ _CURRENT_RUN_ID = None
 from wnmf_model import ALSModel, ClusterWNMF, WNMFModel, WNMFSharedV
 from wnmf_utils import (
     load_ratings_100k,
+    load_ratings_100k_all,
     load_ratings_1m,
     load_assignment,
     load_memberships,
+    load_centroids,
+    resolve_test_cluster_ids,
     split_by_cluster,
     remap_user_ids,
     save_dataframe_csv,
@@ -98,6 +101,7 @@ from wnmf_utils import (
 
 DATA_100K_TRAIN = os.path.join(os.path.dirname(BASE_DIR), 'data', 'ml-100k', 'u1.base')
 DATA_100K_TEST  = os.path.join(os.path.dirname(BASE_DIR), 'data', 'ml-100k', 'u1.test')
+DATA_100K_ALL   = os.path.join(os.path.dirname(BASE_DIR), 'data', 'ml-100k', 'u.data')
 DATA_1M         = os.path.join(os.path.dirname(BASE_DIR), 'data', 'ml-1m', 'ratings.dat')
 ASSIGN_ROOT     = os.path.join(os.path.dirname(BASE_DIR), 'mealpy','results', 'assignments_lof')
 OUT_ROOT        = os.path.join(os.path.dirname(BASE_DIR), 'results', 'wnmf')
@@ -123,6 +127,7 @@ ALGO_LABELS = [
     'H9_QSA+CDO', 'H12_MFO+CDO', 'H13_HHO+GAop', 'HA_AVOAHGS',
     # generate_assignments.py ALGO_CONFIG — önce --lof ile atama üretin
     'LIT_CIRCLESA', 'LIT_GOA', 'LIT_GWO', 'LIT_SSA', 'LIT_PSO',
+    'B_AVOA',
 ]
 
 # Yaygın yazım hatası: --algo H1_HGS+HHO → H1_HHO+HGS
@@ -761,6 +766,232 @@ def run_global_als(train, test, n_items, verbose=False, use_bias=True,
     }
 
 
+def run_global_svd(train, test, n_items, top_n: int = 10,
+                   relevance_threshold: float = 4.0,
+                   n_factors: int = 100, n_epochs: int = 20,
+                   lr_all: float = 0.005, reg_all: float = 0.02):
+    """
+    Surprise SVD (Simon Funk biased MF) — global baseline.
+    Non-negativity kısıtı yok; WNMF ile karşılaştırma için kullanılır.
+
+    Tahmin: r̂_ui = μ + b_u + b_i + q_i · p_u
+    WNMF'den farkı: U/V negatif olabilir → daha düşük MAE.
+    """
+    try:
+        from surprise import SVD as SurpriseSVD, Reader
+        from surprise import Dataset as SurpriseDataset
+    except ImportError:
+        print("  [Global SVD] HATA: 'surprise' kurulu değil → pip install scikit-surprise",
+              file=sys.stderr)
+        return None
+
+    print(f"\n  [Global SVD] başlıyor... (n_factors={n_factors}, n_epochs={n_epochs})")
+    t0 = time.time()
+
+    # numpy array → Surprise trainset
+    reader = Reader(rating_scale=(1, 5))
+    df_train = pd.DataFrame({
+        'uid': train[:, 0].astype(int).astype(str),
+        'iid': train[:, 1].astype(int).astype(str),
+        'rating': train[:, 2].astype(float),
+    })
+    surprise_data = SurpriseDataset.load_from_df(df_train[['uid', 'iid', 'rating']], reader)
+    trainset = surprise_data.build_full_trainset()
+
+    algo = SurpriseSVD(n_factors=n_factors, n_epochs=n_epochs,
+                       lr_all=lr_all, reg_all=reg_all, random_state=RANDOM_SEED)
+    algo.fit(trainset)
+
+    # Test tahmini
+    preds, trues = [], []
+    for row in test:
+        u, i, r = int(row[0]), int(row[1]), float(row[2])
+        p = algo.predict(str(u), str(i)).est
+        p = float(np.clip(p, 1.0, 5.0))
+        preds.append(p)
+        trues.append(r)
+
+    preds = np.array(preds, dtype=np.float32)
+    trues = np.array(trues, dtype=np.float32)
+    errors = trues - preds
+    mae  = float(np.mean(np.abs(errors)))
+    rmse = float(np.sqrt(np.mean(errors ** 2)))
+
+    eval_rows = np.column_stack((test[:, 0], test[:, 1], trues, preds))
+    precision, recall, f1, ndcg = _compute_topn_metrics(
+        eval_rows, top_n=top_n, threshold=relevance_threshold,
+    )
+
+    print(f"  [Global SVD] MAE={mae:.4f}  RMSE={rmse:.4f}  ({time.time()-t0:.1f}s)")
+    return {
+        'scenario'        : 'global',
+        'algo_label'      : f'GLOBAL_SVD_f{n_factors}',
+        'mae'             : mae,
+        'rmse'            : rmse,
+        'gray_mae'        : float('nan'),
+        'gray_rmse'       : float('nan'),
+        'white_mae'       : mae,
+        'white_rmse'      : rmse,
+        'n_clusters'      : 1,
+        'n_train'         : len(train),
+        'n_test'          : len(test),
+        'time_seconds'    : time.time() - t0,
+        'accuracy'        : float('nan'),
+        'precision_at_10' : precision,
+        'recall_at_10'    : recall,
+        'f1_at_10'        : f1,
+        'ndcg_at_10'      : ndcg,
+    }
+
+
+def run_global_knn(train, test, n_items,
+                   similarity: str = 'pearson',
+                   k_neighbors: int = 20,
+                   min_common: int = 3,
+                   top_n: int = 10,
+                   relevance_threshold: float = 4.0):
+    """
+    Kümeleme olmadan tüm kullanıcılar üzerinde User-Based KNN.
+
+    'Kümeleme KNN'i gerçekten iyileştiriyor mu?' sorusunu cevaplar:
+        GLOBAL_KNN   → kümeleme yok, tüm veri
+        ClusterKNN   → küme bazlı, aynı benzerlik metriği
+    Fark pozitifse kümeleme işe yarıyor.
+
+    Hız optimizasyonu: kullanıcı-kullanıcı similarity matrisi bir kez
+    önceden hesaplanır (O(n²) build, O(1) lookup), test tahminleri hızlı.
+    """
+    print(f"\n  [Global KNN] başlıyor... (sim={similarity}, k={k_neighbors})")
+    t0 = time.time()
+
+    # ── Veri yapıları ────────────────────────────────────────────
+    global_mean = float(train[:, 2].mean())
+    user_ratings: dict = {}
+    for row in train:
+        u, i, r = int(row[0]), int(row[1]), float(row[2])
+        user_ratings.setdefault(u, {})[i] = r
+
+    user_means = {
+        u: float(np.mean(list(d.values())))
+        for u, d in user_ratings.items()
+    }
+    item_popularity = build_item_popularity(user_ratings=user_ratings)
+
+    # ── Similarity matrisini önceden hesapla ─────────────────────
+    # item → ratingi olan userlar listesi (hızlı co-rater lookup için)
+    item_users: dict = {}
+    for u, items in user_ratings.items():
+        for i in items:
+            item_users.setdefault(i, set()).add(u)
+
+    all_users = list(user_ratings.keys())
+    print(f"  [Global KNN] Similarity matrisi hesaplanıyor "
+          f"({len(all_users)} kullanıcı)...", flush=True)
+
+    # sim_index[u] = [(sim_val, v), ...] sadece pozitif/anlamlı çiftler
+    sim_index: dict = {u: [] for u in all_users}
+    n_pairs = 0
+    for idx, ua in enumerate(all_users):
+        # ua ile en az min_common ortak filmi olan kullanıcıları bul
+        candidates: dict = {}  # v → ortak film sayısı
+        for i in user_ratings[ua]:
+            for v in item_users.get(i, []):
+                if v != ua:
+                    candidates[v] = candidates.get(v, 0) + 1
+
+        for v, cnt in candidates.items():
+            if cnt < min_common:
+                continue
+            if v <= ua:
+                continue  # her çifti bir kez hesapla
+
+            s = knn_user_similarity(
+                ua, v,
+                similarity=similarity,
+                user_ratings=user_ratings,
+                user_means=user_means,
+                item_popularity=item_popularity,
+                min_common=min_common,
+            )
+            if abs(s) < 1e-8:
+                continue
+
+            sim_index[ua].append((s, v))
+            sim_index[v].append((s, ua))
+            n_pairs += 1
+
+    # Her kullanıcı için komşuları sim'e göre sırala
+    for u in all_users:
+        sim_index[u].sort(key=lambda x: -abs(x[0]))
+
+    print(f"  [Global KNN] {n_pairs:,} anlamlı çift hesaplandı "
+          f"({time.time()-t0:.1f}s)", flush=True)
+
+    # ── Tahmin fonksiyonu ─────────────────────────────────────────
+    def _predict(u: int, i: int) -> float:
+        base = float(user_means.get(u, global_mean))
+        # i'yi ratinglayan komşuları filtrele
+        neighbors = [
+            (s, v) for s, v in sim_index.get(u, [])
+            if i in user_ratings.get(v, {})
+        ]
+        if not neighbors:
+            return float(np.clip(base, 1.0, 5.0))
+
+        top_k = neighbors[:k_neighbors]
+        num = sum(s * (user_ratings[v][i] - user_means.get(v, global_mean))
+                  for s, v in top_k)
+        den = sum(abs(s) for s, _ in top_k)
+        if den < 1e-8:
+            return float(np.clip(base, 1.0, 5.0))
+        return float(np.clip(base + num / den, 1.0, 5.0))
+
+    # ── Test değerlendirmesi ──────────────────────────────────────
+    preds, trues = [], []
+    eval_rows = []
+    for row in test:
+        u, i, r = int(row[0]), int(row[1]), float(row[2])
+        p = _predict(u, i)
+        preds.append(p)
+        trues.append(r)
+        eval_rows.append((u, i, r, p))
+
+    preds_arr = np.array(preds, dtype=np.float32)
+    trues_arr = np.array(trues, dtype=np.float32)
+    errors = trues_arr - preds_arr
+    mae  = float(np.mean(np.abs(errors)))
+    rmse = float(np.sqrt(np.mean(errors ** 2)))
+
+    precision, recall, f1, ndcg = _compute_topn_metrics(
+        np.array(eval_rows, dtype=np.float32),
+        top_n=top_n,
+        threshold=relevance_threshold,
+    )
+
+    elapsed = time.time() - t0
+    print(f"  [Global KNN] MAE={mae:.4f}  RMSE={rmse:.4f}  ({elapsed:.1f}s)")
+    return {
+        'scenario'        : 'global',
+        'algo_label'      : f'GLOBAL_KNN_{similarity}_k{k_neighbors}',
+        'mae'             : mae,
+        'rmse'            : rmse,
+        'gray_mae'        : float('nan'),
+        'gray_rmse'       : float('nan'),
+        'white_mae'       : mae,
+        'white_rmse'      : rmse,
+        'n_clusters'      : 1,
+        'n_train'         : len(train),
+        'n_test'          : len(test),
+        'time_seconds'    : elapsed,
+        'accuracy'        : float('nan'),
+        'precision_at_10' : precision,
+        'recall_at_10'    : recall,
+        'f1_at_10'        : f1,
+        'ndcg_at_10'      : ndcg,
+        'k_neighbors'     : k_neighbors,
+    }
+
+
 # ============================================================
 # SENARYO 2: CLUSTER WNMF — HER KÜME U+V ÖĞRENİR
 # ============================================================
@@ -1291,11 +1522,35 @@ def _compute_topn_metrics(eval_rows: np.ndarray, top_n: int = 10, threshold: flo
     )
 
 
+def _nearest_centroid_bundle(args, assign_dir: str, assignments: np.ndarray) -> dict:
+    """--nearest-centroid için centroid yükleme ve kwargs paketi."""
+    if args is None or not getattr(args, 'nearest_centroid', False):
+        return {
+            'centroids': None,
+            'nearest_centroid': False,
+            'centroid_metric': 'euclidean',
+        }
+    n_clusters = int(assignments.max()) + 1
+    return {
+        'centroids': load_centroids(assign_dir, n_clusters),
+        'nearest_centroid': True,
+        'centroid_metric': getattr(args, 'centroid_metric', 'euclidean'),
+    }
+
+
 def run_cluster_average(train, test, assignments, gray_mask,
                         memberships,
                         n_items, algo_label, top_n: int = 10,
-                        relevance_threshold: float = 4.0):
+                        relevance_threshold: float = 4.0,
+                        centroids=None,
+                        nearest_centroid: bool = False,
+                        centroid_metric: str = 'euclidean'):
     t0 = time.time()
+
+    test_cluster_ids = resolve_test_cluster_ids(
+        train, assignments, centroids, nearest_centroid, n_items,
+        centroid_metric=centroid_metric, algo_label=algo_label,
+    )
 
     # Her küme için her item'ın ortalama rating'ini hesapla
     n_clusters = int(assignments.max()) + 1
@@ -1341,7 +1596,7 @@ def run_cluster_average(train, test, assignments, gray_mask,
                 w_use /= w_use.sum()
                 pred = float(np.clip(np.dot(w_use, cluster_item_means[:, i]), 1.0, 5.0))
         else:
-            cid = int(assignments[u])
+            cid = int(test_cluster_ids[u])
             pred = float(np.clip(cluster_item_means[cid, i], 1.0, 5.0))
 
         if gray_mask[u]:
@@ -1373,11 +1628,16 @@ def run_cluster_average(train, test, assignments, gray_mask,
     white_mae, white_rmse = _compute_metrics(true_vals, pred_vals)
 
     elapsed = time.time() - t0
-    print(f"  [{algo_label} | ClusterAvg] MAE={mae:.4f} "
-          f"RMSE={rmse:.4f} | Gray MAE={gray_mae:.4f} ({elapsed:.1f}s)")
+    use_nc = (
+        nearest_centroid and centroids is not None
+        and centroids.shape[1] == n_items
+    )
+    scenario = 'cluster_avg_nc' if use_nc else 'cluster_avg'
+    print(f"  [{algo_label} | ClusterAvg{'+NC' if use_nc else ''}] "
+          f"MAE={mae:.4f} RMSE={rmse:.4f} | Gray MAE={gray_mae:.4f} ({elapsed:.1f}s)")
 
     return {
-        'scenario'    : 'cluster_avg',
+        'scenario'    : scenario,
         'algo_label'  : algo_label,
         'mae'         : mae,
         'rmse'        : rmse,
@@ -1608,9 +1868,17 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
                     sim_amp: float = 1.0,
                     knn_mode: str = 'cluster',
                     top_n: int = 10,
-                    relevance_threshold: float = 4.0):
+                    relevance_threshold: float = 4.0,
+                    centroids=None,
+                    nearest_centroid: bool = False,
+                    centroid_metric: str = 'euclidean'):
     t0 = time.time()
     k_neighbors = max(1, int(k_neighbors))
+
+    test_cluster_ids = resolve_test_cluster_ids(
+        train, assignments, centroids, nearest_centroid, n_items,
+        centroid_metric=centroid_metric, algo_label=algo_label,
+    )
 
     global_mean = float(train[:, 2].mean())
     user_ratings = {}
@@ -1730,7 +1998,7 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
             )
 
         if not use_soft:
-            cid = int(assignments[u])
+            cid = int(test_cluster_ids[u])
             return _predict_for_cluster(
                 u, i, cid, similarity=similarity, min_common=min_common,
             )
@@ -1797,11 +2065,18 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
 
     elapsed = time.time() - t0
     _knn_tag = 'ClusterKNN-fullsoft' if use_full_soft else 'ClusterKNN'
+    _scenario = 'cluster_knn_full_soft' if use_full_soft else 'cluster_knn'
+    if (
+        nearest_centroid and centroids is not None and not use_full_soft
+        and centroids.shape[1] == n_items
+    ):
+        _knn_tag += '+NC'
+        _scenario = 'cluster_knn_nc'
     print(f"  [{algo_label} | {_knn_tag}|{similarity}|k={k_neighbors}] MAE={mae:.4f} "
           f"RMSE={rmse:.4f} | Gray MAE={gray_mae:.4f} ({elapsed:.1f}s)")
 
     return {
-        'scenario'    : 'cluster_knn_full_soft' if use_full_soft else 'cluster_knn',
+        'scenario'    : _scenario,
         'algo_label'  : algo_label,
         'mae'         : mae,
         'rmse'        : rmse,
@@ -1825,6 +2100,598 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
         'similarity'      : similarity,
         'k_neighbors'     : k_neighbors,
         'knn_mode'        : 'full_soft' if use_full_soft else 'cluster',
+    }
+
+
+# ============================================================
+# ITEM-CF ALTYAPISI (Görev 3) + WEIGHTED FUSION (Görev 4-5)
+# ============================================================
+
+def build_item_ratings(train):
+    """Train satırlarından (item_ratings, item_means) sözlüklerini kur.
+
+    item_ratings : {item_id: {user_id: rating}}
+    item_means   : {item_id: ortalama_puan}
+    """
+    item_ratings: dict = {}
+    for row in train:
+        u, i, r = int(row[0]), int(row[1]), float(row[2])
+        if i not in item_ratings:
+            item_ratings[i] = {}
+        item_ratings[i][u] = r
+    item_means = {
+        i: float(np.mean(list(d.values())))
+        for i, d in item_ratings.items()
+    }
+    return item_ratings, item_means
+
+
+def build_user_activity(train=None, user_ratings=None):
+    """{user_id: kaç film oyladı} — IUF-user için aktivite sayacı."""
+    ua: dict = {}
+    if train is not None:
+        for row in train:
+            u = int(row[0])
+            ua[u] = ua.get(u, 0) + 1
+    elif user_ratings is not None:
+        for u, items in user_ratings.items():
+            ua[int(u)] = len(items)
+    return ua
+
+
+def iuf_weight_user(user_id: int, user_activity: dict) -> float:
+    """Aşırı aktif kullanıcıyı cezalandır: w(u) = 1/log(1+n_u)."""
+    n = user_activity.get(user_id, 1)
+    return 1.0 / np.log(1.0 + n)
+
+
+def pearson_sim_items(
+    i: int,
+    j: int,
+    item_ratings: dict,
+    item_means: dict,
+    user_activity: dict,
+    min_common: int = 3,
+    cache: Optional[dict] = None,
+) -> float:
+    """Film i–j arası IUF-ağırlıklı Pearson benzerliği.
+
+    cache: {(min(i,j), max(i,j)): sim} — verilirse simetrik tekrar hesabı yok.
+    """
+    if cache is not None:
+        key = (i, j) if i <= j else (j, i)
+        if key in cache:
+            return cache[key]
+
+    ri = item_ratings.get(i)
+    rj = item_ratings.get(j)
+    if not ri or not rj:
+        result = 0.0
+    else:
+        common_users = list(set(ri.keys()) & set(rj.keys()))
+        if len(common_users) < min_common:
+            result = 0.0
+        else:
+            weights = np.array(
+                [iuf_weight_user(u, user_activity) for u in common_users],
+                dtype=np.float64,
+            )
+            mi = item_means.get(i, 0.0)
+            mj = item_means.get(j, 0.0)
+            i_c = np.array([ri[u] - mi for u in common_users], dtype=np.float64)
+            j_c = np.array([rj[u] - mj for u in common_users], dtype=np.float64)
+
+            num    = float(np.sum(weights * i_c * j_c))
+            norm_i = float(np.sqrt(np.sum(weights * i_c ** 2)))
+            norm_j = float(np.sqrt(np.sum(weights * j_c ** 2)))
+
+            if norm_i < 1e-8 or norm_j < 1e-8:
+                result = 0.0
+            else:
+                result = float(np.clip(num / (norm_i * norm_j), -1.0, 1.0))
+
+    if cache is not None:
+        cache[(i, j) if i <= j else (j, i)] = result
+    return result
+
+
+def _predict_item_knn(
+    u: int,
+    i: int,
+    item_cid: int,
+    item_ratings: dict,
+    cluster_items: dict,
+    item_means: dict,
+    user_activity: dict,
+    k_neighbors: int = 20,
+    min_common: int = 3,
+    global_mean: float = 3.0,
+    sim_cache: Optional[dict] = None,
+) -> float:
+    """Film i'nin kümesindeki benzer filmlerden kullanıcı u için tahmin.
+
+    r̂_item(u,i) = μ_i + Σⱼ sim(i,j) × (r_uj - μ_j) / Σⱼ|sim(i,j)|
+    """
+    k_neighbors = max(1, int(k_neighbors))
+    base_i = float(item_means.get(i, global_mean))
+
+    candidate_items = [
+        j for j in cluster_items.get(item_cid, [])
+        if j != i and u in item_ratings.get(j, {})
+    ]
+    if not candidate_items:
+        return float(np.clip(base_i, 1.0, 5.0))
+
+    sims = []
+    for j in candidate_items:
+        s = pearson_sim_items(
+            i, j, item_ratings, item_means, user_activity,
+            min_common=min_common, cache=sim_cache,
+        )
+        if abs(s) > 1e-8:
+            sims.append((s, j))
+
+    if not sims:
+        return float(np.clip(base_i, 1.0, 5.0))
+
+    sims.sort(key=lambda x: -abs(x[0]))
+    top_k = sims[:k_neighbors]
+
+    num = sum(
+        s * (item_ratings[j].get(u, item_means.get(j, global_mean))
+             - item_means.get(j, global_mean))
+        for s, j in top_k
+    )
+    den = sum(abs(s) for s, _ in top_k)
+    if den < 1e-8:
+        return float(np.clip(base_i, 1.0, 5.0))
+
+    return float(np.clip(base_i + num / den, 1.0, 5.0))
+
+
+def _cosine_dense(a: np.ndarray, b: np.ndarray) -> float:
+    """İki dense vektör için cosine — sıfır vektör güvenli."""
+    norm_a = float(np.linalg.norm(a))
+    norm_b = float(np.linalg.norm(b))
+    if norm_a < 1e-8 or norm_b < 1e-8:
+        return 0.0
+    sim = float(np.dot(a, b) / (norm_a * norm_b))
+    return float(np.clip(sim, -1.0, 1.0))
+
+
+def compute_cluster_centroids_rawspace(
+    R_matrix: np.ndarray,
+    assignments: np.ndarray,
+    K: int,
+    axis: str = 'user',
+) -> np.ndarray:
+    """Ham rating uzayında küme ortalamaları (centroid) hesabı.
+
+    axis='user': R_matrix (n_users × n_items), her kullanıcı kümesi için
+                 rated hücrelerin ortalamasını al → (K × n_items)
+    axis='item': R_matrix.T (n_items × n_users) ile aynı mantık → (K × n_users)
+
+    Sadece rated (>0) hücreler ortalamada sayılır. Hiç rating olmayan sütunlar 0.
+    Feature uzayında değil rating uzayında centroid üretir; fusion için kullanılır.
+    """
+    if axis == 'item':
+        R = R_matrix.T
+    elif axis == 'user':
+        R = R_matrix
+    else:
+        raise ValueError(f"axis bilinmiyor: {axis!r}")
+
+    n_rows, n_cols = R.shape
+    assignments = np.asarray(assignments, dtype=np.int64)
+    if len(assignments) != n_rows:
+        raise ValueError(
+            f"assignments uzunluğu ({len(assignments)}) "
+            f"matris satır sayısıyla ({n_rows}) eşleşmiyor (axis={axis})."
+        )
+
+    centroids = np.zeros((K, n_cols), dtype=np.float32)
+    counts    = np.zeros((K, n_cols), dtype=np.int32)
+    for row in range(n_rows):
+        cid = int(assignments[row])
+        if cid < 0 or cid >= K:
+            continue
+        vec = R[row]
+        mask = vec > 0
+        centroids[cid, mask] += vec[mask]
+        counts[cid, mask]    += 1
+
+    nonzero = counts > 0
+    centroids[nonzero] /= counts[nonzero]
+    return centroids
+
+
+def compute_fusion_weights(
+    u: int,
+    i: int,
+    u_vec: np.ndarray,
+    i_vec: np.ndarray,
+    user_centroids: np.ndarray,
+    item_centroids: np.ndarray,
+    user_assignments: np.ndarray,
+    item_assignments: np.ndarray,
+    mode: str = 'dynamic',
+    alpha: float = 0.5,
+) -> Tuple[float, float]:
+    """User-CF / Item-CF dinamik ağırlıkları.
+
+    mode='fixed' : (1-alpha, alpha)
+    mode='dynamic':
+        m = cos(u_vec, user_centroids[cu])
+        n = cos(i_vec, item_centroids[ci])
+        Negatif/sıfır benzerlikleri 0'a kırparak (m, n) → m/(m+n+eps), n/(m+n+eps)
+    """
+    if mode == 'fixed':
+        w_user = float(np.clip(1.0 - alpha, 0.0, 1.0))
+        w_item = float(np.clip(alpha,        0.0, 1.0))
+        s = w_user + w_item
+        if s < 1e-10:
+            return 0.5, 0.5
+        return w_user / s, w_item / s
+
+    if mode != 'dynamic':
+        raise ValueError(f"fusion_mode bilinmiyor: {mode!r} (fixed | dynamic)")
+
+    cu = int(user_assignments[u])
+    ci = int(item_assignments[i])
+    if cu < 0 or cu >= user_centroids.shape[0] \
+       or ci < 0 or ci >= item_centroids.shape[0]:
+        return 0.5, 0.5
+
+    m = max(0.0, _cosine_dense(u_vec, user_centroids[cu]))
+    n_w = max(0.0, _cosine_dense(i_vec, item_centroids[ci]))
+    total = m + n_w
+    if total < 1e-10:
+        return 0.5, 0.5
+    return m / total, n_w / total
+
+
+def _build_rating_matrix_from_train(
+    train: np.ndarray, n_users: int, n_items: int,
+) -> np.ndarray:
+    """Train rating'lerinden dense (n_users × n_items) matris üret."""
+    R = np.zeros((n_users, n_items), dtype=np.float32)
+    for row in train:
+        u, i, r = int(row[0]), int(row[1]), float(row[2])
+        if 0 <= u < n_users and 0 <= i < n_items:
+            R[u, i] = r
+    return R
+
+
+def compute_coverage(user_recommendations: dict, n_items: int) -> float:
+    """Tüm kullanıcılara önerilen benzersiz film oranı."""
+    if not user_recommendations or n_items <= 0:
+        return float('nan')
+    all_recs = set()
+    for recs in user_recommendations.values():
+        all_recs.update(int(x) for x in recs)
+    return len(all_recs) / float(n_items)
+
+
+def compute_diversity(
+    user_recommendations: dict,
+    sim_fn,
+    max_users: Optional[int] = None,
+) -> float:
+    """Önerilen filmler arası 1 - sim ortalaması.
+
+    sim_fn(i, j) -> float in [-1, 1]
+    max_users: hızlandırma için kullanıcı alt-örneği (varsayılan: hepsi).
+    """
+    if not user_recommendations:
+        return float('nan')
+
+    users = list(user_recommendations.keys())
+    if max_users is not None and max_users > 0 and len(users) > max_users:
+        rng = np.random.default_rng(seed=42)
+        users = list(rng.choice(users, size=max_users, replace=False))
+
+    divs = []
+    for u in users:
+        recs = list(user_recommendations[u])
+        if len(recs) < 2:
+            continue
+        pair_divs = []
+        for a in range(len(recs)):
+            for b in range(a + 1, len(recs)):
+                s = float(sim_fn(int(recs[a]), int(recs[b])))
+                pair_divs.append(1.0 - s)
+        if pair_divs:
+            divs.append(float(np.mean(pair_divs)))
+    return float(np.mean(divs)) if divs else float('nan')
+
+
+def _compute_topn_metrics_with_recs(
+    eval_rows: np.ndarray, top_n: int = 10, threshold: float = 4.0,
+) -> Tuple[float, float, float, float, dict]:
+    """_compute_topn_metrics'in genişletilmiş versiyonu: per-user top-N rec listesi de döner.
+
+    Geri uyumluluk: _compute_topn_metrics değişmedi; bu yeni helper yalnız
+    coverage/diversity hesabı için çağrılır.
+    """
+    if eval_rows is None or len(eval_rows) == 0:
+        return float('nan'), float('nan'), float('nan'), float('nan'), {}
+
+    by_user: dict = {}
+    for row in eval_rows:
+        u = int(row[0]); i = int(row[1])
+        r_true = float(row[2]); r_pred = float(row[3])
+        by_user.setdefault(u, []).append((i, r_true, r_pred))
+
+    precisions, recalls, f1s, ndcgs = [], [], [], []
+    user_recommendations: dict = {}
+    k = max(1, int(top_n))
+    for u, items in by_user.items():
+        ranked = sorted(items, key=lambda x: x[2], reverse=True)[:k]
+        top_items = [int(i) for i, _, _ in ranked]
+        user_recommendations[u] = top_items
+
+        relevant = {int(i) for i, r_true, _ in items if r_true >= threshold}
+        if not relevant:
+            continue
+        hits = len(set(top_items) & relevant)
+        p = hits / k
+        r = hits / len(relevant) if relevant else 0.0
+        f1 = (2 * p * r / (p + r)) if (p + r) > 0 else 0.0
+
+        dcg = 0.0
+        for rank_idx, item_id in enumerate(top_items):
+            rel = 1.0 if item_id in relevant else 0.0
+            dcg += (2.0 ** rel - 1.0) / np.log2(rank_idx + 2.0)
+        ideal_hits = min(len(relevant), k)
+        idcg = sum(1.0 / np.log2(i + 2.0) for i in range(ideal_hits))
+        ndcg = (dcg / idcg) if idcg > 0 else 0.0
+
+        precisions.append(p)
+        recalls.append(r)
+        f1s.append(f1)
+        ndcgs.append(ndcg)
+
+    if not precisions:
+        return float('nan'), float('nan'), float('nan'), float('nan'), user_recommendations
+    return (
+        float(np.mean(precisions)),
+        float(np.mean(recalls)),
+        float(np.mean(f1s)),
+        float(np.mean(ndcgs)),
+        user_recommendations,
+    )
+
+
+def run_cluster_knn_fusion(
+    train,
+    test,
+    user_assignments: np.ndarray,
+    item_assignments: np.ndarray,
+    R_matrix_train: np.ndarray,
+    gray_mask: np.ndarray,
+    n_items: int,
+    n_users: int,
+    algo_label_user: str,
+    algo_label_item: str,
+    similarity: str = 'pearson_iuf',
+    min_common: int = 3,
+    k_user: int = 20,
+    k_item: int = 20,
+    fusion_mode: str = 'dynamic',
+    fusion_alpha: float = 0.5,
+    top_n: int = 10,
+    relevance_threshold: float = 4.0,
+    compute_cov: bool = False,
+    compute_div: bool = False,
+):
+    """Weighted Fusion: User-CF + Item-CF tahminlerini centroid-bazlı veya sabit
+    ağırlıkla birleştirir.
+
+    r̂(u,i) = m × pred_user + n × pred_item
+    """
+    t0 = time.time()
+    k_user = max(1, int(k_user))
+    k_item = max(1, int(k_item))
+
+    global_mean = float(train[:, 2].mean())
+    user_ratings: dict = {}
+    for row in train:
+        u, i, r = int(row[0]), int(row[1]), float(row[2])
+        if u not in user_ratings:
+            user_ratings[u] = {}
+        user_ratings[u][i] = r
+    user_means = {
+        u: float(np.mean(list(d.values()))) for u, d in user_ratings.items()
+    }
+    item_popularity = build_item_popularity(user_ratings=user_ratings)
+    item_ratings, item_means = build_item_ratings(train)
+    user_activity = build_user_activity(train=train)
+
+    cluster_users: dict = {}
+    for u in range(len(user_assignments)):
+        cid = int(user_assignments[u])
+        cluster_users.setdefault(cid, []).append(u)
+
+    cluster_items: dict = {}
+    for i in range(len(item_assignments)):
+        cid = int(item_assignments[i])
+        if cid < 0:
+            continue  # pruned item — kümeye dahil etme
+        cluster_items.setdefault(cid, []).append(i)
+
+    K_user = int(user_assignments.max()) + 1
+    K_item = int(item_assignments.max()) + 1
+    user_centroids = compute_cluster_centroids_rawspace(
+        R_matrix_train, user_assignments, K_user, axis='user',
+    )
+    item_centroids = compute_cluster_centroids_rawspace(
+        R_matrix_train, item_assignments, K_item, axis='item',
+    )
+
+    test_users = sorted({int(row[0]) for row in test})
+    test_items = sorted({int(row[1]) for row in test})
+    u_vec_cache: dict = {}
+    for u in test_users:
+        v = np.zeros(n_items, dtype=np.float32)
+        for j, r in user_ratings.get(u, {}).items():
+            if 0 <= j < n_items:
+                v[j] = r
+        u_vec_cache[u] = v
+    i_vec_cache: dict = {}
+    for i in test_items:
+        v = np.zeros(n_users, dtype=np.float32)
+        for w, r in item_ratings.get(i, {}).items():
+            if 0 <= w < n_users:
+                v[w] = r
+        i_vec_cache[i] = v
+
+    item_sim_cache: dict = {}
+
+    true_vals, pred_vals = [], []
+    gray_true, gray_pred = [], []
+    eval_rows = []
+    fusion_weights_log: List[Tuple[float, float]] = []
+
+    for row in test:
+        u, i, r = int(row[0]), int(row[1]), float(row[2])
+
+        if u < len(user_assignments):
+            cid_user = int(user_assignments[u])
+            pred_u = _predict_knn(
+                u, i, cid_user,
+                user_ratings, cluster_users, user_means,
+                similarity=similarity,
+                k_neighbors=k_user,
+                min_common=min_common,
+                global_mean=global_mean,
+                item_popularity=item_popularity,
+            )
+        else:
+            pred_u = float(np.clip(global_mean, 1.0, 5.0))
+
+        if i < len(item_assignments) and int(item_assignments[i]) >= 0:
+            cid_item = int(item_assignments[i])
+            pred_i = _predict_item_knn(
+                u, i, cid_item,
+                item_ratings, cluster_items, item_means,
+                user_activity,
+                k_neighbors=k_item,
+                min_common=min_common,
+                global_mean=global_mean,
+                sim_cache=item_sim_cache,
+            )
+        else:
+            # Item, pruning sırasında çıkarıldı veya atanmadı — item-ortalama ile fallback
+            pred_i = float(np.clip(item_means.get(i, global_mean), 1.0, 5.0))
+
+        _item_assigned = i < len(item_assignments) and int(item_assignments[i]) >= 0
+        if u in u_vec_cache and i in i_vec_cache \
+           and u < len(user_assignments) and _item_assigned:
+            m, n_w = compute_fusion_weights(
+                u, i,
+                u_vec_cache[u], i_vec_cache[i],
+                user_centroids, item_centroids,
+                user_assignments, item_assignments,
+                mode=fusion_mode, alpha=fusion_alpha,
+            )
+        else:
+            m, n_w = 0.5, 0.5
+
+        fusion_weights_log.append((m, n_w))
+        pred = float(np.clip(m * pred_u + n_w * pred_i, 1.0, 5.0))
+
+        if u < len(gray_mask) and gray_mask[u]:
+            gray_true.append(r)
+            gray_pred.append(pred)
+        else:
+            true_vals.append(r)
+            pred_vals.append(pred)
+        eval_rows.append((u, i, r, pred))
+
+    all_true = true_vals + gray_true
+    all_pred = pred_vals + gray_pred
+    mae, rmse = _compute_metrics(all_true, all_pred)
+    accuracy = _compute_binary_accuracy(
+        all_true, all_pred, threshold=relevance_threshold,
+    )
+
+    gray_mae, gray_rmse = float('nan'), float('nan')
+    if gray_true:
+        gray_errors = np.array(gray_true) - np.array(gray_pred)
+        gray_mae = float(np.mean(np.abs(gray_errors)))
+        gray_rmse = float(np.sqrt(np.mean(gray_errors ** 2)))
+
+    white_mae, white_rmse = _compute_metrics(true_vals, pred_vals)
+
+    eval_rows_arr = np.array(eval_rows, dtype=np.float32)
+    if compute_cov or compute_div:
+        precision, recall, f1, ndcg, user_recs = _compute_topn_metrics_with_recs(
+            eval_rows_arr, top_n=top_n, threshold=relevance_threshold,
+        )
+    else:
+        precision, recall, f1, ndcg = _compute_topn_metrics(
+            eval_rows_arr, top_n=top_n, threshold=relevance_threshold,
+        )
+        user_recs = {}
+
+    coverage_val = float('nan')
+    diversity_val = float('nan')
+    if compute_cov and user_recs:
+        coverage_val = compute_coverage(user_recs, n_items)
+    if compute_div and user_recs:
+        def _div_sim(a: int, b: int) -> float:
+            return pearson_sim_items(
+                a, b, item_ratings, item_means, user_activity,
+                min_common=min_common, cache=item_sim_cache,
+            )
+        diversity_val = compute_diversity(user_recs, _div_sim, max_users=500)
+
+    mean_m = float(np.mean([w[0] for w in fusion_weights_log])) if fusion_weights_log else float('nan')
+    mean_n = float(np.mean([w[1] for w in fusion_weights_log])) if fusion_weights_log else float('nan')
+
+    elapsed = time.time() - t0
+    scenario_name = f'cluster_knn_fusion_{fusion_mode}'
+    print(
+        f"  [{algo_label_user}+{algo_label_item} | Fusion-{fusion_mode}|"
+        f"{similarity}|ku={k_user},ki={k_item}] "
+        f"MAE={mae:.4f} RMSE={rmse:.4f} | mean(m,n)=({mean_m:.3f},{mean_n:.3f}) "
+        f"({elapsed:.1f}s)"
+    )
+
+    return {
+        'scenario'        : scenario_name,
+        'algo_label'      : algo_label_user,
+        'algo_label_item' : algo_label_item,
+        'mae'             : mae,
+        'rmse'            : rmse,
+        'gray_mae'        : gray_mae,
+        'gray_rmse'       : gray_rmse,
+        'white_mae'       : white_mae,
+        'white_rmse'      : white_rmse,
+        'n_clusters'      : K_user,
+        'n_clusters_item' : K_item,
+        'n_train'         : len(train),
+        'n_test'          : len(test),
+        'time_seconds'    : elapsed,
+        'cluster_mae_std' : float('nan'),
+        'cluster_mae_mean': float('nan'),
+        'cluster_mae_min' : float('nan'),
+        'cluster_mae_max' : float('nan'),
+        'accuracy'        : accuracy,
+        'precision_at_10' : precision,
+        'recall_at_10'    : recall,
+        'f1_at_10'        : f1,
+        'ndcg_at_10'      : ndcg,
+        'similarity'      : similarity,
+        'k_neighbors'     : k_user,
+        'k_neighbors_item': k_item,
+        'knn_mode'        : f'fusion_{fusion_mode}',
+        'fusion_mode'     : fusion_mode,
+        'fusion_alpha'    : fusion_alpha if fusion_mode == 'fixed' else float('nan'),
+        'fusion_mean_m'   : mean_m,
+        'fusion_mean_n'   : mean_n,
+        'coverage'        : coverage_val,
+        'diversity'       : diversity_val,
     }
 
 
@@ -1947,15 +2814,18 @@ def _mp_run_algo_job(job):
         rows: List[dict] = []
 
         if run_cluster_avg_flag:
+            nc = _nearest_centroid_bundle(mp_args, assign_dir, assignments)
             row = run_cluster_average(
                 train, test, assignments, gray_mask, memberships, n_items, label,
                 top_n=top_n,
                 relevance_threshold=relevance_threshold,
+                **nc,
             )
             row['dataset'] = dataset_name
             rows.append(row)
 
         if do_cluster_knn_flag:
+            nc = _nearest_centroid_bundle(mp_args, assign_dir, assignments)
             for kv in _knv:
                 row = run_cluster_knn(
                     train, test, assignments, gray_mask, memberships, n_items, label,
@@ -1968,6 +2838,7 @@ def _mp_run_algo_job(job):
                     sim_amp=float(getattr(mp_args, 'sim_amp', 1.0) or 1.0),
                     top_n=top_n,
                     relevance_threshold=relevance_threshold,
+                    **nc,
                 )
                 row['dataset'] = dataset_name
                 rows.append(row)
@@ -2066,6 +2937,10 @@ def _save_row_to_db(dataset_name: str, row: dict, k_used: int, args,
         fold_rmse_values=row.get('fold_rmse_values'),
         run_id=_CURRENT_RUN_ID,
         assignment_id_override=assignment_id_override,
+        assign_suffix=prep_raw,
+        knn=row.get('k_neighbors'),
+        similarity=row.get('similarity'),
+        fold=row.get('cv_fold', fold_override),
     )
 
 
@@ -2094,7 +2969,18 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
                 use_svdpp: bool = False,
                 run_command: Optional[str] = None,
                 args=None,
-                fold: Optional[int] = None):
+                fold: Optional[int] = None,
+                do_fusion: bool = False,
+                fusion_mode: str = 'dynamic',
+                fusion_alpha: float = 0.5,
+                item_assign_root: Optional[str] = None,
+                item_assign_suffix: str = '',
+                assignment_k_item: Optional[int] = None,
+                assignment_k_item_100k: Optional[int] = None,
+                assignment_k_item_1m: Optional[int] = None,
+                knn_item: Union[int, Sequence[int]] = 20,
+                compute_cov: bool = False,
+                compute_div: bool = False):
     """
     Bir dataset üzerinde tüm senaryoları çalıştır.
 
@@ -2113,6 +2999,30 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
     print(f"\n{'='*60}")
     print(f"DATASET: {dataset_name.upper()}  |  mode={mode}")
     print(f"{'='*60}")
+
+    # Fusion ayarlarını args'tan miras al (çağıranlar değişmesin diye)
+    if args is not None:
+        if not do_fusion:
+            do_fusion = bool(getattr(args, 'fusion', False))
+            fusion_mode = str(getattr(args, 'fusion_mode', fusion_mode) or fusion_mode)
+            fusion_alpha = float(getattr(args, 'fusion_alpha', fusion_alpha))
+            if item_assign_root is None:
+                item_assign_root = getattr(args, 'item_assign_root', None)
+            if not item_assign_suffix:
+                item_assign_suffix = getattr(args, 'item_assign_suffix', '') or ''
+            if assignment_k_item is None:
+                assignment_k_item = getattr(args, 'assignment_k_item', None)
+            if assignment_k_item_100k is None:
+                assignment_k_item_100k = getattr(args, 'assignment_k_item_100k', None)
+            if assignment_k_item_1m is None:
+                assignment_k_item_1m = getattr(args, 'assignment_k_item_1m', None)
+            knn_item_arg = getattr(args, 'knn_item', None)
+            if knn_item_arg:
+                knn_item = knn_item_arg
+            if not compute_cov:
+                compute_cov = bool(getattr(args, 'coverage', False))
+            if not compute_div:
+                compute_div = bool(getattr(args, 'diversity', False))
 
     root = assign_root if assign_root is not None else ASSIGN_ROOT
     dk   = ASSIGN_K_DEFAULT_100K if dataset_name == 'ml100k' else ASSIGN_K_DEFAULT_1M
@@ -2152,6 +3062,49 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
     if do_cluster_knn and (knn_mode or 'cluster').strip().lower() == 'full_soft':
         print("ClusterKNN modu: full_soft (tüm kullanıcılar, membership×rating benzerliği)")
 
+    # --- Fusion (Görev 5) hazırlığı ---
+    fusion_setup = None
+    if do_fusion:
+        knn_item_vals: List[int]
+        if isinstance(knn_item, int):
+            knn_item_vals = [int(knn_item)]
+        else:
+            knn_item_vals = [int(k) for k in knn_item]
+        if not knn_item_vals:
+            knn_item_vals = [20]
+
+        item_root = item_assign_root if item_assign_root is not None \
+            else os.path.join(os.path.dirname(BASE_DIR), 'mealpy', 'results', 'item_assignments')
+
+        ITEM_K_DEFAULT = {'ml100k': 30, 'ml1m': 60}
+        k_item_ds = assignment_k_item_100k if dataset_name == 'ml100k' else assignment_k_item_1m
+        if assignment_k_item is not None:
+            if isinstance(assignment_k_item, (list, tuple)):
+                k_item_used = int(assignment_k_item[0])
+            else:
+                k_item_used = int(assignment_k_item)
+        elif k_item_ds is not None:
+            k_item_used = int(k_item_ds)
+        else:
+            k_item_used = ITEM_K_DEFAULT.get(dataset_name, 30)
+
+        n_users_full = int(max(train[:, 0].max(), test[:, 0].max())) + 1
+        R_matrix_train = _build_rating_matrix_from_train(train, n_users_full, n_items)
+
+        fusion_setup = {
+            'item_root'        : item_root,
+            'item_assign_suffix': item_assign_suffix,
+            'k_item_used'      : k_item_used,
+            'knn_item_vals'    : knn_item_vals,
+            'R_matrix_train'   : R_matrix_train,
+            'n_users_full'     : n_users_full,
+        }
+        print(f"Fusion        : mode={fusion_mode}"
+              + (f" alpha={fusion_alpha}" if fusion_mode == 'fixed' else ''))
+        print(f"Item assign K : {k_item_used}")
+        print(f"Item kNN      : {knn_item_vals}")
+        print(f"Item root     : {item_root}")
+
     results = []
     if fold is None:
         k_dir = os.path.join(OUT_ROOT, dataset_name, f'k{k_used}')
@@ -2172,26 +3125,59 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
     # Algo-düzeyinde paralel iş sayısını belirle
     _n_candidate = len(algo_filter) if algo_filter else len(ALGO_LABELS)
     nw_algo = _resolve_pool_workers(algo_workers, _n_candidate)
+    # --fusion için R_matrix_train pickle maliyeti yüksek (ML-1M ~80MB);
+    # algo paralelliğini sıralıya zorla.
+    if do_fusion and nw_algo > 1:
+        print(
+            "  Uyarı: --fusion ile algoritma paralelliği desteklenmiyor; "
+            "--algo-jobs yok sayılıyor (sıralı mod).",
+            file=sys.stderr,
+        )
+        nw_algo = 1
     # İç içe ProcessPoolExecutor CPU'yu aşırı yükler; algo paralelse küme içi
     # paralelliği kapat.
     eff_cluster_workers = 1 if nw_algo > 1 else cluster_workers
 
-    # Global WNMF baseline
+    # Global baseline(lar)
     if run_global:
-        if bool(getattr(args, 'als', False)):
-            row = run_global_als(
-                train, test, n_items, use_bias=use_bias, use_svdpp=use_svdpp,
-                top_n=top_n, relevance_threshold=relevance_threshold,
-            )
-        else:
-            row = run_global_wnmf(
-                train, test, n_items, use_bias=use_bias, use_svdpp=use_svdpp,
-                top_n=top_n, relevance_threshold=relevance_threshold,
-            )
-        row['dataset'] = dataset_name
-        results.append(row)
+        _global_rows = []
 
-        _save_row_to_db(dataset_name, row, k_used, args, fold_override=fold)
+        if bool(getattr(args, 'als', False)):
+            _global_rows.append(run_global_als(
+                train, test, n_items, use_bias=use_bias, use_svdpp=use_svdpp,
+                top_n=top_n, relevance_threshold=relevance_threshold,
+            ))
+        elif bool(getattr(args, 'svd', False)):
+            _svd_n_factors = int(getattr(args, 'svd_factors', 100))
+            _svd_n_epochs  = int(getattr(args, 'svd_epochs',  20))
+            row_svd = run_global_svd(
+                train, test, n_items,
+                top_n=top_n, relevance_threshold=relevance_threshold,
+                n_factors=_svd_n_factors, n_epochs=_svd_n_epochs,
+            )
+            if row_svd is not None:
+                _global_rows.append(row_svd)
+        elif bool(getattr(args, 'global_knn', False)):
+            _gknn_k   = int(getattr(args, 'global_knn_k',   20))
+            _gknn_sim = str(getattr(args, 'global_knn_sim', similarity))
+            _global_rows.append(run_global_knn(
+                train, test, n_items,
+                similarity=_gknn_sim,
+                k_neighbors=_gknn_k,
+                min_common=min_common,
+                top_n=top_n,
+                relevance_threshold=relevance_threshold,
+            ))
+        else:
+            _global_rows.append(run_global_wnmf(
+                train, test, n_items, use_bias=use_bias, use_svdpp=use_svdpp,
+                top_n=top_n, relevance_threshold=relevance_threshold,
+            ))
+
+        for row in _global_rows:
+            row['dataset'] = dataset_name
+            results.append(row)
+            _save_row_to_db(dataset_name, row, k_used, args, fold_override=fold)
 
     # Her algoritma — önce geçerli etiket/dizin çiftlerini topla
     active_algos: List[Tuple[str, str]] = []
@@ -2262,12 +3248,14 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
         for label, assign_dir in active_algos:
             assignments, gray_mask = load_assignment(assign_dir)
             memberships = load_memberships(assign_dir)
+            nc = _nearest_centroid_bundle(args, assign_dir, assignments)
 
             if run_cluster_avg:
                 row = run_cluster_average(
                     train, test, assignments, gray_mask, memberships, n_items, label,
                     top_n=top_n,
                     relevance_threshold=relevance_threshold,
+                    **nc,
                 )
                 row['dataset'] = dataset_name
                 results.append(row)
@@ -2287,11 +3275,69 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
                         sim_amp=float(getattr(args, 'sim_amp', 1.0) or 1.0) if args else 1.0,
                         top_n=top_n,
                         relevance_threshold=relevance_threshold,
+                        **nc,
                     )
                     row['dataset'] = dataset_name
                     results.append(row)
 
                     _save_row_to_db(dataset_name, row, k_used, args, fold_override=fold)
+
+            if do_fusion and fusion_setup is not None:
+                item_assign_dir = _algo_assignment_dir(
+                    fusion_setup['item_root'],
+                    dataset_name,
+                    label,
+                    fusion_setup['k_item_used'],
+                    assign_suffix=fusion_setup['item_assign_suffix'],
+                )
+                item_path = os.path.join(item_assign_dir, 'assignments.npy')
+                if not os.path.isfile(item_path):
+                    print(
+                        f"  [{label} | Fusion] ATLANDI — item assignment yok: "
+                        f"{item_path}",
+                        flush=True,
+                    )
+                else:
+                    item_assignments_arr = np.load(item_path)
+                    # item_indices.npy varsa: pruned item uzayındaki assignment'ları
+                    # orijinal item uzayına yay (-1 = atanmamış/pruned).
+                    _item_idx_path = os.path.join(item_assign_dir, 'item_indices.npy')
+                    if os.path.isfile(_item_idx_path):
+                        _item_indices = np.load(_item_idx_path)
+                        _full = np.full(n_items, -1, dtype=np.int32)
+                        _full[_item_indices] = item_assignments_arr.astype(np.int32)
+                        item_assignments_arr = _full
+                        print(
+                            f"  [{label} | Fusion] item_indices yüklendi: "
+                            f"{len(_item_indices)}/{n_items} item eşlendi",
+                            flush=True,
+                        )
+                    for k_user_v in knn_vals:
+                        for k_item_v in fusion_setup['knn_item_vals']:
+                            row = run_cluster_knn_fusion(
+                                train, test,
+                                assignments, item_assignments_arr,
+                                fusion_setup['R_matrix_train'],
+                                gray_mask,
+                                n_items, fusion_setup['n_users_full'],
+                                algo_label_user=label,
+                                algo_label_item=label,
+                                similarity=similarity,
+                                min_common=min_common,
+                                k_user=int(k_user_v),
+                                k_item=int(k_item_v),
+                                fusion_mode=fusion_mode,
+                                fusion_alpha=fusion_alpha,
+                                top_n=top_n,
+                                relevance_threshold=relevance_threshold,
+                                compute_cov=compute_cov,
+                                compute_div=compute_div,
+                            )
+                            row['dataset'] = dataset_name
+                            results.append(row)
+                            _save_row_to_db(
+                                dataset_name, row, k_used, args, fold_override=fold,
+                            )
 
             if mode in ('full', 'all'):
                 row = run_cluster_full(
@@ -2591,10 +3637,29 @@ def parse_args():
     p = argparse.ArgumentParser(description="WNMF karşılaştırma deneyi")
     p.add_argument('--dataset', choices=['100k', '1m', 'both'], default='both')
     p.add_argument(
+        '--eval-split',
+        choices=['official', 'random'],
+        default='official',
+        help='ML-100K değerlendirme bölmesi: official=u1.base/u1.test (varsayılan); '
+             'random=u.data üzerinde rastgele %%20 (HSC makalesi protokolü). ML-1M her zaman rastgele.',
+    )
+    p.add_argument(
+        '--nearest-centroid',
+        action='store_true',
+        help='Test tahmininde train profiline göre en yakın centroid kümesini seç (HSC). '
+             'best_sol.npy gerekir; boyut n_items ile eşleşmeli (fe=none).',
+    )
+    p.add_argument(
+        '--centroid-metric',
+        choices=['euclidean', 'pearson'],
+        default='euclidean',
+        help='--nearest-centroid ile centroid uzaklık metriği (default: euclidean).',
+    )
+    p.add_argument(
         '--fold', type=int, default=None, metavar='N',
-        help='İsteğe bağlı holdout fold (1–5). Verilmezse: ML-100K u1.base/u1.test; ML-1M %%20 holdout; '
-             'sonuçlar results/wnmf/<ds>/k{K}/run*/. Verilirse: ML-100K u{N}.base / u{N}.test; '
-             'ML-1M için load_ratings_1m(fold=N); sonuçlar .../k{K}/fold{N}/run*/.',
+        help='İsteğe bağlı holdout fold (1–5). Verilmezse: 5-fold CV (u1 veya u.data). '
+             'Verilirse: official→u{N}.base/u{N}.test; random→u.data KFold fold N (N=1: %%20 holdout). '
+             'Sonuçlar .../k{K}/fold{N}/run*/ veya fold yoksa .../k{K}/run*/.',
     )
     p.add_argument(
         '--algo',
@@ -2786,6 +3851,41 @@ def parse_args():
         help='Global baseline için WNMF yerine ALS çalıştır',
     )
     p.add_argument(
+        '--svd',
+        action='store_true',
+        help='Global baseline için Surprise SVD (Simon Funk biased MF) çalıştır. '
+             'Non-negativity kısıtı yok; WNMF ile üst sınır karşılaştırması için.',
+    )
+    p.add_argument(
+        '--svd-factors', type=int, default=100, metavar='K',
+        dest='svd_factors',
+        help='Surprise SVD gizli faktör sayısı (varsayılan: 100)',
+    )
+    p.add_argument(
+        '--svd-epochs', type=int, default=20, metavar='E',
+        dest='svd_epochs',
+        help='Surprise SVD epoch sayısı (varsayılan: 20)',
+    )
+    p.add_argument(
+        '--global-knn',
+        action='store_true',
+        dest='global_knn',
+        help='Global baseline olarak kümelemesiz User-KNN çalıştır. '
+             'ClusterKNN ile karşılaştırma: kümeleme KNN\'i iyileştiriyor mu?',
+    )
+    p.add_argument(
+        '--global-knn-k', type=int, default=20, metavar='K',
+        dest='global_knn_k',
+        help='Global KNN komşu sayısı (varsayılan: 20)',
+    )
+    p.add_argument(
+        '--global-knn-sim',
+        choices=['pearson', 'pearson_iuf', 'cosine'],
+        default='pearson',
+        dest='global_knn_sim',
+        help='Global KNN similarity metriği (varsayılan: pearson)',
+    )
+    p.add_argument(
         '--compare-mf-svdpp',
         action='store_true',
         help='Aynı hiperparametrelerle ardışık iki koşu: önce MF (SVD++ kapalı), sonra SVD++. '
@@ -2794,6 +3894,60 @@ def parse_args():
     p.add_argument(
         '--note', type=str, default=None,
         help='Bu run için açıklama notu (örn: "zscore karşılaştırma")',
+    )
+    # --- Fusion / Item-CF flag'leri (Görev 7) ---
+    p.add_argument(
+        '--item-assign-root', type=str, default=None,
+        help='Item assignment kök dizini (varsayılan: mealpy/results/item_assignments). '
+             '--fusion ile kullanılır.',
+    )
+    p.add_argument(
+        '--item-assign-suffix', type=str, default='',
+        help='Item assignment klasör adına ek suffix (örn: _euc_imkpp_nogs_none_svd50_k30). '
+             '--fusion ile kullanılır.',
+    )
+    p.add_argument(
+        '--k-item', nargs='+', type=int, default=None,
+        dest='assignment_k_item',
+        metavar='K',
+        help='Item assignment K (film kümesi sayısı); varsayılan ML-100K=30, ML-1M=60. '
+             'Çoklu değer kabul edilir; her K user-K ile eşleştirilir (zip).',
+    )
+    p.add_argument(
+        '--k-item-100k', type=int, default=None,
+        dest='assignment_k_item_100k',
+        help='Sadece ML-100K item K',
+    )
+    p.add_argument(
+        '--k-item-1m', type=int, default=None,
+        dest='assignment_k_item_1m',
+        help='Sadece ML-1M item K',
+    )
+    p.add_argument(
+        '--knn-item', nargs='+', type=int, default=[20], metavar='K',
+        help='Item-CF: film kümesi içi komşu sayısı (default: 20)',
+    )
+    p.add_argument(
+        '--fusion', action='store_true',
+        help='Weighted Fusion senaryosu: User-CF + Item-CF birleşimini '
+             'çalıştır (mevcut ClusterKNN yanında ek satır olarak).',
+    )
+    p.add_argument(
+        '--fusion-mode', choices=['fixed', 'dynamic'], default='dynamic',
+        help='fixed=alpha sabit, dynamic=centroid cosine benzerliğine göre m,n (default).',
+    )
+    p.add_argument(
+        '--fusion-alpha', type=float, default=0.5,
+        help='--fusion-mode fixed iken item-CF ağırlığı (1-alpha user-CF). default 0.5.',
+    )
+    p.add_argument(
+        '--coverage', action='store_true',
+        help='Fusion sonucu için coverage (önerilen benzersiz film oranı) hesapla.',
+    )
+    p.add_argument(
+        '--diversity', action='store_true',
+        help='Fusion sonucu için diversity (önerilen filmler arası 1-sim ortalaması) hesapla. '
+             'Maliyetli; max 500 kullanıcı altörneklenir.',
     )
     args = p.parse_args()
     if any(k < 1 for k in args.knn):
@@ -2818,6 +3972,25 @@ def parse_args():
                 print(f"not: --algo '{raw}' -> '{canon}' olarak yorumlandi", file=sys.stderr)
             resolved.append(canon)
         args.algo = resolved
+    # --- Fusion validasyonu (Görev 7) ---
+    if args.assignment_k_item is not None and (
+        args.assignment_k_item_100k is not None or args.assignment_k_item_1m is not None
+    ):
+        p.error('--k-item ile --k-item-100k / --k-item-1m birlikte kullanılamaz')
+    if any(k < 1 for k in args.knn_item):
+        p.error('--knn-item içindeki her değer en az 1 olmalı')
+    if not (0.0 <= args.fusion_alpha <= 1.0):
+        p.error('--fusion-alpha [0, 1] aralığında olmalı')
+    if args.fusion and args.fusion_mode == 'dynamic' and not args.assign_root \
+       and not args.item_assign_root:
+        # Bilgi notu — kullanıcı her iki rootu da default'a bırakıyor (sorun yok)
+        pass
+    if args.diversity and not args.fusion:
+        print("Uyarı: --diversity yalnız --fusion ile birlikte hesaplanır; "
+              "yok sayılıyor.", file=sys.stderr)
+    if args.coverage and not args.fusion:
+        print("Uyarı: --coverage yalnız --fusion ile birlikte hesaplanır; "
+              "yok sayılıyor.", file=sys.stderr)
     return args
 
 
@@ -2873,6 +4046,9 @@ if __name__ == '__main__':
     print("WNMF DENEY")
     print("=" * 60)
     print(f"Dataset       : {args.dataset}")
+    if args.dataset in ('100k', 'both'):
+        print(f"Eval split    : {args.eval_split}"
+              + (' (u.data, rastgele %20)' if args.eval_split == 'random' else ' (u1.base/u1.test)'))
     print(f"Mod           : {args.mode}")
     print(f"Algoritmalar  : {args.algo or ALGO_LABELS}")
     print(f"Epoch çiftleri: {len(epoch_pairs)} adet {'(grid/Cartesian)' if args.epochs_grid else '(zip/yayılım)'}")
@@ -2940,7 +4116,13 @@ if __name__ == '__main__':
     train_1m   = test_1m = None
     full_100k = full_1m = None
     if args.dataset in ('100k', 'both'):
-        if args.fold is None:
+        if args.eval_split == 'random':
+            train_100k, test_100k = load_ratings_100k_all(
+                DATA_100K_ALL,
+                random_seed=RANDOM_SEED,
+                fold=args.fold,
+            )
+        elif args.fold is None:
             train_100k, test_100k = load_ratings_100k(DATA_100K_TRAIN, DATA_100K_TEST)
         else:
             data_100k_train = os.path.join(
