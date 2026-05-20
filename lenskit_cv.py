@@ -8,16 +8,24 @@ Datasets:
 Splitting follows LensKit user partitioning + per-user holdout (crossfold_users + SampleN):
 https://lenskit.org/stable/guide/batch.html
 
-Run examples:
+LensKit modeller (ranking metrikleri — NDCG, Recall, RBP):
   python lenskit_cv.py --dataset ml-latest-small
   python lenskit_cv.py --dataset ml-100k --data-path data/ml-100k/u.data
   python lenskit_cv.py --dataset ml-latest-small --model als --folds 5 --holdout 5 --topn 20
+
+Surprise modeller (rating tahmin metrikleri — MAE, RMSE):
+  python lenskit_cv.py --dataset ml-100k --model svd
+  python lenskit_cv.py --dataset ml-100k --model svd --n-factors 100 --n-epochs 20
+  python lenskit_cv.py --dataset ml-100k --model svdpp
+  python lenskit_cv.py --dataset ml-100k --model nmf --n-factors 15
+  python lenskit_cv.py --dataset ml-100k --model nmf --n-factors 20 --biased
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -29,6 +37,8 @@ from lenskit.data import Dataset, from_interactions_df
 from lenskit.metrics import NDCG, RBP, Recall, RunAnalysis
 from lenskit.pipeline import topn_pipeline
 from lenskit.splitting import SampleN, crossfold_users
+
+SURPRISE_MODELS = {"svd", "svdpp", "nmf"}
 
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -85,6 +95,116 @@ def build_pipeline(model_name: str, topn: int, rng: int):
     raise ValueError(f"Unknown model: {model_name}")
 
 
+def _load_surprise_dataset(name: str, data_path: Path | None) -> "surprise.Dataset":
+    """u.data veya ratings.csv dosyasını Surprise formatına yükle."""
+    try:
+        from surprise import Dataset as SurpriseDataset, Reader
+    except ImportError:
+        print("Hata: 'surprise' kurulu değil. Kurmak için: pip install scikit-surprise", file=sys.stderr)
+        sys.exit(1)
+
+    if name == "ml-100k":
+        u_data = data_path if data_path is not None else REPO_ROOT / "data" / "ml-100k" / "u.data"
+        if not Path(u_data).is_file():
+            raise FileNotFoundError(f"Missing {u_data}")
+        reader = Reader(line_format="user item rating timestamp", sep="\t", rating_scale=(1, 5))
+        return SurpriseDataset.load_from_file(str(u_data), reader=reader)
+
+    if name == "ml-latest-small":
+        ratings_path = (data_path / "ratings.csv") if data_path is not None else REPO_ROOT / "data" / "ml-latest-small" / "ratings.csv"
+        if not Path(ratings_path).is_file():
+            raise FileNotFoundError(f"Missing {ratings_path}")
+        df = pd.read_csv(ratings_path)
+        reader = Reader(rating_scale=(df["rating"].min(), df["rating"].max()))
+        from surprise import Dataset as SurpriseDataset
+        return SurpriseDataset.load_from_df(df[["userId", "movieId", "rating"]], reader)
+
+    raise ValueError(f"Unknown dataset: {name}")
+
+
+def run_surprise_cv(args) -> int:
+    """Surprise SVD / SVD++ / NMF modellerini 5-fold CV ile çalıştır, MAE/RMSE raporla."""
+    try:
+        from surprise import SVD, SVDpp
+        from surprise import NMF as SurpriseNMF
+        from surprise.model_selection import cross_validate as surprise_cv
+    except ImportError:
+        print("Hata: 'surprise' kurulu değil. Kurmak için: pip install scikit-surprise", file=sys.stderr)
+        return 1
+
+    try:
+        data = _load_surprise_dataset(args.dataset, args.data_path)
+    except FileNotFoundError as e:
+        print(e, file=sys.stderr)
+        return 1
+
+    n_factors = getattr(args, "n_factors", None)
+    n_epochs  = getattr(args, "n_epochs",  None)
+    biased    = getattr(args, "biased",    False)
+
+    if args.model == "svd":
+        kw = {}
+        if n_factors is not None:
+            kw["n_factors"] = n_factors
+        if n_epochs is not None:
+            kw["n_epochs"] = n_epochs
+        algo = SVD(**kw)
+        label = f"SVD(n_factors={kw.get('n_factors', 100)}, n_epochs={kw.get('n_epochs', 20)})"
+
+    elif args.model == "svdpp":
+        kw = {}
+        if n_factors is not None:
+            kw["n_factors"] = n_factors
+        if n_epochs is not None:
+            kw["n_epochs"] = n_epochs
+        algo = SVDpp(**kw)
+        label = f"SVD++(n_factors={kw.get('n_factors', 20)}, n_epochs={kw.get('n_epochs', 20)})"
+
+    elif args.model == "nmf":
+        kw = {"biased": biased}
+        if n_factors is not None:
+            kw["n_factors"] = n_factors
+        if n_epochs is not None:
+            kw["n_epochs"] = n_epochs
+        algo = SurpriseNMF(**kw)
+        label = f"NMF(n_factors={kw.get('n_factors', 15)}, biased={biased})"
+
+    else:
+        raise ValueError(f"Unknown Surprise model: {args.model}")
+
+    print(f"Model  : {label}")
+    print(f"Dataset: {args.dataset}")
+    print(f"CV     : {args.folds}-fold")
+    print()
+
+    t0 = time.time()
+    results = surprise_cv(
+        algo,
+        data,
+        measures=["RMSE", "MAE"],
+        cv=args.folds,
+        verbose=True,
+        n_jobs=1,
+    )
+    elapsed = time.time() - t0
+
+    mae_vals  = results["test_mae"]
+    rmse_vals = results["test_rmse"]
+    fit_vals  = results["fit_time"]
+
+    print(f"\nSonuçlar ({args.folds}-fold CV):")
+    header = f"{'Model':<40} {'MAE':>8} {'RMSE':>8} {'Fit(s)':>8}"
+    print(header)
+    print("-" * len(header))
+    for i, (mae, rmse, ft) in enumerate(zip(mae_vals, rmse_vals, fit_vals), 1):
+        print(f"  Fold {i:<35} {mae:8.4f} {rmse:8.4f} {ft:8.2f}s")
+    print("-" * len(header))
+    print(f"  {'Ortalama':<38} {mae_vals.mean():8.4f} {rmse_vals.mean():8.4f} {fit_vals.mean():8.2f}s")
+    print(f"  {'Std':<38} {mae_vals.std():8.4f} {rmse_vals.std():8.4f}")
+    print(f"\nToplam süre: {elapsed:.1f}s")
+    return 0
+
+
 def evaluate_fold(pipe, split_test, topn: int, n_jobs: int | None) -> pd.Series:
     runner = BatchPipelineRunner(n_jobs=n_jobs)
     runner.recommend(n=topn)
@@ -123,8 +243,20 @@ def main(argv: list[str] | None = None) -> int:
         help="Test ratings per user in each test-user group (SampleN).",
     )
     p.add_argument("--topn", type=int, default=20, help="Top-N list length for recommendations and metrics.")
-    p.add_argument("--model", choices=["pop", "als"], default="pop")
+    p.add_argument(
+        "--model",
+        choices=["pop", "als", "svd", "svdpp", "nmf"],
+        default="pop",
+        help="pop/als → LensKit (ranking metrikleri); svd/svdpp/nmf → Surprise (MAE/RMSE)",
+    )
     p.add_argument("--rng", type=int, default=42, help="Seed for CV shuffle and ALS.")
+    # Surprise-özgü parametreler
+    p.add_argument("--n-factors", type=int, default=None, metavar="K",
+                   help="Surprise: gizli faktör sayısı (SVD=100, SVD++=20, NMF=15 varsayılan)")
+    p.add_argument("--n-epochs", type=int, default=None, metavar="E",
+                   help="Surprise: epoch sayısı (SVD/SVD++=20, NMF=50 varsayılan)")
+    p.add_argument("--biased", action="store_true",
+                   help="Surprise NMF: bias terimleri ekle (μ + b_u + b_i + q·p)")
     p.add_argument(
         "--n-jobs",
         type=int,
@@ -132,6 +264,9 @@ def main(argv: list[str] | None = None) -> int:
         help="Parallel batch jobs (LensKit BatchPipelineRunner); 1 is safest on Windows.",
     )
     args = p.parse_args(argv)
+
+    if args.model in SURPRISE_MODELS:
+        return run_surprise_cv(args)
 
     try:
         data, source = load_dataset(args.dataset, args.data_path)

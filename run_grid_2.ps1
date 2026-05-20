@@ -4,6 +4,7 @@
 function Get-AssignSuffix {
   param(
     [int]$MinU, [int]$MinI,
+    [bool]$NoPrune = $false,
     [bool]$Zscore,
     [string]$Pca,
     [int]$WnmfFeat,
@@ -12,10 +13,14 @@ function Get-AssignSuffix {
     [bool]$Paper, [bool]$NoGs,
     [string]$Preprocess, [string]$Fe, [int]$Components,
     [int]$K,
+    [string]$InitMode = "mkpp",
     [bool]$KmRefine = $false,
     [string]$Algo = ""
   )
-  $s = "_pruneu$($MinU)_i$($MinI)"
+  $s = ""
+  if (-not $NoPrune -and ($MinU -gt 0 -or $MinI -gt 0)) {
+    $s = "_pruneu$($MinU)_i$($MinI)"
+  }
   if ($Zscore) { $s += "_zscore" }
   if ($Pca -ne "") { $s += "_pca$([int][math]::Round([double]$Pca * 100))pct" }
   # Yol A.2: legacy --wnmf-features verildiyse SADECE init/trim etiketi düşer.
@@ -25,6 +30,7 @@ function Get-AssignSuffix {
   }
   if ($Metric -eq "fuzzy")    { $s += "_fuzzy" }
   elseif ($Metric -eq "euclidean") { $s += "_euc" }
+  if ($InitMode -eq "random") { $s += "_irand" } else { $s += "_imkpp" }
   if ($Paper) { $s += "_paper" }
   elseif ($NoGs) { $s += "_nogs" }
   $s += "_$($Preprocess)_$($Fe)$($Components)_k$($K)"
@@ -151,21 +157,23 @@ foreach ($k in $ks) {
       python @args
 
       # Atama klasörü suffix'i (kmref durumunda B0_KMEANS hariç _kmref eklenir)
+      $effInit = if ($initMode) { $initMode } else { "mkpp" }
       $suffixBase = Get-AssignSuffix -MinU $minU -MinI $minI `
         -Zscore $sc.Zscore -Pca $sc.Pca `
         -WnmfFeat 0 -WnmfInit "inmed" -TrimLow 5.0 -TrimHigh 95.0 `
         -Metric $sc.Cm -Paper $false -NoGs $noGraySheep `
         -Preprocess $sc.Pp -Fe $sc.Fe -Components ([int]$sc.Dim) -K ([int]$k) `
-        -KmRefine $false -Algo "B0_KMEANS"
+        -InitMode $effInit -KmRefine $false -Algo "B0_KMEANS"
       $suffixRefined = Get-AssignSuffix -MinU $minU -MinI $minI `
         -Zscore $sc.Zscore -Pca $sc.Pca `
         -WnmfFeat 0 -WnmfInit "inmed" -TrimLow 5.0 -TrimHigh 95.0 `
         -Metric $sc.Cm -Paper $false -NoGs $noGraySheep `
         -Preprocess $sc.Pp -Fe $sc.Fe -Components ([int]$sc.Dim) -K ([int]$k) `
-        -KmRefine $kmRefine -Algo "OTHER"
+        -InitMode $effInit -KmRefine $kmRefine -Algo "OTHER"
 
       $algosBase    = $algos | Where-Object { $_ -eq "B0_KMEANS" }
       $algosRefined = $algos | Where-Object { $_ -ne "B0_KMEANS" }
+      $splitWnmfBySuffix = $kmRefine -and ($suffixBase -ne $suffixRefined)
 
       foreach ($fd in $predFolds) {
         foreach ($knn in $knns) {
@@ -173,11 +181,15 @@ foreach ($k in $ks) {
             Write-Host "  -> tahmin: fold=$fd knn=$knn sim=$sim mode=$predMode" -ForegroundColor Yellow
 
             $predGroups = @()
-            if ($algosRefined.Count -gt 0) {
-              $predGroups += ,@{ Algos = $algosRefined; Suffix = $suffixRefined }
-            }
-            if ($algosBase.Count -gt 0) {
-              $predGroups += ,@{ Algos = $algosBase; Suffix = $suffixBase }
+            if ($splitWnmfBySuffix) {
+              if ($algosRefined.Count -gt 0) {
+                $predGroups += ,@{ Algos = $algosRefined; Suffix = $suffixRefined }
+              }
+              if ($algosBase.Count -gt 0) {
+                $predGroups += ,@{ Algos = $algosBase; Suffix = $suffixBase }
+              }
+            } else {
+              $predGroups += ,@{ Algos = $algos; Suffix = $suffixBase }
             }
 
             foreach ($grp in $predGroups) {
