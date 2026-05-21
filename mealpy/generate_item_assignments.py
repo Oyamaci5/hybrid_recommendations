@@ -75,6 +75,8 @@ from generate_assignments import (
     prune_sparse_matrix,
     run_single,
     run_single_with_early_stop,
+    run_ha_avoahgs_with_early_stop,
+    run_iwo_hho_with_early_stop,
     save_assignment,
     zscore_normalize,
 )
@@ -281,44 +283,70 @@ def _run_one_item(
         best_fit = float(km.inertia_)
         assignments = km.labels_.astype(np.int32, copy=False)
     elif g_name == 'IWO_HHO' or label == 'IWO_HHO':
-        from optimizers.iwo_hho import IWO_HHO_Clustering
-
         init = _multi_start_init(
             matrix, K=K, pop_size=POP_SIZE, seed=seed, n_restarts=10,
             metric=cluster_metric, init_mode=init_mode,
         )
-        problem = _make_problem(matrix, K, metric=cluster_metric)
-        iwo_hho = IWO_HHO_Clustering(
-            epoch=BASELINE_EPOCH,
-            pop_size=POP_SIZE,
-            seed=seed,
-        )
-        try:
-            best_sol, best_fit = iwo_hho.solve(
-                problem, starting_solutions=init[:POP_SIZE],
+        if args is not None and getattr(args, 'early_stop', False):
+            es_max = getattr(args, 'early_stop_max_epoch', EARLY_STOP_MAX_EPOCH)
+            best_sol, best_fit, actual_epochs, convergence_history = (
+                run_iwo_hho_with_early_stop(
+                    matrix, K, init, es_max, POP_SIZE, seed,
+                    metric=cluster_metric,
+                    patience=getattr(args, 'early_stop_patience', EARLY_STOP_PATIENCE),
+                    tolerance=getattr(args, 'early_stop_tolerance', EARLY_STOP_TOLERANCE),
+                    block_size=getattr(args, 'early_stop_block', EARLY_STOP_BLOCK_SIZE),
+                )
             )
-        except TypeError:
-            best_sol, best_fit = iwo_hho.solve(problem)
-    elif label == 'HA_AVOAHGS':
-        from optimizers.HA_AVOAHGS import HA_AVOAHGS
+            print(f"    Early-stop epoch: {actual_epochs}/{es_max}")
+        else:
+            from optimizers.iwo_hho import IWO_HHO_Clustering
 
+            problem = _make_problem(matrix, K, metric=cluster_metric)
+            iwo_hho = IWO_HHO_Clustering(
+                epoch=BASELINE_EPOCH,
+                pop_size=POP_SIZE,
+                seed=seed,
+            )
+            try:
+                best_sol, best_fit = iwo_hho.solve(
+                    problem, starting_solutions=init[:POP_SIZE],
+                )
+            except TypeError:
+                best_sol, best_fit = iwo_hho.solve(problem)
+    elif label == 'HA_AVOAHGS':
         init = _multi_start_init(
             matrix, K=K, pop_size=POP_SIZE, seed=seed, n_restarts=10,
             metric=cluster_metric, init_mode=init_mode,
         )
-        problem = _make_problem(matrix, K, metric=cluster_metric)
-        model = HA_AVOAHGS(
-            epoch=BASELINE_EPOCH,
-            pop_size=POP_SIZE,
-            p1=0.4,
-            hgs_rate=0.7,
-        )
-        try:
-            model.solve(problem, starting_solutions=init[:POP_SIZE])
-        except TypeError:
-            model.solve(problem)
-        best_sol = model.g_best.solution
-        best_fit = float(model.g_best.target.fitness)
+        if args is not None and getattr(args, 'early_stop', False):
+            es_max = getattr(args, 'early_stop_max_epoch', EARLY_STOP_MAX_EPOCH)
+            best_sol, best_fit, actual_epochs, convergence_history = (
+                run_ha_avoahgs_with_early_stop(
+                    matrix, K, init, es_max, POP_SIZE,
+                    metric=cluster_metric,
+                    patience=getattr(args, 'early_stop_patience', EARLY_STOP_PATIENCE),
+                    tolerance=getattr(args, 'early_stop_tolerance', EARLY_STOP_TOLERANCE),
+                    block_size=getattr(args, 'early_stop_block', EARLY_STOP_BLOCK_SIZE),
+                )
+            )
+            print(f"    Early-stop epoch: {actual_epochs}/{es_max}")
+        else:
+            from optimizers.HA_AVOAHGS import HA_AVOAHGS
+
+            problem = _make_problem(matrix, K, metric=cluster_metric)
+            model = HA_AVOAHGS(
+                epoch=BASELINE_EPOCH,
+                pop_size=POP_SIZE,
+                p1=0.4,
+                hgs_rate=0.7,
+            )
+            try:
+                model.solve(problem, starting_solutions=init[:POP_SIZE])
+            except TypeError:
+                model.solve(problem)
+            best_sol = model.g_best.solution
+            best_fit = float(model.g_best.target.fitness)
     else:
         if g_name not in algo_map:
             raise KeyError(

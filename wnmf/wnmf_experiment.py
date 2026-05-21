@@ -126,7 +126,7 @@ ALGO_LABELS = [
     'B1_HHO', 'B2_HGS', 'B3_MFO', 'LF_HHO', 'IWO_HHO', 'SFOA', 'SFOA_06', 'H1_HHO+HGS', 'H4_MFO+HHO', 'DOA',
     'H9_QSA+CDO', 'H12_MFO+CDO', 'H13_HHO+GAop', 'HA_AVOAHGS',
     # generate_assignments.py ALGO_CONFIG — önce --lof ile atama üretin
-    'LIT_CIRCLESA', 'LIT_GOA', 'LIT_GWO', 'LIT_SSA', 'LIT_PSO',
+    'LIT_CIRCLESA', 'LIT_GOA', 'LIT_GWO', 'LIT_SSA', 'LIT_PSO', 'LIT_CSO',
     'B_AVOA',
 ]
 
@@ -1544,7 +1544,9 @@ def run_cluster_average(train, test, assignments, gray_mask,
                         relevance_threshold: float = 4.0,
                         centroids=None,
                         nearest_centroid: bool = False,
-                        centroid_metric: str = 'euclidean'):
+                        centroid_metric: str = 'euclidean',
+                        cluster_avg_hard: bool = False,
+                        cluster_avg_leaky: bool = False):
     t0 = time.time()
 
     test_cluster_ids = resolve_test_cluster_ids(
@@ -1554,8 +1556,12 @@ def run_cluster_average(train, test, assignments, gray_mask,
 
     # Her küme için her item'ın ortalama rating'ini hesapla
     n_clusters = int(assignments.max()) + 1
+    # Thakrar et al. (2025) Algorithm 6: kümedeki tüm kullanıcıların ortalaması;
+    # soft membership yok (--cluster-avg-hard).
     use_soft = (
-        memberships is not None
+        not cluster_avg_hard
+        and not cluster_avg_leaky
+        and memberships is not None
         and memberships.shape[0] >= len(assignments)
         and memberships.shape[1] == n_clusters
     )
@@ -1563,15 +1569,16 @@ def run_cluster_average(train, test, assignments, gray_mask,
     cluster_item_means = np.zeros((n_clusters, n_items), dtype=np.float32)
     cluster_item_counts = np.zeros((n_clusters, n_items), dtype=np.int32)
 
-    # Train verisinden küme-item ortalamalarını hesapla
-    for row in train:
+    # Ortalama kaynağı: train (doğru holdout) veya train+test (makale-tipi sızıntı)
+    mean_rows = np.vstack([train, test]) if cluster_avg_leaky else train
+    for row in mean_rows:
         u, i, r = int(row[0]), int(row[1]), float(row[2])
         cid = int(assignments[u])
         cluster_item_means[cid, i] += r
         cluster_item_counts[cid, i] += 1
 
     # Ortalamaları hesapla, rating olmayan item için global ortalama kullan
-    global_mean = float(train[:, 2].mean())
+    global_mean = float(mean_rows[:, 2].mean())
     for cid in range(n_clusters):
         mask = cluster_item_counts[cid] > 0
         cluster_item_means[cid, mask] /= cluster_item_counts[cid, mask]
@@ -1632,8 +1639,17 @@ def run_cluster_average(train, test, assignments, gray_mask,
         nearest_centroid and centroids is not None
         and centroids.shape[1] == n_items
     )
-    scenario = 'cluster_avg_nc' if use_nc else 'cluster_avg'
-    print(f"  [{algo_label} | ClusterAvg{'+NC' if use_nc else ''}] "
+    if cluster_avg_leaky:
+        scenario = 'calc_avg_rating_leaky_nc' if use_nc else 'calc_avg_rating_leaky'
+        tag = 'CalcAvgRating+LEAK'
+    elif cluster_avg_hard:
+        scenario = 'calc_avg_rating_nc' if use_nc else 'calc_avg_rating'
+        tag = 'CalcAvgRating'
+    else:
+        scenario = 'cluster_avg_nc' if use_nc else 'cluster_avg'
+        tag = 'ClusterAvg'
+    leak_note = ' [train+test ort.]' if cluster_avg_leaky else ''
+    print(f"  [{algo_label} | {tag}{'+NC' if use_nc else ''}{leak_note}] "
           f"MAE={mae:.4f} RMSE={rmse:.4f} | Gray MAE={gray_mae:.4f} ({elapsed:.1f}s)")
 
     return {
@@ -2819,6 +2835,8 @@ def _mp_run_algo_job(job):
                 train, test, assignments, gray_mask, memberships, n_items, label,
                 top_n=top_n,
                 relevance_threshold=relevance_threshold,
+                cluster_avg_hard=bool(getattr(mp_args, 'cluster_avg_hard', False)),
+                cluster_avg_leaky=bool(getattr(mp_args, 'cluster_avg_leaky', False)),
                 **nc,
             )
             row['dataset'] = dataset_name
@@ -3255,6 +3273,8 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
                     train, test, assignments, gray_mask, memberships, n_items, label,
                     top_n=top_n,
                     relevance_threshold=relevance_threshold,
+                    cluster_avg_hard=bool(getattr(args, 'cluster_avg_hard', False)),
+                    cluster_avg_leaky=bool(getattr(args, 'cluster_avg_leaky', False)),
                     **nc,
                 )
                 row['dataset'] = dataset_name
@@ -3785,6 +3805,18 @@ def parse_args():
     p.add_argument(
         '--no-cluster-avg', action='store_true',
         help='ClusterAvg senaryosunu çalıştırma',
+    )
+    p.add_argument(
+        '--cluster-avg-hard',
+        action='store_true',
+        help='Thakrar et al. (2025) CalculateAverageRating: küme-içi train ortalaması, '
+             'soft membership yok (senaryo: calc_avg_rating).',
+    )
+    p.add_argument(
+        '--cluster-avg-leaky',
+        action='store_true',
+        help='Küme-item ortalamasını train+test ile hesapla (makale-tipi sızıntı; '
+             'senaryo: calc_avg_rating_leaky). Tahmin yine test çiftlerinde.',
     )
     p.add_argument(
         '--no-cluster-knn', action='store_true',

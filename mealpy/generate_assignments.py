@@ -139,6 +139,7 @@ ALGO_CONFIG = [
     ('LIT_GWO', 'GWO.OriginalGWO', None),
     ('LIT_SSA', 'SSA.OriginalSSA', None),
     ('LIT_PSO', 'PSO.OriginalPSO', None),
+    ('LIT_CSO', 'CSO.OriginalCSO', None),
     ('HA_AVOAHGS', None, None),
     ('B_AVOA', 'AVOA.OriginalAVOA', None),
 ]
@@ -329,6 +330,97 @@ def run_single(algo_info, matrix, K, init, epoch, pop_size, metric: str = 'pears
     return model.g_best.solution, best_fit
 
 
+def _init_early_stop_population(init, pop_size, lb, ub):
+    rng = np.random.default_rng(SEED)
+    current_pop = [
+        np.asarray(s, dtype=np.float64).copy() for s in init[:pop_size]
+    ]
+    while len(current_pop) < pop_size:
+        current_pop.append(rng.uniform(lb, ub))
+    return current_pop
+
+
+def _run_block_early_stop(
+    init,
+    max_epoch,
+    pop_size,
+    patience,
+    tolerance,
+    block_size,
+    algo_short,
+    lb,
+    ub,
+    run_block,
+):
+    """
+    Blok bazlı convergence early-stop.
+    run_block(current_pop, block_epochs, block_idx) -> (block_best_sol, block_fit, new_pop)
+    """
+    block_size = max(1, int(block_size))
+    max_epoch = max(1, int(max_epoch))
+    patience = max(1, int(patience))
+
+    best_fit = float('inf')
+    best_sol = None
+    no_improve = 0
+    actual_epochs = 0
+    convergence_history: list[dict] = []
+    current_pop = _init_early_stop_population(init, pop_size, lb, ub)
+
+    def _run_one_block(epochs: int, block_idx: int) -> bool:
+        nonlocal best_fit, best_sol, no_improve, actual_epochs, current_pop
+
+        block_best_sol, new_fit, current_pop = run_block(
+            current_pop, epochs, block_idx,
+        )
+        actual_epochs += epochs
+        convergence_history.append({
+            'epoch': actual_epochs,
+            'fitness': new_fit,
+            'block': block_idx,
+        })
+
+        improvement = best_fit - new_fit
+        if improvement > tolerance:
+            best_fit = new_fit
+            best_sol = np.asarray(block_best_sol, dtype=np.float64).copy()
+            no_improve = 0
+        else:
+            no_improve += 1
+
+        print(
+            f"    Block {block_idx}: fitness={new_fit:.6f}, "
+            f"improvement={improvement:.2e}, "
+            f"no_improve={no_improve}/{patience}"
+        )
+        return no_improve >= patience
+
+    n_blocks = max_epoch // block_size
+    remainder = max_epoch % block_size
+    stopped = False
+
+    for block in range(n_blocks):
+        if _run_one_block(block_size, block + 1):
+            print(f"    Early stop: {actual_epochs} epoch'ta converge")
+            stopped = True
+            break
+
+    if not stopped and remainder > 0 and actual_epochs < max_epoch:
+        if _run_one_block(remainder, n_blocks + 1):
+            print(f"    Early stop: {actual_epochs} epoch'ta converge")
+
+    if best_sol is None:
+        raise RuntimeError(
+            f"{algo_short}: early-stop sonrası geçerli çözüm yok"
+        )
+
+    print(
+        f"    {algo_short} WCSS: {best_fit:.4f} "
+        f"({actual_epochs}/{max_epoch} epoch, {len(convergence_history)} blok)"
+    )
+    return best_sol, best_fit, actual_epochs, convergence_history
+
+
 def run_single_with_early_stop(
     algo_info,
     matrix,
@@ -346,34 +438,16 @@ def run_single_with_early_stop(
     patience ardışık blok boyunca tolerance altında iyileşme yoksa durur.
     """
     problem = _make_problem(matrix, K, metric=metric)
-    block_size = max(1, int(block_size))
-    max_epoch = max(1, int(max_epoch))
-    patience = max(1, int(patience))
-
-    best_fit = float('inf')
-    best_sol = None
-    no_improve = 0
-    actual_epochs = 0
-    convergence_history: list[dict] = []
-
     lb = np.array(problem["bounds"].lb)
     ub = np.array(problem["bounds"].ub)
-    rng = np.random.default_rng(SEED)
-    current_pop = [
-        np.asarray(s, dtype=np.float64).copy() for s in init[:pop_size]
-    ]
-    while len(current_pop) < pop_size:
-        current_pop.append(rng.uniform(lb, ub))
-
     algo_short = algo_info['full_name'].split('.')[0]
 
-    def _run_block(epochs: int, block_idx: int) -> bool:
-        """Bir blok çalıştır. True dönerse early stop tetiklendi."""
-        nonlocal best_fit, best_sol, no_improve, actual_epochs, current_pop
-
-        sp_block = get_special_params(algo_info['full_name'], epochs, pop_size)
+    def run_block(current_pop, block_epochs, _block_idx):
+        sp_block = get_special_params(
+            algo_info['full_name'], block_epochs, pop_size,
+        )
         block_model = algo_info['class'](
-            **(sp_block or {'epoch': epochs, 'pop_size': pop_size})
+            **(sp_block or {'epoch': block_epochs, 'pop_size': pop_size})
         )
         try:
             block_model.solve(problem, starting_solutions=current_pop)
@@ -381,64 +455,120 @@ def run_single_with_early_stop(
             block_model.solve(problem)
 
         new_fit = float(block_model.g_best.target.fitness)
-        actual_epochs += epochs
-        convergence_history.append({
-            'epoch': actual_epochs,
-            'fitness': new_fit,
-            'block': block_idx,
-        })
-
+        new_sol = np.asarray(
+            block_model.g_best.solution, dtype=np.float64,
+        ).copy()
         pop = getattr(block_model, 'pop', None)
         if pop:
-            current_pop = [
+            new_pop = [
                 np.asarray(a.solution, dtype=np.float64).copy() for a in pop
             ]
         else:
-            current_pop[0] = np.asarray(
-                block_model.g_best.solution, dtype=np.float64,
-            ).copy()
+            new_pop = current_pop.copy()
+            new_pop[0] = new_sol
+        return new_sol, new_fit, new_pop
 
-        improvement = best_fit - new_fit
-        if improvement > tolerance:
-            best_fit = new_fit
-            best_sol = np.asarray(
-                block_model.g_best.solution, dtype=np.float64,
-            ).copy()
-            no_improve = 0
-        else:
-            no_improve += 1
-
-        print(
-            f"    Block {block_idx}: fitness={new_fit:.6f}, "
-            f"improvement={improvement:.2e}, "
-            f"no_improve={no_improve}/{patience}"
-        )
-        return no_improve >= patience
-
-    n_blocks = max_epoch // block_size
-    remainder = max_epoch % block_size
-    stopped = False
-
-    for block in range(n_blocks):
-        if _run_block(block_size, block + 1):
-            print(f"    Early stop: {actual_epochs} epoch'ta converge")
-            stopped = True
-            break
-
-    if not stopped and remainder > 0 and actual_epochs < max_epoch:
-        if _run_block(remainder, n_blocks + 1):
-            print(f"    Early stop: {actual_epochs} epoch'ta converge")
-
-    if best_sol is None:
-        raise RuntimeError(
-            f"{algo_info['full_name']}: early-stop sonrası geçerli çözüm yok"
-        )
-
-    print(
-        f"    {algo_short} WCSS: {best_fit:.4f} "
-        f"({actual_epochs}/{max_epoch} epoch, {len(convergence_history)} blok)"
+    return _run_block_early_stop(
+        init, max_epoch, pop_size, patience, tolerance, block_size,
+        algo_short, lb, ub, run_block,
     )
-    return best_sol, best_fit, actual_epochs, convergence_history
+
+
+def run_ha_avoahgs_with_early_stop(
+    matrix,
+    K,
+    init,
+    max_epoch,
+    pop_size,
+    metric: str = 'pearson',
+    patience: int = EARLY_STOP_PATIENCE,
+    tolerance: float = EARLY_STOP_TOLERANCE,
+    block_size: int = EARLY_STOP_BLOCK_SIZE,
+    p1: float = 0.4,
+    hgs_rate: float = 0.7,
+):
+    from optimizers.HA_AVOAHGS import HA_AVOAHGS
+
+    problem = _make_problem(matrix, K, metric=metric)
+    lb = np.array(problem["bounds"].lb)
+    ub = np.array(problem["bounds"].ub)
+
+    def run_block(current_pop, block_epochs, _block_idx):
+        model = HA_AVOAHGS(
+            epoch=block_epochs,
+            pop_size=pop_size,
+            p1=p1,
+            hgs_rate=hgs_rate,
+        )
+        try:
+            model.solve(problem, starting_solutions=current_pop)
+        except TypeError:
+            model.solve(problem)
+
+        new_fit = float(model.g_best.target.fitness)
+        new_sol = np.asarray(model.g_best.solution, dtype=np.float64).copy()
+        pop = getattr(model, 'pop', None)
+        if pop:
+            new_pop = [
+                np.asarray(a.solution, dtype=np.float64).copy() for a in pop
+            ]
+        else:
+            new_pop = current_pop.copy()
+            new_pop[0] = new_sol
+        return new_sol, new_fit, new_pop
+
+    return _run_block_early_stop(
+        init, max_epoch, pop_size, patience, tolerance, block_size,
+        'HA_AVOAHGS', lb, ub, run_block,
+    )
+
+
+def run_iwo_hho_with_early_stop(
+    matrix,
+    K,
+    init,
+    max_epoch,
+    pop_size,
+    seed,
+    metric: str = 'pearson',
+    patience: int = EARLY_STOP_PATIENCE,
+    tolerance: float = EARLY_STOP_TOLERANCE,
+    block_size: int = EARLY_STOP_BLOCK_SIZE,
+):
+    from optimizers.iwo_hho import IWO_HHO_Clustering
+
+    problem = _make_problem(matrix, K, metric=metric)
+    lb = np.array(problem["bounds"].lb)
+    ub = np.array(problem["bounds"].ub)
+
+    def run_block(current_pop, block_epochs, _block_idx):
+        iwo_hho = IWO_HHO_Clustering(
+            epoch=block_epochs,
+            pop_size=pop_size,
+            seed=seed,
+        )
+        try:
+            best_sol, new_fit = iwo_hho.solve(
+                problem, starting_solutions=current_pop,
+            )
+        except TypeError:
+            best_sol, new_fit = iwo_hho.solve(problem)
+
+        new_sol = np.asarray(best_sol, dtype=np.float64).copy()
+        last_pop = getattr(iwo_hho, 'last_population', None)
+        if last_pop:
+            new_pop = [
+                np.asarray(p, dtype=np.float64).copy() for p in last_pop
+            ]
+        else:
+            new_pop = current_pop.copy()
+            new_pop[0] = new_sol
+        return new_sol, float(new_fit), new_pop
+
+    return _run_block_early_stop(
+        init, max_epoch, pop_size, patience, tolerance, block_size,
+        'IWO_HHO', lb, ub, run_block,
+    )
 
 
 def run_hybrid(g_info, l_info, matrix, K, init, g_epoch, l_epoch, pop_size,
@@ -885,21 +1015,34 @@ def _run_one_core(
         best_fit = float(km.inertia_)
         assignments = km.labels_
     elif label == 'HA_AVOAHGS':
-        from optimizers.HA_AVOAHGS import HA_AVOAHGS
+        if args is not None and getattr(args, 'early_stop', False):
+            es_max = getattr(args, 'early_stop_max_epoch', EARLY_STOP_MAX_EPOCH)
+            best_sol, best_fit, actual_epochs, convergence_history = (
+                run_ha_avoahgs_with_early_stop(
+                    matrix, K, init, es_max, pop_size,
+                    metric=cluster_metric,
+                    patience=getattr(args, 'early_stop_patience', EARLY_STOP_PATIENCE),
+                    tolerance=getattr(args, 'early_stop_tolerance', EARLY_STOP_TOLERANCE),
+                    block_size=getattr(args, 'early_stop_block', EARLY_STOP_BLOCK_SIZE),
+                )
+            )
+            print(f"    Early-stop epoch: {actual_epochs}/{es_max}")
+        else:
+            from optimizers.HA_AVOAHGS import HA_AVOAHGS
 
-        model = HA_AVOAHGS(
-            epoch=baseline_epoch,
-            pop_size=pop_size,
-            p1=0.4,
-            hgs_rate=0.7,
-        )
-        problem = _make_problem(matrix, K, metric=cluster_metric)
-        try:
-            model.solve(problem, starting_solutions=init[:pop_size])
-        except TypeError:
-            model.solve(problem)
-        best_sol = model.g_best.solution
-        best_fit = float(model.g_best.target.fitness)
+            model = HA_AVOAHGS(
+                epoch=baseline_epoch,
+                pop_size=pop_size,
+                p1=0.4,
+                hgs_rate=0.7,
+            )
+            problem = _make_problem(matrix, K, metric=cluster_metric)
+            try:
+                model.solve(problem, starting_solutions=init[:pop_size])
+            except TypeError:
+                model.solve(problem)
+            best_sol = model.g_best.solution
+            best_fit = float(model.g_best.target.fitness)
     elif g_name == 'KMEANS':
         from sklearn.cluster import KMeans
         from sklearn.preprocessing import normalize
@@ -947,20 +1090,33 @@ def _run_one_core(
             matrix, best_sol, K, metric=cluster_metric,
         )
     elif g_name == 'IWO_HHO' or label == 'IWO_HHO':
-        from optimizers.iwo_hho import IWO_HHO_Clustering
-
-        problem = _make_problem(matrix, K, metric=cluster_metric)
-        iwo_hho = IWO_HHO_Clustering(
-            epoch=baseline_epoch,
-            pop_size=pop_size,
-            seed=seed,
-        )
-        try:
-            best_sol, best_fit = iwo_hho.solve(
-                problem, starting_solutions=init[:pop_size],
+        if args is not None and getattr(args, 'early_stop', False):
+            es_max = getattr(args, 'early_stop_max_epoch', EARLY_STOP_MAX_EPOCH)
+            best_sol, best_fit, actual_epochs, convergence_history = (
+                run_iwo_hho_with_early_stop(
+                    matrix, K, init, es_max, pop_size, seed,
+                    metric=cluster_metric,
+                    patience=getattr(args, 'early_stop_patience', EARLY_STOP_PATIENCE),
+                    tolerance=getattr(args, 'early_stop_tolerance', EARLY_STOP_TOLERANCE),
+                    block_size=getattr(args, 'early_stop_block', EARLY_STOP_BLOCK_SIZE),
+                )
             )
-        except TypeError:
-            best_sol, best_fit = iwo_hho.solve(problem)
+            print(f"    Early-stop epoch: {actual_epochs}/{es_max}")
+        else:
+            from optimizers.iwo_hho import IWO_HHO_Clustering
+
+            problem = _make_problem(matrix, K, metric=cluster_metric)
+            iwo_hho = IWO_HHO_Clustering(
+                epoch=baseline_epoch,
+                pop_size=pop_size,
+                seed=seed,
+            )
+            try:
+                best_sol, best_fit = iwo_hho.solve(
+                    problem, starting_solutions=init[:pop_size],
+                )
+            except TypeError:
+                best_sol, best_fit = iwo_hho.solve(problem)
     elif label in ('SFOA', 'SFOA_06') or g_name in ('SFOA', 'SFOA_06'):
         gp_map = {'SFOA': 0.5, 'SFOA_06': 0.6}
         sfoa_key = label if label in gp_map else g_name
@@ -1765,8 +1921,14 @@ def parse_args():
         help='KMeans refinement için max_iter (default: 300; önerilen 100-500).'
     )
     p.add_argument(
+        '--out-root', type=str, default=None, metavar='DIR',
+        help='Çıktı kök klasörü (mealpy/ altında veya mutlak yol). '
+             'Verilmezse --early-stop ile assignments_lof_estop / assignments_estop, '
+             'aksi halde assignments_lof / assignments kullanılır.',
+    )
+    p.add_argument(
         '--early-stop', action='store_true',
-        help='Tek-algoritma (l_name=None) mealpy koşularında blok bazlı erken durdurma',
+        help='Blok bazlı convergence early-stop (mealpy tek-algo, HA_AVOAHGS, IWO_HHO)',
     )
     p.add_argument(
         '--early-stop-max-epoch', type=int, default=EARLY_STOP_MAX_EPOCH, metavar='N',
@@ -1947,11 +2109,22 @@ if __name__ == '__main__':
         k_100k = args.k_100k or K_100K_DEFAULT
         k_1m   = args.k_1m   or K_1M_DEFAULT
 
-    # Çıktı klasörü — LOF ve percentile ayrı tutulur
-    out_root = os.path.join(
-        BASE_DIR, 'results',
-        'assignments_lof' if args.lof else 'assignments'
-    )
+    # Çıktı klasörü — LOF ve percentile ayrı tutulur; early-stop ayrı kökte
+    if args.out_root:
+        out_root = (
+            args.out_root if os.path.isabs(args.out_root)
+            else os.path.join(BASE_DIR, args.out_root)
+        )
+    elif args.early_stop:
+        out_root = os.path.join(
+            BASE_DIR, 'results',
+            'assignments_lof_estop' if args.lof else 'assignments_estop',
+        )
+    else:
+        out_root = os.path.join(
+            BASE_DIR, 'results',
+            'assignments_lof' if args.lof else 'assignments',
+        )
     os.makedirs(out_root, exist_ok=True)
 
     print("=" * 60)
@@ -1972,6 +2145,13 @@ if __name__ == '__main__':
     if args.lof:
         print(f"LOF         : n_neighbors={args.n_neighbors}, contamination={contamination}")
     print(f"Epoch       : baseline={BASELINE_EPOCH}, global={GLOBAL_EPOCH}, local={LOCAL_EPOCH}")
+    if args.early_stop:
+        print(
+            f"Early-stop  : max={args.early_stop_max_epoch}, "
+            f"block={args.early_stop_block}, "
+            f"patience={args.early_stop_patience}, "
+            f"tol={args.early_stop_tolerance}"
+        )
     print(f"Pop size    : {POP_SIZE}  |  Seed: {SEED}")
     feat_bits = []
     if args.min_user_ratings <= 0 and args.min_item_ratings <= 0:

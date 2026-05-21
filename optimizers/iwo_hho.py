@@ -150,6 +150,7 @@ class IWO_HHO_Clustering:
         print(f"[IWO-HHO] Final fitness: {best_fit:.4f}")
         self.best_solution = best_sol
         self.best_fitness = best_fit
+        self.last_population = [p.copy() for p in pop]
         return best_sol, best_fit
 
     def optimize(self, X: np.ndarray, k: int) -> np.ndarray:
