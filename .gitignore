@@ -2,14 +2,25 @@
 
 .gitignore
 data/
-results/*
-!results/assignment_experiments.sqlite
+results/**
+!results/**/
+!results/**/*.sqlite
+!results/**/*.png
+mealpy/results/**
+!mealpy/results/**/
+!mealpy/results/**/*.sqlite
+!mealpy/results/**/*.png
+comparison_algorithms/results/**
+!comparison_algorithms/results/**/
+!comparison_algorithms/results/**/*.sqlite
+!comparison_algorithms/results/**/*.png
 google_apps_script/
 # Explicitly ignore .cursor directory
 .cursor/
 *.txt
 *.xlsx
 *.csv
+*.npy
 
 # Python cache files
 __pycache__/
