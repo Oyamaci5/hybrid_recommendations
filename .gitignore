@@ -2,7 +2,8 @@
 
 .gitignore
 data/
-results/
+results/*
+!results/assignment_experiments.sqlite
 google_apps_script/
 # Explicitly ignore .cursor directory
 .cursor/
