@@ -1,26 +1,42 @@
 # Ignore everything except data and results directories
 
-.gitignore
 data/
-results/**
-!results/**/
-!results/**/*.sqlite
-!results/**/*.png
-mealpy/results/**
-!mealpy/results/**/
-!mealpy/results/**/*.sqlite
-!mealpy/results/**/*.png
-comparison_algorithms/results/**
-!comparison_algorithms/results/**/
-!comparison_algorithms/results/**/*.sqlite
-!comparison_algorithms/results/**/*.png
 google_apps_script/
 # Explicitly ignore .cursor directory
 .cursor/
+
+# Bulky experiment artifacts (sqlite + png are tracked)
+*.npy
+*.csv
 *.txt
 *.xlsx
-*.csv
-*.npy
+*.log
+*.json
+*.pkl
+*.tex
+
+# Root results: keep top-level sqlite; ignore output trees
+results/cf_k14/
+results/cf_metaheuristic/
+results/clustering_cf/
+results/grid_search/
+results/wnmf/
+results/wnmf_u/
+
+# mealpy experiment outputs (sqlite/png at top level or encr/ stay trackable)
+mealpy/results/assignments/
+mealpy/results/assignments_gs/
+mealpy/results/assignments_lof/
+mealpy/results/assignments_lof_estop/
+mealpy/results/assignments_lof_kmref/
+mealpy/results/grid/
+mealpy/results/hybrid/
+mealpy/results/hybrid_v3/
+mealpy/results/hybrid_v4/
+mealpy/results/hybrid_v4_without_mkss/
+mealpy/results/item_assignments/
+mealpy/results/phase3/
+mealpy/results/recommender_benchmark/
 
 # Python cache files
 __pycache__/
@@ -35,7 +51,8 @@ venv/
 env/
 
 # IDE and editors
-.vscode/
+.vscode/*
+!.vscode/settings.json
 .idea/
 *.swp
 *.swo

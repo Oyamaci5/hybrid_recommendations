@@ -1,0 +1,11 @@
+{
+  "files.watcherExclude": {
+    "**/results/**": true,
+    "**/mealpy/results/**": true,
+    "**/comparison_algorithms/results/**": true
+  },
+  "search.exclude": {
+    "**/results/**": true,
+    "**/mealpy/results/**": true
+  }
+}
