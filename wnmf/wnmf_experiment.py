@@ -73,6 +73,8 @@ try:
         save_wnmf_result,
         init_db,
         get_assignment_id,
+        get_assignment_id_by_suffix,
+        ensure_assignment_on_disk,
     )
     init_db()
     _DB_AVAILABLE = True
@@ -2910,7 +2912,15 @@ def _save_row_to_db(dataset_name: str, row: dict, k_used: int, args,
     prep = _normalize_db_preprocessing(prep_raw)
     scenario = row['scenario']
     assignment_id_override = None
-    if scenario != 'global':
+    if scenario != 'global' and prep_raw:
+        db_dataset = _normalize_db_dataset_name(dataset_name)
+        try:
+            assignment_id_override = get_assignment_id_by_suffix(
+                db_dataset, row['algo_label'], k_used, prep_raw,
+            )
+        except Exception:
+            assignment_id_override = None
+    if assignment_id_override is None and scenario != 'global':
         for prep_try in _db_preprocessing_candidates(prep_raw):
             try:
                 assignment_id_override = get_assignment_id(
@@ -3207,6 +3217,31 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
         assign_dir = _algo_assignment_dir(
             root, dataset_name, label, k_used, assign_suffix=assign_suffix,
         )
+        db_dataset = _normalize_db_dataset_name(dataset_name)
+        use_db = bool(getattr(args, 'assign_from_db', False)) if args else False
+        if use_db or not os.path.isdir(assign_dir):
+            if _DB_AVAILABLE and assign_suffix:
+                ok = ensure_assignment_on_disk(
+                    db_dataset,
+                    label,
+                    k_used,
+                    assign_suffix,
+                    assign_dir,
+                    strategy=getattr(args, 'assign_db_strategy', 'best_wcss'),
+                    overwrite=bool(getattr(args, 'assign_db_overwrite', False)),
+                )
+                if ok:
+                    print(
+                        f"\n  [{label}] assignment DB'den export edildi -> {assign_dir}",
+                        flush=True,
+                    )
+                elif use_db:
+                    print(
+                        f"\n  [{label}] ATLANDI — DB'de suffix bulunamadi: "
+                        f"{assign_suffix}",
+                        flush=True,
+                    )
+                    continue
         if (
             not os.path.isdir(assign_dir)
             and label == 'B0_KMEANS'
@@ -3766,6 +3801,20 @@ def parse_args():
     p.add_argument(
         '--assign-suffix', type=str, default='',
         help='Assignment klasör adına ek suffix (örn: _wnmf20, _zscore)',
+    )
+    p.add_argument(
+        '--assign-from-db', action='store_true',
+        help='Assignment dosyalarini diskte yoksa (veya --assign-db-overwrite ile) '
+             'SQLite assignments tablosundan assign_suffix ile export et.',
+    )
+    p.add_argument(
+        '--assign-db-overwrite', action='store_true',
+        help='--assign-from-db: mevcut klasoru DB kaydi ile ustune yaz.',
+    )
+    p.add_argument(
+        '--assign-db-strategy', choices=['best_wcss', 'latest', 'worst_wcss'],
+        default='best_wcss',
+        help='Ayni suffix icin birden fazla assignment varsa secim (varsayilan: best_wcss).',
     )
     p.add_argument(
         '--sync-assign-suffix-latent',

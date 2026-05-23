@@ -58,6 +58,7 @@ if _OPT_DIR not in sys.path:
 
 try:
     from assignment_db import (
+        assign_suffix_from_save_dir,
         finish_run,
         init_db,
         save_assignment as db_save,
@@ -97,7 +98,11 @@ from sfoa_optimizer import SFOA_Clustering  # pyright: ignore[reportMissingImpor
 # ============================================================
 
 DATA_100K = os.path.join(os.path.dirname(BASE_DIR), 'data', 'ml-100k', 'u.data')
+DATA_100K_TRAIN = os.path.join(os.path.dirname(BASE_DIR), 'data', 'ml-100k', 'u1.base')
+DATA_100K_TEST = os.path.join(os.path.dirname(BASE_DIR), 'data', 'ml-100k', 'u1.test')
 DATA_1M   = os.path.join(os.path.dirname(BASE_DIR), 'data', 'ml-1m',   'ratings.dat')
+N_USERS_100K = 943
+N_ITEMS_100K = 1682
 
 K_100K_DEFAULT = 7
 K_1M_DEFAULT   = 7
@@ -887,6 +892,12 @@ def save_assignment(assignments, gray_mask, best_sol, best_fit,
                     f"{getattr(args, 'wnmf_init', 'inmed')}_trim"
                     f"{getattr(args, 'inmed_trim_low', 5.0):g}_{getattr(args, 'inmed_trim_high', 95.0):g}"
                 )
+        if getattr(args, 'train_only', False):
+            prep_parts.append(
+                format_train_only_folder_suffix(
+                    True, getattr(args, 'eval_split', 'random'), getattr(args, 'fold', None),
+                ).lstrip('_') or 'trainonly',
+            )
         preprocessing = '_'.join(prep_parts) if prep_parts else 'none'
 
         # dataset adını belirle
@@ -899,6 +910,7 @@ def save_assignment(assignments, gray_mask, best_sol, best_fit,
             algo=label,
             k=K,
             preprocessing=preprocessing,
+            assign_suffix=assign_suffix_from_save_dir(save_dir, label) if label else None,
             wcss=float(best_fit),
             gray_count=int(gray_mask.sum()),
             gray_ratio=float(gray_mask.mean()),
@@ -1367,6 +1379,103 @@ def run_one(label, g_name, l_name, matrix, K, seed, save_dir, algo_map,
         init_mode=init_mode,
         disable_gray_sheep=disable_gray_sheep,
     )
+
+
+# ============================================================
+# TRAIN-ONLY VERİ YÜKLEME (wnmf_experiment eval split ile hizalı)
+# ============================================================
+
+def format_train_only_folder_suffix(train_only, eval_split, fold):
+    """Klasör out_suffix: train-only modunda eval protokolü etiketi."""
+    if not train_only:
+        return ''
+    if eval_split == 'official':
+        if fold is None or fold == 1:
+            return '_trainonly_official'
+        return f'_trainonly_official_f{int(fold)}'
+    if fold is None or fold == 1:
+        return '_trainonly_rand'
+    return f'_trainonly_rand_f{int(fold)}'
+
+
+def _import_wnmf_loaders():
+    wnmf_dir = os.path.join(_REPO_ROOT, 'wnmf')
+    if wnmf_dir not in sys.path:
+        sys.path.insert(0, wnmf_dir)
+    from wnmf_utils import load_ratings_100k, load_ratings_100k_all, load_ratings_1m
+    return load_ratings_100k, load_ratings_100k_all, load_ratings_1m
+
+
+def _ratings_to_dense_matrix(train, n_users, n_items):
+    matrix = np.zeros((n_users, n_items), dtype=np.float32)
+    for row in train:
+        u, i, r = int(row[0]), int(row[1]), float(row[2])
+        if 0 <= u < n_users and 0 <= i < n_items:
+            matrix[u, i] = r
+    return matrix
+
+
+def load_movielens_train_only_100k(
+    eval_split='random',
+    fold=None,
+    random_seed=SEED,
+    ratings_path=None,
+):
+    """
+    ML-100K train rating'lerinden dense matris (test hücreleri 0).
+    wnmf_experiment.py --eval-split / --fold ile aynı bölme.
+    """
+    load_ratings_100k, load_ratings_100k_all, _ = _import_wnmf_loaders()
+    ratings_path = ratings_path or DATA_100K
+
+    if eval_split == 'random':
+        train, test = load_ratings_100k_all(
+            ratings_path, random_seed=random_seed, fold=fold,
+        )
+        split_label = (
+            f'random KFold fold {fold}/5 (seed={random_seed})'
+            if fold is not None and fold != 1
+            else f'random %20 holdout (seed={random_seed})'
+        )
+    elif fold is None or fold == 1:
+        train, test = load_ratings_100k(DATA_100K_TRAIN, DATA_100K_TEST)
+        split_label = 'official u1.base / u1.test'
+    else:
+        train, test = load_ratings_100k(DATA_100K_TRAIN, DATA_100K_TEST, fold=fold)
+        split_label = f'official u{fold}.base / u{fold}.test'
+
+    matrix = _ratings_to_dense_matrix(train, N_USERS_100K, N_ITEMS_100K)
+    total = matrix.size
+    nonzero = np.count_nonzero(matrix)
+    print(f"Matrix shape (train-only, {split_label}): {matrix.shape}")
+    print(f"  Train ratings: {len(train):,}  |  Test (hariç): {len(test):,}")
+    print(f"  Sparsity      : {1 - nonzero / total:.3f}")
+    print(
+        f"  Rating range  : {matrix[matrix > 0].min():.1f} - {matrix.max():.1f}"
+        if nonzero else "  Rating range  : (boş)"
+    )
+    return matrix
+
+
+def load_movielens_train_only_1m(fold=None, random_seed=SEED, ratings_path=None):
+    """ML-1M train rating'lerinden dense matris (test hücreleri 0)."""
+    _, _, load_ratings_1m = _import_wnmf_loaders()
+    ratings_path = ratings_path or DATA_1M
+    train, test = load_ratings_1m(ratings_path, random_seed=random_seed, fold=fold)
+    n_users = int(max(train[:, 0].max(), test[:, 0].max())) + 1
+    n_items = int(max(train[:, 1].max(), test[:, 1].max())) + 1
+    matrix = _ratings_to_dense_matrix(train, n_users, n_items)
+    total = matrix.size
+    nonzero = np.count_nonzero(matrix)
+    fold_label = (
+        f'fold {fold}/5 (seed={random_seed})'
+        if fold is not None and fold != 1
+        else f'%20 holdout (seed={random_seed})'
+    )
+    print(f"Matrix shape (train-only, {fold_label}): {matrix.shape}")
+    print(f"  Train ratings: {len(train):,}  |  Test (hariç): {len(test):,}")
+    print(f"  Sparsity     : {1 - nonzero / total:.3f}")
+    return matrix
 
 
 # ============================================================
@@ -1896,6 +2005,22 @@ def parse_args():
     p.add_argument('--data-100k', default=DATA_100K)
     p.add_argument('--data-1m',   default=DATA_1M)
     p.add_argument(
+        '--train-only', action='store_true',
+        help='Yalnızca train rating\'leri ile matris oluştur (test hücreleri 0). '
+             'wnmf_experiment.py --eval-split / --fold ile hizalıdır.',
+    )
+    p.add_argument(
+        '--eval-split',
+        choices=['official', 'random'],
+        default='random',
+        help='--train-only ile ML-100K bölmesi: official=u1.base; '
+             'random=u.data %%20 veya KFold (default: random).',
+    )
+    p.add_argument(
+        '--fold', type=int, default=None, metavar='N',
+        help='--train-only ile holdout fold (1–5). random: KFold; official: u{N}.base/test.',
+    )
+    p.add_argument(
         '--jobs', type=int, default=None,
         help='Paralel algoritma süreç sayısı (varsayılan: otomatik = CPU sayısına göre; '
              '1=sıralı, 2+=belirtilen sayıda süreç, 0=CPU ile sınırlandırılmış havuz)',
@@ -1986,6 +2111,13 @@ def parse_args():
         p.error('--min-item-ratings 0 veya daha büyük olmalı')
     if not (0 <= args.inmed_trim_low < args.inmed_trim_high <= 100):
         p.error('--inmed-trim-low ve --inmed-trim-high için 0 <= low < high <= 100 olmalı')
+    if args.fold is not None and not (1 <= args.fold <= 5):
+        p.error('--fold 1..5 aralığında olmalı')
+    if args.fold is not None and not args.train_only:
+        print('  Uyarı: --fold yalnızca --train-only ile anlamlı; yok sayılıyor.')
+        args.fold = None
+    if args.train_only and args.eval_split != 'random' and args.dataset in ('1m', 'both'):
+        print('  Not: ML-1M için --eval-split yok sayılır (her zaman rastgele/KFold).')
     args.pca = args.pca_variance
     if args.cluster_metric == 'auto':
         args.cluster_metric = (
@@ -2084,6 +2216,12 @@ if __name__ == '__main__':
                     prep_parts.append(
                         f"{args.wnmf_init}_trim{args.inmed_trim_low:g}_{args.inmed_trim_high:g}"
                     )
+            if args.train_only:
+                prep_parts.append(
+                    format_train_only_folder_suffix(
+                        True, args.eval_split, args.fold,
+                    ).lstrip('_') or 'trainonly',
+                )
             preprocessing_run = '_'.join(prep_parts) if prep_parts else 'none'
             db_run_id = start_run(
                 command=' '.join(sys.argv),
@@ -2138,6 +2276,11 @@ if __name__ == '__main__':
     print(f"Paper mode  : {'Açık' if args.paper_mode else 'Kapalı'}")
     print(f"Algoritmalar: {selected_algos or [c[0] for c in ALGO_CONFIG]}")
     print(f"Dataset     : {args.dataset}")
+    if args.train_only:
+        fold_note = f'fold {args.fold}' if args.fold is not None else 'holdout'
+        print(
+            f"Train-only  : Açık ({args.eval_split}, {fold_note}, seed={SEED})"
+        )
     if k_multi is not None:
         print(f"K listesi     : {k_multi}  (her değer sırayla işlenir)")
     else:
@@ -2222,15 +2365,28 @@ if __name__ == '__main__':
     init_suffix = format_init_mode_folder_suffix(args.init_mode)
     paper_suffix = '_paper' if args.paper_mode else ''
     no_gs_suffix = '_nogs' if args.disable_gray_sheep and not args.paper_mode else ''
+    train_only_suffix = format_train_only_folder_suffix(
+        args.train_only, args.eval_split, args.fold,
+    )
     out_suffix = (
         prune_suffix + zscore_suffix + pca_suffix + wnmf_suffix
         + metric_suffix + init_suffix + paper_suffix + no_gs_suffix
+        + train_only_suffix
     )
 
     try:
         if args.dataset in ('100k', 'both'):
-            print(f"\nML-100K yükleniyor: {args.data_100k}")
-            matrix_100k = load_movielens(args.data_100k)
+            if args.train_only:
+                print(f"\nML-100K train-only yükleniyor (eval-split={args.eval_split}, fold={args.fold})")
+                matrix_100k = load_movielens_train_only_100k(
+                    eval_split=args.eval_split,
+                    fold=args.fold,
+                    random_seed=SEED,
+                    ratings_path=args.data_100k,
+                )
+            else:
+                print(f"\nML-100K yükleniyor: {args.data_100k}")
+                matrix_100k = load_movielens(args.data_100k)
             matrix_100k = prepare_matrix_for_clustering(
                 matrix_100k,
                 args.zscore,
@@ -2282,8 +2438,16 @@ if __name__ == '__main__':
                 )
 
         if args.dataset in ('1m', 'both'):
-            print(f"\nML-1M yükleniyor: {args.data_1m}")
-            matrix_1m = load_movielens_1m(args.data_1m)
+            if args.train_only:
+                print(f"\nML-1M train-only yükleniyor (fold={args.fold})")
+                matrix_1m = load_movielens_train_only_1m(
+                    fold=args.fold,
+                    random_seed=SEED,
+                    ratings_path=args.data_1m,
+                )
+            else:
+                print(f"\nML-1M yükleniyor: {args.data_1m}")
+                matrix_1m = load_movielens_1m(args.data_1m)
             matrix_1m = prepare_matrix_for_clustering(
                 matrix_1m,
                 args.zscore,
