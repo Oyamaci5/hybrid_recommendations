@@ -272,6 +272,20 @@ def load_memberships(assignment_dir: str) -> Optional[np.ndarray]:
     return memberships
 
 
+def load_user_features(assignment_dir: str, n_users: int) -> Optional[np.ndarray]:
+    """
+    Kümeleme özellik uzayındaki kullanıcı vektörleri (WNMF/PCA/SVD sonrası).
+    generate_assignments.py user_features.npy → (n_users, n_features).
+    """
+    path = os.path.join(assignment_dir, 'user_features.npy')
+    if not os.path.isfile(path):
+        return None
+    arr = np.load(path)
+    if len(arr) != n_users:
+        return None
+    return np.asarray(arr, dtype=np.float64)
+
+
 def load_centroids(assignment_dir: str, n_clusters: int) -> Optional[np.ndarray]:
     """
     generate_assignments.py'nin kaydettiği best_sol.npy → (K, n_features) centroid matrisi.
@@ -349,6 +363,7 @@ def resolve_test_cluster_ids(
     n_items: int,
     centroid_metric: str = 'euclidean',
     algo_label: str = '',
+    assign_dir: Optional[str] = None,
 ) -> np.ndarray:
     """
     Test tahmininde kullanılacak küme ID'leri.
@@ -366,15 +381,24 @@ def resolve_test_cluster_ids(
 
     n_users = len(assignments)
     n_features = centroids.shape[1]
-    if n_features != n_items:
+    if n_features == n_items:
+        profiles = build_user_profile_matrix(train, n_users, n_features)
+    else:
+        profiles = None
+        if assign_dir:
+            profiles = load_user_features(assign_dir, n_users)
+        if profiles is None or profiles.shape[1] != n_features:
+            print(
+                f"  [{algo_label}] uyarı: centroid boyutu ({n_features}) != n_items ({n_items}) "
+                f"ve user_features.npy yok/uyumsuz; offline assignment kullanılıyor.",
+                flush=True,
+            )
+            return assignments
         print(
-            f"  [{algo_label}] uyarı: centroid boyutu ({n_features}) != n_items ({n_items}); "
-            f"en yakın centroid atlanıyor (offline assignment kullanılıyor).",
+            f"  [{algo_label}] nearest-centroid: latent uzay ({n_features} boyut) "
+            f"user_features.npy ile",
             flush=True,
         )
-        return assignments
-
-    profiles = build_user_profile_matrix(train, n_users, n_features)
     test_ids = nearest_centroid_assignments(profiles, centroids, metric=centroid_metric)
     changed = int(np.sum(test_ids != assignments))
     print(

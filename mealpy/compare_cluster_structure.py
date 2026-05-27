@@ -1,12 +1,20 @@
 """
 Aynı veri önkoşuluyla (aynı kullanıcı sırası, aynı suffix) assignment klasörleri arasında
-küme yapısı farklarını özetler: aktif küme, boş küme, denge, çiftler arası ARI/NMI.
+küme yapısı farklarını özetler: aktif küme, boş küme, denge, çiftler arası ARI/NMI,
+label agreement ve best_sol centroid mesafesi (Hungarian eşleştirme ile).
 
 Örnek (aynı deney ekiyle tüm algoritmalar):
   python mealpy/compare_cluster_structure.py \\
     --dataset-root mealpy/results/assignments/ml100k \\
     --suffix _pruneu5_i10_zscore_euc_nogs_none_wnmf25_k30 \\
     --algos B0_KMEANS B2_HGS HA_AVOAHGS H4_MFO+HHO LIT_PSO LIT_GWO LIT_GOA
+
+Örnek (LOF + WNMF30 K=7):
+  python mealpy/compare_cluster_structure.py \\
+    --dataset-root mealpy/results/assignments_lof/ml100k \\
+    --suffix _pruneu5_i10_zscore_euc_imkpp_none_wnmf30_k7 \\
+    --algos B0_KMEANS B2_HGS B3_MFO HA_AVOAHGS H4_MFO+HHO LIT_PSO LIT_GWO \\
+    --reference B0_KMEANS
 
 Örnek (referansa göre ARI — ilk algoritma referans):
   python mealpy/compare_cluster_structure.py \\
@@ -26,6 +34,8 @@ from itertools import combinations
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+from scipy.optimize import linear_sum_assignment
+from scipy.spatial.distance import cdist
 from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 
 
@@ -76,6 +86,43 @@ def _load_labels_and_gray(fp: str) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     gpath = os.path.join(d, "gray_sheep_mask.npy")
     g = np.load(gpath).astype(bool, copy=False) if os.path.isfile(gpath) else None
     return a, g
+
+
+def _load_centroids(fp: str, k_expected: int) -> Optional[np.ndarray]:
+    """best_sol.npy → (K, d) centroid matrisi; yoksa None."""
+    d = os.path.dirname(fp)
+    bpath = os.path.join(d, "best_sol.npy")
+    if not os.path.isfile(bpath):
+        return None
+    flat = np.load(bpath).astype(np.float64, copy=False).ravel()
+    if k_expected <= 0 or flat.size % k_expected != 0:
+        return None
+    n_features = flat.size // k_expected
+    return flat.reshape(k_expected, n_features)
+
+
+def mean_centroid_distance(C_a: np.ndarray, C_b: np.ndarray) -> float:
+    """Hungarian eşleştirme sonrası eşleşen centroid çiftleri arası ortalama L2 mesafe."""
+    C_a = np.asarray(C_a, dtype=np.float64)
+    C_b = np.asarray(C_b, dtype=np.float64)
+    if C_a.shape != C_b.shape:
+        raise ValueError(f"Centroid shape uyumsuz: {C_a.shape} vs {C_b.shape}")
+    cost = cdist(C_a, C_b, metric="euclidean")
+    row_ind, col_ind = linear_sum_assignment(cost)
+    return float(cost[row_ind, col_ind].mean())
+
+
+def _common_mask(
+    ga: Optional[np.ndarray],
+    gb: Optional[np.ndarray],
+    n: int,
+) -> np.ndarray:
+    if ga is None and gb is None:
+        return np.ones(n, dtype=bool)
+    if ga is not None and gb is not None:
+        return (~ga) & (~gb)
+    g = ga if ga is not None else gb
+    return ~g
 
 
 def _structure_stats(
@@ -181,9 +228,13 @@ def main() -> None:
 
     rows = []
     loaded: Dict[str, Tuple[np.ndarray, Optional[np.ndarray]]] = {}
+    centroids: Dict[str, np.ndarray] = {}
     for algo, fp in paths.items():
         a, g = _load_labels_and_gray(fp)
         loaded[algo] = (a, g)
+        C = _load_centroids(fp, k_expected)
+        if C is not None:
+            centroids[algo] = C
         folder, k_i = folder_meta[algo]
         if k_i != k_expected:
             print(f"  Not: {algo} klasörü _k={k_i}, tablo için K={k_expected} kullanılıyor.")
@@ -237,58 +288,98 @@ def main() -> None:
     )
     print()
 
-    # Pairwise ARI / NMI (ortak non-gray)
+    # Pairwise ARI / NMI / label agreement / centroid distance
     names = list(paths.keys())
     if len(names) >= 2:
-        print("Çiftler — ortak non-gray kullanıcılar üzerinde ARI / NMI:")
-        print(f"{'Çift':<36} {'n_ortak':>8} {'ARI':>8} {'NMI':>8}")
-        print("-" * 64)
+        has_centroids = len(centroids) >= 2
+        print("Çiftler — ortak non-gray kullanıcılar üzerinde karşılaştırma:")
+        if has_centroids:
+            hdr_pair = (
+                f"{'Çift':<36} {'n_ortak':>8} {'Agree':>8} {'ARI':>8} "
+                f"{'NMI':>8} {'CentDist':>10}"
+            )
+        else:
+            hdr_pair = f"{'Çift':<36} {'n_ortak':>8} {'Agree':>8} {'ARI':>8} {'NMI':>8}"
+        print(hdr_pair)
+        print("-" * len(hdr_pair))
         for na, nb in combinations(names, 2):
             la, ga = loaded[na]
             lb, gb = loaded[nb]
-            if ga is None and gb is None:
-                mask = np.ones(len(la), dtype=bool)
-            elif ga is not None and gb is not None:
-                mask = (~ga) & (~gb)
-            else:
-                g = ga if ga is not None else gb
-                mask = ~g
+            mask = _common_mask(ga, gb, len(la))
             n_ok = int(mask.sum())
             if n_ok < 2:
-                print(f"{na + ' vs ' + nb:<36} {n_ok:>8d} {'—':>8} {'—':>8}")
+                if has_centroids:
+                    print(
+                        f"{na + ' vs ' + nb:<36} {n_ok:>8d} {'—':>8} {'—':>8} "
+                        f"{'—':>8} {'—':>10}"
+                    )
+                else:
+                    print(
+                        f"{na + ' vs ' + nb:<36} {n_ok:>8d} {'—':>8} {'—':>8} {'—':>8}"
+                    )
                 continue
+            agree = float((la[mask] == lb[mask]).mean())
             ari = adjusted_rand_score(la[mask], lb[mask])
             nmi = normalized_mutual_info_score(
                 la[mask], lb[mask], average_method="arithmetic"
             )
-            print(f"{na + ' vs ' + nb:<36} {n_ok:>8d} {ari:>8.4f} {nmi:>8.4f}")
+            if has_centroids and na in centroids and nb in centroids:
+                cdist_val = mean_centroid_distance(centroids[na], centroids[nb])
+                print(
+                    f"{na + ' vs ' + nb:<36} {n_ok:>8d} {agree:>7.1%} {ari:>8.4f} "
+                    f"{nmi:>8.4f} {cdist_val:>10.4f}"
+                )
+            elif has_centroids:
+                print(
+                    f"{na + ' vs ' + nb:<36} {n_ok:>8d} {agree:>7.1%} {ari:>8.4f} "
+                    f"{nmi:>8.4f} {'—':>10}"
+                )
+            else:
+                print(
+                    f"{na + ' vs ' + nb:<36} {n_ok:>8d} {agree:>7.1%} {ari:>8.4f} {nmi:>8.4f}"
+                )
+        print("  Agree: ham label uyumu (ID permütasyonuna duyarlı).")
         print("  ARI ~0 rastgele; 1 ayni bolusum (yeniden numaralandirmaya dayanikli).")
         print("  NMI 0..1, yüksek = daha uyumlu bilgi paylaşımı.")
+        if has_centroids:
+            print(
+                "  CentDist: best_sol centroidleri arasi ort. L2 (Hungarian eslestirme); "
+                "dusuk = W uzayinda yakin merkezler."
+            )
+        else:
+            print("  CentDist: best_sol.npy bulunamadi, atlandi.")
         print()
 
     if ref_name and ref_name in loaded:
-        print(f"Referansa göre ({ref_name}) — ARI / NMI:")
-        print(f"{'Algo':<14} {'ARI':>8} {'NMI':>8}")
-        print("-" * 32)
+        print(f"Referansa göre ({ref_name}) — Agree / ARI / NMI:")
+        if ref_name in centroids:
+            print(f"{'Algo':<14} {'Agree':>8} {'ARI':>8} {'NMI':>8} {'CentDist':>10}")
+            print("-" * 52)
+        else:
+            print(f"{'Algo':<14} {'Agree':>8} {'ARI':>8} {'NMI':>8}")
+            print("-" * 42)
         lr, gr = loaded[ref_name]
         for algo in names:
             if algo == ref_name:
-                print(f"{algo:<14} {'1.0000':>8} {'1.0000':>8}")
+                if ref_name in centroids:
+                    print(f"{algo:<14} {'100.0%':>8} {'1.0000':>8} {'1.0000':>8} {'0.0000':>10}")
+                else:
+                    print(f"{algo:<14} {'100.0%':>8} {'1.0000':>8} {'1.0000':>8}")
                 continue
             la, ga = loaded[algo]
-            if gr is not None and ga is not None:
-                mask = (~gr) & (~ga)
-            elif gr is not None:
-                mask = ~gr
-            elif ga is not None:
-                mask = ~ga
-            else:
-                mask = np.ones(len(lr), dtype=bool)
+            mask = _common_mask(gr, ga, len(lr))
+            agree = float((lr[mask] == la[mask]).mean())
             ari = adjusted_rand_score(lr[mask], la[mask])
             nmi = normalized_mutual_info_score(
                 lr[mask], la[mask], average_method="arithmetic"
             )
-            print(f"{algo:<14} {ari:>8.4f} {nmi:>8.4f}")
+            if ref_name in centroids and algo in centroids:
+                cdist_val = mean_centroid_distance(centroids[ref_name], centroids[algo])
+                print(
+                    f"{algo:<14} {agree:>7.1%} {ari:>8.4f} {nmi:>8.4f} {cdist_val:>10.4f}"
+                )
+            else:
+                print(f"{algo:<14} {agree:>7.1%} {ari:>8.4f} {nmi:>8.4f}")
         print()
 
     if args.csv and rows:

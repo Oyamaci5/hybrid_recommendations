@@ -256,7 +256,22 @@ def compute_wcss_fast(matrix, solution, K, metric='pearson'):
     return float(min_distances.sum()), assignments
 
 
-def make_fitness_function(matrix, K, metric='pearson'):
+def make_fitness_function(matrix, K, metric='pearson', objective='multi'):
+    """Meta-sezgisel fitness. objective='wcss': saf WCSS (+ boş küme cezası)."""
+    objective = (objective or 'multi').strip().lower()
+    empty_penalty = 1e6
+
+    if objective == 'wcss':
+
+        def fitness(solution):
+            wcss, assignments = compute_wcss_fast(matrix, solution, K, metric=metric)
+            for cid in range(K):
+                if not np.any(assignments == cid):
+                    return float(empty_penalty)
+            return float(wcss)
+
+        return fitness
+
     baseline = None
     eps = 1e-12
 
