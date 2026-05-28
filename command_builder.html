@@ -146,6 +146,22 @@
   .ref-section { margin-bottom: 28px; }
   .ref-section h3 { font-size: 14px; margin: 16px 0 6px 0; color: var(--accent); }
   .ref-section p { color: var(--muted); font-size: 12px; line-height: 1.55; margin: 4px 0; }
+  .simple-list { margin: 8px 0 0 18px; padding: 0; color: var(--text); }
+  .simple-list li { margin: 6px 0; font-size: 13px; line-height: 1.45; }
+  .muted-note { color: var(--muted); font-size: 12px; line-height: 1.5; margin-top: 8px; }
+  .mini-form { display: grid; grid-template-columns: repeat(6, minmax(90px, 1fr)); gap: 8px; margin-top: 10px; }
+  .mini-form input, .mini-form select {
+    width: 100%; background: #0d111b; color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px; padding: 7px 8px; font-size: 12px;
+  }
+  .mini-form .span2 { grid-column: span 2; }
+  .mini-form .span3 { grid-column: span 3; }
+  .mini-actions { margin-top: 8px; display: flex; gap: 8px; flex-wrap: wrap; }
+  .mini-list { margin-top: 12px; max-height: 300px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; }
+  .mini-item { padding: 10px 12px; border-top: 1px solid rgba(255,255,255,.08); font-size: 12px; }
+  .mini-item:first-child { border-top: none; }
+  .mini-item b { color: #cfe9ff; }
+  .mono { font-family: ui-monospace, Menlo, Consolas, monospace; }
 
   .tab-page { display: none; }
   .tab-page.active { display: block; }
@@ -166,6 +182,7 @@
   <div class="tab" data-tab="grid">3) Grid Search · MAE Karşılaştırma</div>
   <div class="tab" data-tab="compare">4) Küme Karşılaştırma · <code class="kbd">compare_cluster_structure.py</code></div>
   <div class="tab" data-tab="ref">5) Referans · Argümanlar &amp; Kombinasyonlar</div>
+  <div class="tab" data-tab="insights">6) Sonuçlar · Özellik Notları &amp; Çalıştırma Geçmişi</div>
 </div>
 
 <!-- ============================================================
@@ -651,6 +668,112 @@
             <input type="text" data-arg="--data-1m" placeholder="(varsayılan)" />
           </div>
         </div>
+      </details>
+
+      <details>
+        <summary>Gelişmiş (Yeni) — Fitness / Split / HA</summary>
+
+        <div class="row">
+          <div class="label">Fitness türü
+            <span class="arg">--fitness</span>
+          </div>
+          <div class="control">
+            <select data-arg="--fitness" data-default="wcss">
+              <option value="wcss" selected>wcss</option>
+              <option value="latent_dev">latent_dev</option>
+              <option value="knn_mae">knn_mae</option>
+              <option value="knn_mae_legacy">knn_mae_legacy</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Meta objective
+            <span class="arg">--cluster-objective</span>
+          </div>
+          <div class="control">
+            <select data-arg="--cluster-objective" data-default="multi">
+              <option value="multi" selected>multi</option>
+              <option value="wcss">wcss</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">WNMF model path (latent_dev)
+            <span class="arg">--wnmf-model-path</span>
+          </div>
+          <div class="control">
+            <input type="text" data-arg="--wnmf-model-path" placeholder="(opsiyonel)" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="label">Centroid optimizer
+            <span class="arg">--centroid-algo</span>
+          </div>
+          <div class="control">
+            <select data-arg="--centroid-algo" data-default="MFO">
+              <option value="MFO" selected>MFO</option>
+              <option value="IWO">IWO</option>
+              <option value="HA">HA</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="row"><div class="label">Centroid agents <span class="arg">--centroid-agents</span></div><div class="control"><input type="number" data-arg="--centroid-agents" placeholder="(opsiyonel)" /></div></div>
+        <div class="row"><div class="label">Centroid iter <span class="arg">--centroid-iter</span></div><div class="control"><input type="number" data-arg="--centroid-iter" placeholder="(opsiyonel)" /></div></div>
+        <div class="row"><div class="label">Baseline epoch <span class="arg">--baseline-epoch</span></div><div class="control"><input type="number" data-arg="--baseline-epoch" placeholder="(opsiyonel)" /></div></div>
+        <div class="row"><div class="label">Pop size <span class="arg">--pop-size</span></div><div class="control"><input type="number" data-arg="--pop-size" placeholder="(opsiyonel)" /></div></div>
+        <div class="row"><div class="label">Train sample <span class="arg">--centroid-train-sample</span></div><div class="control"><input type="number" data-arg="--centroid-train-sample" data-default="500" placeholder="500" /></div></div>
+        <div class="row"><div class="label">Val sample <span class="arg">--centroid-val-sample</span></div><div class="control"><input type="number" data-arg="--centroid-val-sample" data-default="200" placeholder="200" /></div></div>
+        <div class="row"><div class="label">kNN K (fitness) <span class="arg">--centroid-knn-k</span></div><div class="control"><input type="number" data-arg="--centroid-knn-k" data-default="20" placeholder="20" /></div></div>
+        <div class="row">
+          <div class="label">kNN similarity (fitness)
+            <span class="arg">--centroid-knn-sim</span>
+          </div>
+          <div class="control">
+            <select data-arg="--centroid-knn-sim" data-default="cosine">
+              <option value="cosine" selected>cosine</option>
+              <option value="pearson">pearson</option>
+            </select>
+          </div>
+        </div>
+        <div class="row"><div class="label">Bias epochs (fitness) <span class="arg">--centroid-bias-epochs</span></div><div class="control"><input type="number" data-arg="--centroid-bias-epochs" data-default="5" placeholder="5" /></div></div>
+        <div class="row"><div class="label">kNN min-common <span class="arg">--min-common</span></div><div class="control"><input type="number" data-arg="--min-common" data-default="3" placeholder="3" min="1" /></div></div>
+
+        <div class="row">
+          <div class="label">Sadece train ile üret
+            <span class="arg">--train-only</span>
+          </div>
+          <div class="control">
+            <label class="check"><input type="checkbox" data-arg="--train-only" /> Açık</label>
+          </div>
+        </div>
+        <div class="row">
+          <div class="label">Eval split
+            <span class="arg">--eval-split</span>
+          </div>
+          <div class="control">
+            <select data-arg="--eval-split" data-default="random">
+              <option value="random" selected>random</option>
+              <option value="official">official</option>
+            </select>
+          </div>
+        </div>
+        <div class="row"><div class="label">Fold (1..5) <span class="arg">--fold</span></div><div class="control"><input type="number" data-arg="--fold" min="1" max="5" placeholder="(opsiyonel)" /></div></div>
+        <div class="row"><div class="label">Out root <span class="arg">--out-root</span></div><div class="control"><input type="text" data-arg="--out-root" placeholder="(opsiyonel)" /></div></div>
+
+        <div class="row">
+          <div class="label">HA adaptive epoch
+            <span class="arg">--ha-adaptive-epoch</span>
+          </div>
+          <div class="control">
+            <label class="check"><input type="checkbox" data-arg="--ha-adaptive-epoch" /> Açık</label>
+          </div>
+        </div>
+        <div class="row"><div class="label">HA max cap <span class="arg">--ha-adaptive-max-cap</span></div><div class="control"><input type="number" data-arg="--ha-adaptive-max-cap" data-default="600" placeholder="600" /></div></div>
+        <div class="row"><div class="label">HA min tol <span class="arg">--ha-adaptive-min-tol</span></div><div class="control"><input type="text" data-arg="--ha-adaptive-min-tol" data-default="1e-6" placeholder="1e-6" /></div></div>
       </details>
     </div>
 
@@ -1601,6 +1724,127 @@
           </div>
         </div>
       </details>
+
+      <details>
+        <summary>Gelişmiş (Yeni) — DB / ClusterAvg / Backend / Global Baselines</summary>
+
+        <div class="row"><div class="label">Assignment DB'den çek <span class="arg">--assign-from-db</span></div><div class="control"><label class="check"><input type="checkbox" data-arg="--assign-from-db" /> Açık</label></div></div>
+        <div class="row"><div class="label">DB overwrite <span class="arg">--assign-db-overwrite</span></div><div class="control"><label class="check"><input type="checkbox" data-arg="--assign-db-overwrite" /> Açık</label></div></div>
+        <div class="row">
+          <div class="label">DB seçim stratejisi
+            <span class="arg">--assign-db-strategy</span>
+          </div>
+          <div class="control">
+            <select data-arg="--assign-db-strategy" data-default="best_wcss">
+              <option value="best_wcss" selected>best_wcss</option>
+              <option value="latest">latest</option>
+              <option value="worst_wcss">worst_wcss</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="row"><div class="label">Paper eval modu <span class="arg">--paper-mode</span></div><div class="control"><label class="check"><input type="checkbox" data-arg="--paper-mode" /> Açık</label></div></div>
+        <div class="row"><div class="label">Meta eval modu <span class="arg">--meta-eval</span></div><div class="control"><label class="check"><input type="checkbox" data-arg="--meta-eval" /> Açık</label></div></div>
+        <div class="row"><div class="label">ClusterAvg hard <span class="arg">--cluster-avg-hard</span></div><div class="control"><label class="check"><input type="checkbox" data-arg="--cluster-avg-hard" /> Açık</label></div></div>
+        <div class="row">
+          <div class="label">ClusterAvg base
+            <span class="arg">--cluster-avg-base</span>
+          </div>
+          <div class="control">
+            <select data-arg="--cluster-avg-base" data-default="user">
+              <option value="user" selected>user</option>
+              <option value="cluster">cluster</option>
+              <option value="cluster_item_pop">cluster_item_pop</option>
+            </select>
+          </div>
+        </div>
+        <div class="row"><div class="label">ClusterAvg leaky <span class="arg">--cluster-avg-leaky</span></div><div class="control"><label class="check"><input type="checkbox" data-arg="--cluster-avg-leaky" /> Açık</label></div></div>
+        <div class="row"><div class="label">Cluster mean impute train <span class="arg">--cluster-mean-impute-train</span></div><div class="control"><label class="check"><input type="checkbox" data-arg="--cluster-mean-impute-train" /> Açık</label></div></div>
+        <div class="row"><div class="label">Debug ClusterAvg hard <span class="arg">--debug-cluster-avg-hard</span></div><div class="control"><label class="check"><input type="checkbox" data-arg="--debug-cluster-avg-hard" /> Açık</label></div></div>
+        <div class="row"><div class="label">Debug limit <span class="arg">--debug-cluster-avg-hard-limit</span></div><div class="control"><input type="number" data-arg="--debug-cluster-avg-hard-limit" data-default="5" placeholder="5" min="1" /></div></div>
+
+        <div class="row">
+          <div class="label">ClusterKNN variant
+            <span class="arg">--cluster-knn-variant</span>
+          </div>
+          <div class="control">
+            <select data-arg="--cluster-knn-variant" data-default="baseline">
+              <option value="baseline" selected>baseline</option>
+              <option value="withmeans">withmeans</option>
+              <option value="coclustering">coclustering</option>
+            </select>
+          </div>
+        </div>
+        <div class="row">
+          <div class="label">ClusterKNN backend
+            <span class="arg">--cluster-knn-backend</span>
+          </div>
+          <div class="control">
+            <select data-arg="--cluster-knn-backend" data-default="surprise">
+              <option value="surprise" selected>surprise</option>
+              <option value="manual">manual</option>
+              <option value="native">native</option>
+            </select>
+          </div>
+        </div>
+        <div class="row"><div class="label">Latent similarity <span class="arg">--use-latent-similarity</span></div><div class="control"><label class="check"><input type="checkbox" data-arg="--use-latent-similarity" /> Açık</label></div></div>
+        <div class="row"><div class="label">Cluster weight alpha <span class="arg">--cluster-weight-alpha</span></div><div class="control"><input type="text" data-arg="--cluster-weight-alpha" data-default="1.0" placeholder="1.0 veya auto" /></div></div>
+        <div class="row"><div class="label">Cluster weight base <span class="arg">--cluster-weight-base</span></div><div class="control"><input type="number" step="0.1" data-arg="--cluster-weight-base" data-default="1.0" placeholder="1.0" /></div></div>
+
+        <div class="row"><div class="label">Global Surprise SVD <span class="arg">--svd</span></div><div class="control"><label class="check"><input type="checkbox" data-arg="--svd" /> Açık</label></div></div>
+        <div class="row"><div class="label">SVD factors <span class="arg">--svd-factors</span></div><div class="control"><input type="number" data-arg="--svd-factors" data-default="100" placeholder="100" min="1" /></div></div>
+        <div class="row"><div class="label">SVD epochs <span class="arg">--svd-epochs</span></div><div class="control"><input type="number" data-arg="--svd-epochs" data-default="20" placeholder="20" min="1" /></div></div>
+
+        <div class="row"><div class="label">Global KNN <span class="arg">--global-knn</span></div><div class="control"><label class="check"><input type="checkbox" data-arg="--global-knn" /> Açık</label></div></div>
+        <div class="row"><div class="label">Global KNN K <span class="arg">--global-knn-k</span></div><div class="control"><input type="number" data-arg="--global-knn-k" data-default="20" placeholder="20" min="1" /></div></div>
+        <div class="row">
+          <div class="label">Global KNN sim
+            <span class="arg">--global-knn-sim</span>
+          </div>
+          <div class="control">
+            <select data-arg="--global-knn-sim" data-default="pearson">
+              <option value="pearson" selected>pearson</option>
+              <option value="pearson_iuf">pearson_iuf</option>
+              <option value="cosine">cosine</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="row"><div class="label">Global KNNBaseline <span class="arg">--global-knn-baseline</span></div><div class="control"><label class="check"><input type="checkbox" data-arg="--global-knn-baseline" /> Açık</label></div></div>
+        <div class="row"><div class="label">KNNBaseline K <span class="arg">--global-knn-baseline-k</span></div><div class="control"><input type="number" data-arg="--global-knn-baseline-k" data-default="40" placeholder="40" min="1" /></div></div>
+        <div class="row">
+          <div class="label">KNNBaseline sim
+            <span class="arg">--global-knn-baseline-sim</span>
+          </div>
+          <div class="control">
+            <select data-arg="--global-knn-baseline-sim" data-default="pearson_baseline">
+              <option value="pearson_baseline" selected>pearson_baseline</option>
+              <option value="msd">msd</option>
+              <option value="pearson">pearson</option>
+              <option value="cosine">cosine</option>
+            </select>
+          </div>
+        </div>
+        <div class="row"><div class="label">KNNBaseline min common <span class="arg">--global-knn-baseline-min-common</span></div><div class="control"><input type="number" data-arg="--global-knn-baseline-min-common" data-default="1" placeholder="1" min="1" /></div></div>
+        <div class="row"><div class="label">KNNBaseline item-based <span class="arg">--global-knn-baseline-item-based</span></div><div class="control"><label class="check"><input type="checkbox" data-arg="--global-knn-baseline-item-based" /> Açık</label></div></div>
+
+        <div class="row"><div class="label">Global KNNWithMeans <span class="arg">--global-kwm</span></div><div class="control"><label class="check"><input type="checkbox" data-arg="--global-kwm" /> Açık</label></div></div>
+        <div class="row"><div class="label">KWM K <span class="arg">--global-kwm-k</span></div><div class="control"><input type="number" data-arg="--global-kwm-k" data-default="40" placeholder="40" min="1" /></div></div>
+        <div class="row">
+          <div class="label">KWM sim
+            <span class="arg">--global-kwm-sim</span>
+          </div>
+          <div class="control">
+            <select data-arg="--global-kwm-sim" data-default="msd">
+              <option value="msd" selected>msd</option>
+              <option value="pearson">pearson</option>
+              <option value="cosine">cosine</option>
+            </select>
+          </div>
+        </div>
+        <div class="row"><div class="label">KWM min common <span class="arg">--global-kwm-min-common</span></div><div class="control"><input type="number" data-arg="--global-kwm-min-common" data-default="1" placeholder="1" min="1" /></div></div>
+        <div class="row"><div class="label">KWM item-based <span class="arg">--global-kwm-item-based</span></div><div class="control"><label class="check"><input type="checkbox" data-arg="--global-kwm-item-based" /> Açık</label></div></div>
+      </details>
     </div>
 
     <div class="panel preview">
@@ -2534,6 +2778,57 @@
   </div>
 </div>
 
+<!-- ============================================================
+     TAB 6: Sonuçlar ve Notlar
+     ============================================================ -->
+<div class="tab-page" id="page-insights">
+  <div style="padding: 18px 24px;">
+    <div class="panel" style="margin-bottom: 14px;">
+      <h2>Yeni Eklenen Özellikler — Kısa Açıklama</h2>
+      <ul class="simple-list">
+        <li><b>Fusion akışı:</b> <code>--fusion</code>, <code>--fusion-mode</code>, <code>--knn-item</code>, <code>--coverage</code>, <code>--diversity</code> parametreleri ile user/item tahminlerini birlikte değerlendirebilirsin.</li>
+        <li><b>Item-side otomatik senkron:</b> Tab 1b’de üretilen item suffix, Tab 2’deki fusion alanlarına otomatik aktarılıyor (manuel değiştirince korunuyor).</li>
+        <li><b>Canlı kombinasyon lint’i:</b> mode collapse ve deprecated kombinasyonlar anında uyarı/hata olarak gösteriliyor.</li>
+        <li><b>Küme karşılaştırma paneli:</b> <code>compare_cluster_structure.py</code> için komut üretimi + dosya bazlı ARI/NMI ve küme dağılımı tablosu tek ekranda.</li>
+        <li><b>Grid presetleri:</b> K etkisi, metric etkisi ve geniş ablation senaryoları için hazır preset akışı mevcut.</li>
+      </ul>
+      <div class="muted-note">
+        Not: Buradaki açıklamalar pratik karar almayı hızlandırmak için özet tutuldu; detaylı argüman davranışları 5. sekmede duruyor.
+      </div>
+    </div>
+
+    <div class="layout" style="padding: 0;">
+      <div class="panel">
+        <h2>En İyi Değerler (Deney Not Defteri)</h2>
+        <div class="mini-form">
+          <input id="best-dataset" type="text" placeholder="dataset (örn: ml100k)" />
+          <input id="best-k" type="number" placeholder="K" min="1" />
+          <input id="best-mae" type="text" placeholder="MAE" />
+          <input id="best-rmse" type="text" placeholder="RMSE" />
+          <input id="best-model" class="span2" type="text" placeholder="model / kombinasyon (örn: fusion-dynamic)" />
+          <input id="best-notes" class="span3" type="text" placeholder="kısa not (neden iyi?)" />
+          <input id="best-path" class="span3" type="text" placeholder="çıktı yolu (opsiyonel)" />
+        </div>
+        <div class="mini-actions">
+          <button class="btn ok" id="best-add">En İyiye Ekle</button>
+          <button class="btn" id="best-clear">Listeyi Temizle</button>
+        </div>
+        <div class="mini-list" id="best-list"></div>
+      </div>
+
+      <div class="panel">
+        <h2>Son Çalıştırmalar</h2>
+        <div class="muted-note">Komut önizlemelerinde <b>Kopyala</b> tuşuna bastığında buraya otomatik kayıt düşer.</div>
+        <div class="mini-actions">
+          <button class="btn" id="runs-add-active">Aktif Sekme Komutunu Kaydet</button>
+          <button class="btn" id="runs-clear">Geçmişi Temizle</button>
+        </div>
+        <div class="mini-list" id="runs-list"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div class="toast" id="toast">Kopyalandı</div>
 
 <script>
@@ -3342,9 +3637,110 @@ function copyText(id) {
     showToast('Kopyalandı');
   }
 }
-document.getElementById('copy-ga').addEventListener('click', () => copyText('cmd-ga'));
-document.getElementById('copy-wnmf').addEventListener('click', () => copyText('cmd-wnmf'));
-document.getElementById('copy-gi')?.addEventListener('click', () => copyText('cmd-gi'));
+const STORAGE_KEYS = {
+  best: 'hr_command_builder_best_values_v1',
+  runs: 'hr_command_builder_recent_runs_v1',
+};
+
+function safeLoad(key) {
+  try { return JSON.parse(localStorage.getItem(key) || '[]'); }
+  catch (_) { return []; }
+}
+function safeSave(key, data) {
+  localStorage.setItem(key, JSON.stringify(data));
+}
+function renderBestList() {
+  const host = document.getElementById('best-list');
+  if (!host) return;
+  const rows = safeLoad(STORAGE_KEYS.best);
+  if (!rows.length) {
+    host.innerHTML = '<div class="mini-item" style="color:var(--muted)">Henüz kayıt yok.</div>';
+    return;
+  }
+  host.innerHTML = rows.map((r, idx) => `
+    <div class="mini-item">
+      <b>${idx + 1}. ${escapeHtml(r.model || '(model yok)')}</b> · ${escapeHtml(r.dataset || '-')} · K=${escapeHtml(r.k || '-')}<br>
+      MAE: <span class="mono">${escapeHtml(r.mae || '-')}</span> · RMSE: <span class="mono">${escapeHtml(r.rmse || '-')}</span><br>
+      <span style="color:var(--muted)">${escapeHtml(r.notes || '')}</span><br>
+      <span class="mono" style="color:#9cc7ff">${escapeHtml(r.path || '')}</span>
+    </div>
+  `).join('');
+}
+function addBestValue() {
+  const entry = {
+    dataset: (document.getElementById('best-dataset')?.value || '').trim(),
+    k: (document.getElementById('best-k')?.value || '').trim(),
+    mae: (document.getElementById('best-mae')?.value || '').trim(),
+    rmse: (document.getElementById('best-rmse')?.value || '').trim(),
+    model: (document.getElementById('best-model')?.value || '').trim(),
+    notes: (document.getElementById('best-notes')?.value || '').trim(),
+    path: (document.getElementById('best-path')?.value || '').trim(),
+    ts: new Date().toISOString(),
+  };
+  if (!entry.dataset && !entry.model && !entry.mae) {
+    showToast('En az dataset/model/MAE gir');
+    return;
+  }
+  const rows = safeLoad(STORAGE_KEYS.best);
+  rows.unshift(entry);
+  safeSave(STORAGE_KEYS.best, rows.slice(0, 120));
+  renderBestList();
+  showToast('En iyi değer kaydedildi');
+}
+function commandForTab(tabName) {
+  const map = {
+    ga: 'cmd-ga',
+    gi: 'cmd-gi',
+    wnmf: 'cmd-wnmf',
+    grid: 'cmd-grid',
+    compare: 'cmd-compare',
+  };
+  const id = map[tabName];
+  return id ? (document.getElementById(id)?.textContent || '').trim() : '';
+}
+function activeTabName() {
+  return document.querySelector('.tab.active')?.dataset.tab || '';
+}
+function renderRunsList() {
+  const host = document.getElementById('runs-list');
+  if (!host) return;
+  const rows = safeLoad(STORAGE_KEYS.runs);
+  if (!rows.length) {
+    host.innerHTML = '<div class="mini-item" style="color:var(--muted)">Henüz çalıştırma kaydı yok.</div>';
+    return;
+  }
+  host.innerHTML = rows.map(r => `
+    <div class="mini-item">
+      <b>${escapeHtml(r.source || 'komut')}</b> · <span style="color:var(--muted)">${escapeHtml(r.when || '')}</span><br>
+      <span class="mono">${escapeHtml(r.command || '')}</span>
+    </div>
+  `).join('');
+}
+function trackRun(source, command) {
+  const cmd = (command || '').trim();
+  if (!cmd) return;
+  const rows = safeLoad(STORAGE_KEYS.runs);
+  rows.unshift({
+    source,
+    command: cmd,
+    when: new Date().toLocaleString('tr-TR'),
+  });
+  safeSave(STORAGE_KEYS.runs, rows.slice(0, 200));
+  renderRunsList();
+}
+
+document.getElementById('copy-ga').addEventListener('click', () => {
+  copyText('cmd-ga');
+  trackRun('Atama Üretici', document.getElementById('cmd-ga').textContent);
+});
+document.getElementById('copy-wnmf').addEventListener('click', () => {
+  copyText('cmd-wnmf');
+  trackRun('WNMF / Soft-KNN', document.getElementById('cmd-wnmf').textContent);
+});
+document.getElementById('copy-gi')?.addEventListener('click', () => {
+  copyText('cmd-gi');
+  trackRun('Item Atama Üretici', document.getElementById('cmd-gi').textContent);
+});
 
 document.getElementById('reset-ga').addEventListener('click', () => {
   document.querySelector('[data-preset="reset"]').click();
@@ -3974,7 +4370,10 @@ document.querySelectorAll('[data-grid-preset]').forEach(b => {
 });
 
 // Kopyala / kaydet
-document.getElementById('copy-grid').addEventListener('click', () => copyText('cmd-grid'));
+document.getElementById('copy-grid').addEventListener('click', () => {
+  copyText('cmd-grid');
+  trackRun('Grid Search', document.getElementById('cmd-grid').textContent);
+});
 document.getElementById('save-grid').addEventListener('click', () => {
   const txt = document.getElementById('cmd-grid').textContent;
   const blob = new Blob([txt], { type: 'text/plain;charset=utf-8' });
@@ -4008,7 +4407,10 @@ function buildCompareCommand() {
 ['cmp-root','cmp-suffix','cmp-algos','cmp-reference','cmp-csv'].forEach(id => {
   document.getElementById(id).addEventListener('input', buildCompareCommand);
 });
-document.getElementById('copy-compare').addEventListener('click', () => copyText('cmd-compare'));
+document.getElementById('copy-compare').addEventListener('click', () => {
+  copyText('cmd-compare');
+  trackRun('Küme Karşılaştırma', document.getElementById('cmd-compare').textContent);
+});
 buildCompareCommand();
 
 // ---- NPY parser (1D int/uint/float arrays, fortran_order=False) ----
@@ -4303,6 +4705,30 @@ document.getElementById('clear-compare').addEventListener('click', () => {
   document.getElementById('cmp-ref-file').innerHTML = '<option value="">(ilk dosya)</option>';
   document.getElementById('compare-results').innerHTML = '';
 });
+
+document.getElementById('best-add')?.addEventListener('click', addBestValue);
+document.getElementById('best-clear')?.addEventListener('click', () => {
+  safeSave(STORAGE_KEYS.best, []);
+  renderBestList();
+  showToast('En iyi değer listesi temizlendi');
+});
+document.getElementById('runs-clear')?.addEventListener('click', () => {
+  safeSave(STORAGE_KEYS.runs, []);
+  renderRunsList();
+  showToast('Çalıştırma geçmişi temizlendi');
+});
+document.getElementById('runs-add-active')?.addEventListener('click', () => {
+  const tab = activeTabName();
+  const cmd = commandForTab(tab);
+  if (!cmd) {
+    showToast('Bu sekmede kayıtlanacak komut yok');
+    return;
+  }
+  trackRun('Manuel · ' + tab, cmd);
+  showToast('Aktif sekme komutu kaydedildi');
+});
+renderBestList();
+renderRunsList();
 
 // İlk render
 regenerateAll();
