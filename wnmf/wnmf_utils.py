@@ -465,6 +465,94 @@ def split_by_cluster(
     return cluster_ratings, gray_ratings
 
 
+def compute_cluster_item_means_imputed(
+    train: np.ndarray,
+    assignments: np.ndarray,
+    gray_mask: np.ndarray,
+    n_items: int,
+    *,
+    cluster_avg_hard: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, float, np.ndarray, np.ndarray]:
+    """
+  İki geçişli küme-ortalama imputation:
+    1) Gözlemlenen train rating'lerinden küme×item ortalaması
+    2) Eksik (u,i) hücrelerini bu ortalama ile doldurup ortalamayı yeniden hesapla
+
+  Döndürür: cluster_item_means, cluster_item_counts, global_mean, item_means, user_means
+    """
+    train = np.asarray(train, dtype=np.float64)
+    assignments = np.asarray(assignments, dtype=np.int64).ravel()
+    gray_mask = np.asarray(gray_mask, dtype=bool).ravel()
+    n_users = len(assignments)
+    n_clusters = int(assignments.max()) + 1 if len(assignments) else 0
+
+    global_mean = float(train[:, 2].mean()) if len(train) else 3.0
+    item_sums = np.zeros(n_items, dtype=np.float64)
+    item_counts = np.zeros(n_items, dtype=np.int32)
+    user_sums = np.zeros(n_users, dtype=np.float64)
+    user_counts = np.zeros(n_users, dtype=np.int32)
+    for row in train:
+        u, i, r = int(row[0]), int(row[1]), float(row[2])
+        item_sums[i] += r
+        item_counts[i] += 1
+        if u < n_users:
+            user_sums[u] += r
+            user_counts[u] += 1
+    item_means = np.where(
+        item_counts > 0, item_sums / np.maximum(item_counts, 1), global_mean,
+    ).astype(np.float32)
+    user_means = np.where(
+        user_counts > 0, user_sums / np.maximum(user_counts, 1), global_mean,
+    ).astype(np.float32)
+
+    def _means_from_rows(rows: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        c_means = np.zeros((n_clusters, n_items), dtype=np.float64)
+        c_counts = np.zeros((n_clusters, n_items), dtype=np.int32)
+        for row in rows:
+            u, i, r = int(row[0]), int(row[1]), float(row[2])
+            if u >= n_users or gray_mask[u]:
+                continue
+            cid = int(assignments[u])
+            c_means[cid, i] += r
+            c_counts[cid, i] += 1
+        for cid in range(n_clusters):
+            mask = c_counts[cid] > 0
+            c_means[cid, mask] /= c_counts[cid, mask]
+            if not cluster_avg_hard:
+                c_means[cid, ~mask] = global_mean
+            else:
+                c_means[cid, ~mask] = np.nan
+        return c_means.astype(np.float32), c_counts
+
+    c_means, c_counts = _means_from_rows(train)
+
+    def _cell_value(u: int, i: int) -> float:
+        cid = int(assignments[u])
+        val = c_means[cid, i]
+        if not np.isnan(val) and c_counts[cid, i] > 0:
+            return float(val)
+        if item_counts[i] > 0:
+            return float(item_means[i])
+        if user_counts[u] > 0:
+            return float(user_means[u])
+        return global_mean
+
+    train_pairs = {(int(r[0]), int(r[1])) for r in train}
+    extra = []
+    for u in range(n_users):
+        if gray_mask[u]:
+            continue
+        for i in range(n_items):
+            if (u, i) in train_pairs:
+                continue
+            extra.append([u, i, _cell_value(u, i)])
+    if extra:
+        imputed_train = np.vstack([train, np.asarray(extra, dtype=np.float64)])
+        c_means, c_counts = _means_from_rows(imputed_train)
+
+    return c_means, c_counts, global_mean, item_means, user_means
+
+
 def remap_user_ids(
     train: np.ndarray,
     test: np.ndarray,

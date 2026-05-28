@@ -138,6 +138,68 @@ EARLY_STOP_BLOCK_SIZE = 5
 EARLY_STOP_PATIENCE = 8      # 8 blok = 40 epoch iyileşme yoksa dur
 EARLY_STOP_TOLERANCE = 1e-5
 
+
+def _resolve_ha_epoch_policy(args, matrix, K, pop_size):
+    """
+    HA_AVOAHGS için epoch/early-stop parametrelerini üretir.
+
+    Adaptif modda mantık:
+      - min_epoch: problemin (K, d) karmaşıklığına göre alt sınır
+      - max_epoch: n, d, K ve pop büyüklüğüne göre bütçe
+      - patience: min_epoch'tan sonra ne kadar bekleyeceğimizi blok cinsinden belirler
+      - tolerance: veri büyüdükçe (n*K) daha hassas iyileşme eşiği
+    """
+    if args is None:
+        return (
+            EARLY_STOP_MAX_EPOCH,
+            EARLY_STOP_PATIENCE,
+            EARLY_STOP_TOLERANCE,
+            EARLY_STOP_BLOCK_SIZE,
+            "fixed",
+        )
+
+    block_size = int(max(1, getattr(args, 'early_stop_block', EARLY_STOP_BLOCK_SIZE)))
+    if not getattr(args, 'ha_adaptive_epoch', False):
+        return (
+            int(getattr(args, 'early_stop_max_epoch', EARLY_STOP_MAX_EPOCH)),
+            int(getattr(args, 'early_stop_patience', EARLY_STOP_PATIENCE)),
+            float(getattr(args, 'early_stop_tolerance', EARLY_STOP_TOLERANCE)),
+            block_size,
+            "fixed",
+        )
+
+    n_users = int(matrix.shape[0])
+    n_feats = int(matrix.shape[1])
+    K_eff = int(max(1, K))
+    pop_eff = int(max(1, pop_size))
+
+    min_epoch = int(max(
+        30,
+        np.ceil(2.5 * np.sqrt(K_eff) * np.log2(n_feats + 1.0)),
+    ))
+
+    target_epoch = int(np.ceil(
+        min_epoch
+        + 0.35 * np.sqrt((n_users * n_feats) / K_eff)
+        + 0.60 * pop_eff
+    ))
+
+    cap = int(max(min_epoch + block_size, getattr(args, 'ha_adaptive_max_cap', 600)))
+    max_epoch = int(min(cap, max(min_epoch + block_size, target_epoch)))
+
+    span = max(1, max_epoch - min_epoch)
+    patience = int(max(4, np.ceil(span / (3.0 * block_size))))
+    min_tol = float(max(1e-8, getattr(args, 'ha_adaptive_min_tol', 1e-6)))
+    tolerance = float(max(min_tol, 1e-4 / np.sqrt(n_users * K_eff)))
+
+    note = (
+        "adaptive "
+        f"(min={min_epoch}, target={target_epoch}, max={max_epoch}, "
+        f"pat={patience}, tol={tolerance:.2e}, block={block_size})"
+    )
+    return max_epoch, patience, tolerance, block_size, note
+
+
 LOF_N_NEIGHBORS   = 20
 LOF_CONTAMINATION = 'auto'
 
@@ -1091,7 +1153,13 @@ def _run_one_core(
     cluster_objective = (
         getattr(args, 'cluster_objective', 'multi') if args is not None else 'multi'
     )
-    use_centroid_opt = fitness_mode in ('latent_dev', 'knn_mae')
+    # B0_KMEANS her zaman gerçek KMeans baseline olarak çalışmalı.
+    # knn_mae/latent_dev gibi fitness'lar yalnızca meta-sezgisel dallar için
+    # centroid optimizer'ı tetikler.
+    use_centroid_opt = (
+        label != 'B0_KMEANS'
+        and fitness_mode in ('latent_dev', 'knn_mae', 'knn_mae_legacy')
+    )
     if use_centroid_opt:
         opt_note = (
             f", fitness={fitness_mode}, "
@@ -1139,6 +1207,10 @@ def _run_one_core(
             n_val_sample=int(getattr(args, 'centroid_val_sample', 200) or 200),
             knn_k=int(getattr(args, 'centroid_knn_k', 20) or 20),
             fitness_mode=fitness_mode,
+            knn_sim_metric=str(getattr(args, 'centroid_knn_sim', 'cosine') or 'cosine'),
+            min_common=int(getattr(args, 'min_common', 3) or 3),
+            bias_epochs=int(getattr(args, 'centroid_bias_epochs', 5) or 5),
+            use_native_predictor=fitness_mode == 'knn_mae',
         )
         opt_result = opt.optimize()
         best_sol = opt_result['centroids'].astype(np.float32, copy=False).flatten()
@@ -1166,14 +1238,17 @@ def _run_one_core(
             assignments = km.labels_
         elif label == 'HA_AVOAHGS':
             if args is not None and getattr(args, 'early_stop', False):
-                es_max = getattr(args, 'early_stop_max_epoch', EARLY_STOP_MAX_EPOCH)
+                es_max, es_pat, es_tol, es_block, es_note = _resolve_ha_epoch_policy(
+                    args, matrix, K, pop_size,
+                )
+                print(f"    HA epoch policy: {es_note}")
                 best_sol, best_fit, actual_epochs, convergence_history = (
                     run_ha_avoahgs_with_early_stop(
                         matrix, K, init, es_max, pop_size,
                         metric=cluster_metric,
-                        patience=getattr(args, 'early_stop_patience', EARLY_STOP_PATIENCE),
-                        tolerance=getattr(args, 'early_stop_tolerance', EARLY_STOP_TOLERANCE),
-                        block_size=getattr(args, 'early_stop_block', EARLY_STOP_BLOCK_SIZE),
+                        patience=es_pat,
+                        tolerance=es_tol,
+                        block_size=es_block,
                         cluster_objective=cluster_objective,
                     )
                 )
@@ -1404,7 +1479,10 @@ def _run_one_core(
         cluster_matrix, best_sol, K, metric=cluster_metric,
     )
     if use_centroid_opt:
-        fit_label = 'sample_mae' if fitness_mode == 'knn_mae' else 'latent_dev'
+        fit_label = (
+            'cluster_predictor_mae' if fitness_mode == 'knn_mae'
+            else ('sample_mae' if fitness_mode == 'knn_mae_legacy' else 'latent_dev')
+        )
         print(f"    {fit_label}    : {best_fit:.6f}  (WCSS rapor: {best_wcss:.4f})")
 
     if getattr(args, 'fcm', False):
@@ -2276,10 +2354,10 @@ def parse_args():
     )
     p.add_argument(
         '--fitness',
-        choices=['wcss', 'latent_dev', 'knn_mae'],
+        choices=['wcss', 'latent_dev', 'knn_mae', 'knn_mae_legacy'],
         default='wcss',
-        help='Kümeleme hedefi: wcss (varsayılan), latent_dev (W uzayı sapma) veya '
-             'knn_mae (CentroidOptimizer: örneklenmiş val kNN MAE).',
+        help='Kümeleme hedefi: wcss (varsayılan), latent_dev, knn_mae (ClusterPredictor '
+             'val MAE), knn_mae_legacy (hızlı Pearson kNN örneklemesi).',
     )
     p.add_argument(
         '--cluster-objective',
@@ -2328,6 +2406,20 @@ def parse_args():
     p.add_argument(
         '--centroid-knn-k', type=int, default=20, metavar='K',
         help='--fitness knn_mae: küme-içi kNN komşu sayısı (varsayılan: 20).',
+    )
+    p.add_argument(
+        '--centroid-knn-sim',
+        choices=['cosine', 'pearson'],
+        default='cosine',
+        help='--fitness knn_mae: ClusterPredictor benzerlik metriği (varsayılan: cosine).',
+    )
+    p.add_argument(
+        '--centroid-bias-epochs', type=int, default=5, metavar='N',
+        help='--fitness knn_mae: küme başına bias SGD epoch (varsayılan: 5; hız için düşük tutun).',
+    )
+    p.add_argument(
+        '--min-common', type=int, default=3, metavar='N',
+        help='kNN min_support / min_common (varsayılan: 3).',
     )
     p.add_argument(
         '--save-wnmf-u', type=str, default=None, metavar='DIR',
@@ -2432,6 +2524,19 @@ def parse_args():
         '--early-stop-block', type=int, default=EARLY_STOP_BLOCK_SIZE, metavar='N',
         help=f'Early-stop: blok başına epoch (default: {EARLY_STOP_BLOCK_SIZE})',
     )
+    p.add_argument(
+        '--ha-adaptive-epoch', action='store_true',
+        help='HA_AVOAHGS için epoch/patience/tolerance değerlerini veri boyutu, K ve pop '
+             'üzerinden adaptif hesaplar (yalnızca --early-stop ile).',
+    )
+    p.add_argument(
+        '--ha-adaptive-max-cap', type=int, default=600, metavar='N',
+        help='--ha-adaptive-epoch aktifken HA için max epoch üst sınırı (default: 600).',
+    )
+    p.add_argument(
+        '--ha-adaptive-min-tol', type=float, default=1e-6,
+        help='--ha-adaptive-epoch aktifken tolerance alt sınırı (default: 1e-6).',
+    )
     args = p.parse_args()
     if args.k is not None and (args.k_100k is not None or args.k_1m is not None):
         p.error('--k (tek veya çoklu) ile --k-100k / --k-1m birlikte kullanılamaz')
@@ -2486,7 +2591,7 @@ def parse_args():
             else 'pearson'
         )
     if (
-        args.fitness in ('latent_dev', 'knn_mae')
+        args.fitness in ('latent_dev', 'knn_mae', 'knn_mae_legacy')
         and not args.wnmf_model_path
         and args.feature_extraction != 'wnmf'
         and args.wnmf_features is None
@@ -2495,7 +2600,7 @@ def parse_args():
             '--fitness latent_dev/knn_mae için --wnmf-model-path zorunlu '
             '(veya --feature-extraction wnmf ile pipeline W matrisi kullanılır)'
         )
-    if args.fitness == 'knn_mae' and not args.train_only:
+    if args.fitness in ('knn_mae', 'knn_mae_legacy') and not args.train_only:
         print(
             '  Uyarı: --fitness knn_mae için --train-only önerilir '
             '(val örnekleri holdout/test bölmesinden gelir).',
@@ -2705,6 +2810,11 @@ if __name__ == '__main__':
             f"patience={args.early_stop_patience}, "
             f"tol={args.early_stop_tolerance}"
         )
+        if getattr(args, 'ha_adaptive_epoch', False):
+            print(
+                f"HA adaptif  : açık (max_cap={args.ha_adaptive_max_cap}, "
+                f"min_tol={args.ha_adaptive_min_tol})"
+            )
     print(f"Pop size    : {pop_size}  |  Seed: {SEED}")
     if args.kmeans_refine:
         print(
@@ -2739,7 +2849,7 @@ if __name__ == '__main__':
     ))
     if args.fitness == 'wcss':
         print(f"Cluster obj : {args.cluster_objective} (meta-sezgisel hedef)")
-    if args.fitness == 'knn_mae':
+    if args.fitness in ('knn_mae', 'knn_mae_legacy'):
         print(
             f"Centroid MAE: train_sample={args.centroid_train_sample}, "
             f"val_sample={args.centroid_val_sample}, knn_k={args.centroid_knn_k}"
@@ -2809,7 +2919,7 @@ if __name__ == '__main__':
     try:
         if args.dataset in ('100k', 'both'):
             raw_train_100k = raw_test_100k = None
-            if args.fitness == 'knn_mae':
+            if args.fitness in ('knn_mae', 'knn_mae_legacy'):
                 raw_train_100k, raw_test_100k = _fetch_100k_train_test_arrays(
                     eval_split=args.eval_split,
                     fold=args.fold,
@@ -2839,10 +2949,10 @@ if __name__ == '__main__':
                 min_item_ratings=args.min_item_ratings,
                 wnmf_init_method=args.wnmf_init,
                 inmed_trim=(args.inmed_trim_low, args.inmed_trim_high),
-                return_prune_indices=(args.fitness == 'knn_mae'),
+                return_prune_indices=(args.fitness in ('knn_mae', 'knn_mae_legacy')),
                 paper_style=getattr(args, 'paper_style', False),
             )
-            if args.fitness == 'knn_mae':
+            if args.fitness in ('knn_mae', 'knn_mae_legacy'):
                 matrix_100k, kept_u, kept_i = prep_100k
                 args.centroid_train_ratings = _remap_ratings_to_pruned(
                     raw_train_100k, kept_u, kept_i,

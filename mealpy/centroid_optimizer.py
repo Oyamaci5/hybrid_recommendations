@@ -2,8 +2,11 @@
 centroid_optimizer.py
 =====================
 Meta-algoritma ile optimal cluster centroid'larını bul.
-Fitness (knn_mae): örneklenmiş val seti üzerinde küme-içi kNN MAE.
-Fitness (latent_dev): WNMF latent uzayında ortalama sapma (eski proxy).
+
+Fitness modları:
+  knn_mae       — ClusterPredictor (küme bias SGD + küme-içi cosine/pearson kNN) val MAE
+  knn_mae_legacy — eski hızlı Pearson kNN (örneklemeli)
+  latent_dev    — WNMF latent uzayında ortalama sapma (proxy)
 """
 
 from __future__ import annotations
@@ -186,6 +189,59 @@ def fast_knn_mae(
     return float(np.mean(errors))
 
 
+def cluster_predictor_mae(
+    train_ratings: np.ndarray,
+    val_sample: np.ndarray,
+    assignments: np.ndarray,
+    n_users: int,
+    n_items: int,
+    *,
+    k_neighbors: int = 20,
+    sim_metric: str = 'cosine',
+    min_support: int = 3,
+    bias_epochs: int = 5,
+    bias_lr: float = 0.005,
+    bias_reg: float = 0.02,
+) -> float:
+    """
+    Küme ataması için ClusterPredictor fit + val örneklemesi üzerinde MAE.
+    Meta centroid aramada: pred(u,i) = mu + b_u[c] + b_i[c] + kNN sapması.
+    """
+    val_sample = np.asarray(val_sample, dtype=np.float64)
+    if val_sample.size == 0:
+        return float(_EMPTY_CLUSTER_PENALTY)
+
+    assignments = np.asarray(assignments, dtype=np.int32)
+    if len(assignments) != int(n_users):
+        return float(_EMPTY_CLUSTER_PENALTY)
+
+    wnmf_dir = os.path.join(_REPO_ROOT, 'wnmf')
+    if wnmf_dir not in sys.path:
+        sys.path.insert(0, wnmf_dir)
+    from cluster_predictor import ClusterPredictor, build_rating_matrix
+
+    R = build_rating_matrix(train_ratings, int(n_users), int(n_items))
+    pred = ClusterPredictor(
+        k_neighbors=max(1, int(k_neighbors)),
+        sim_metric=(sim_metric or 'cosine').strip().lower(),
+        min_support=max(1, int(min_support)),
+        bias_epochs=max(1, int(bias_epochs)),
+        bias_lr=float(bias_lr),
+        bias_reg=float(bias_reg),
+        bias_seed=42,
+    )
+    pred.fit(R, assignments)
+    mae, _ = pred.evaluate(val_sample)
+    return float(mae)
+
+
+def _rating_bounds(train_ratings: np.ndarray) -> Tuple[int, int]:
+    tr = np.asarray(train_ratings, dtype=np.float64)
+    if tr.size == 0:
+        return 0, 0
+    return int(tr[:, 0].max()) + 1, int(tr[:, 1].max()) + 1
+
+
 def _as_w_matrix(arr, source: str) -> np.ndarray:
     W = np.asarray(arr, dtype=np.float64)
     if W.ndim != 2:
@@ -327,6 +383,10 @@ class CentroidOptimizer:
         n_val_sample: int = 200,
         knn_k: int = 20,
         fitness_mode: str = 'knn_mae',
+        knn_sim_metric: str = 'cosine',
+        min_common: int = 3,
+        bias_epochs: int = 5,
+        use_native_predictor: bool = True,
     ):
         self.W = np.asarray(W_matrix, dtype=np.float64)
         self.K = int(K)
@@ -337,20 +397,39 @@ class CentroidOptimizer:
         self.seed = int(seed)
         self.fitness_mode = (fitness_mode or 'knn_mae').strip().lower()
         self.knn_k = max(1, int(knn_k))
+        self.knn_sim_metric = (knn_sim_metric or 'cosine').strip().lower()
+        self.min_common = max(1, int(min_common))
+        self.bias_epochs = max(1, int(bias_epochs))
+        self.use_native_predictor = bool(use_native_predictor)
         self.rng = np.random.default_rng(self.seed)
 
         self.train_sample = None
         self.val_sample = None
-        if self.fitness_mode == 'knn_mae':
+        self.train_full = None
+        self.n_items_fit = 0
+        if self.fitness_mode in ('knn_mae', 'knn_mae_legacy'):
             train_ratings = np.asarray(train_ratings, dtype=np.float64) if train_ratings is not None else np.zeros((0, 3))
             val_ratings = np.asarray(val_ratings, dtype=np.float64) if val_ratings is not None else np.zeros((0, 3))
-            self.train_sample = sample_ratings(train_ratings, int(n_train_sample), self.rng)
-            self.val_sample = sample_ratings(val_ratings, int(n_val_sample), self.rng)
-            print(
-                f"  CentroidOptimizer knn_mae: train_sample={len(self.train_sample)}, "
-                f"val_sample={len(self.val_sample)}, k={self.knn_k}",
-                flush=True,
-            )
+            self.train_full = train_ratings
+            _, self.n_items_fit = _rating_bounds(train_ratings)
+            if self.use_native_predictor and self.fitness_mode == 'knn_mae':
+                self.train_sample = train_ratings
+                self.val_sample = sample_ratings(val_ratings, int(n_val_sample), self.rng)
+                print(
+                    f"  CentroidOptimizer knn_mae (ClusterPredictor): "
+                    f"train={len(self.train_full):,}, val_sample={len(self.val_sample)}, "
+                    f"k={self.knn_k}, sim={self.knn_sim_metric}, bias_ep={self.bias_epochs}",
+                    flush=True,
+                )
+            else:
+                self.train_sample = sample_ratings(train_ratings, int(n_train_sample), self.rng)
+                self.val_sample = sample_ratings(val_ratings, int(n_val_sample), self.rng)
+                print(
+                    f"  CentroidOptimizer knn_mae_legacy: "
+                    f"train_sample={len(self.train_sample)}, "
+                    f"val_sample={len(self.val_sample)}, k={self.knn_k}",
+                    flush=True,
+                )
 
         col_min = self.W.min(axis=0)
         col_max = self.W.max(axis=0)
@@ -382,11 +461,33 @@ class CentroidOptimizer:
                 return float(_EMPTY_CLUSTER_PENALTY)
 
         if self.fitness_mode == 'knn_mae' and self.val_sample is not None:
+            if self.use_native_predictor and self.train_full is not None:
+                return cluster_predictor_mae(
+                    self.train_full,
+                    self.val_sample,
+                    assignments,
+                    self.n_users,
+                    max(self.n_items_fit, 1),
+                    k_neighbors=self.knn_k,
+                    sim_metric=self.knn_sim_metric,
+                    min_support=self.min_common,
+                    bias_epochs=self.bias_epochs,
+                )
             return fast_knn_mae(
                 self.train_sample,
                 self.val_sample,
                 assignments,
                 k=self.knn_k,
+                min_common=self.min_common,
+            )
+
+        if self.fitness_mode == 'knn_mae_legacy' and self.val_sample is not None:
+            return fast_knn_mae(
+                self.train_sample,
+                self.val_sample,
+                assignments,
+                k=self.knn_k,
+                min_common=self.min_common,
             )
 
         return self._latent_dev_fitness(centroids, assignments)
@@ -421,7 +522,12 @@ class CentroidOptimizer:
         centroids = individual.reshape(self.K, self.n_features)
         assignments = self._assign(centroids)
 
-        fit_label = 'sample_mae' if self.fitness_mode == 'knn_mae' else 'latent_dev'
+        if self.fitness_mode == 'knn_mae':
+            fit_label = 'cluster_predictor_mae'
+        elif self.fitness_mode == 'knn_mae_legacy':
+            fit_label = 'sample_mae'
+        else:
+            fit_label = 'latent_dev'
         print(
             f"    CentroidOptimizer ({self.algo}/{full_name}): "
             f"{fit_label}={best_fit:.6f}",

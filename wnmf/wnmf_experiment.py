@@ -30,6 +30,9 @@ Birden fazla K ve latent + atlanmış koşular (assignment suffix'teki wnmf boyu
         --assign-suffix _pruneu5_i10_zscore_wnmf20_inmed_trim5_95_fuzzy \\
         --sync-assign-suffix-latent --skip-existing \\
         --assign-root mealpy/results/assignments_lof
+    python wnmf_experiment.py --dataset 100k --mode baselines --k 30 --algo H4_MFO+HHO \\
+        --cluster-knn-backend native --knn 30 --min-common 3 \\
+        --assign-root mealpy/results/assignments_lof
     python wnmf_experiment.py --dataset 100k --k 30 --no-global --reg 0.001 0.01 0.1 --lr 0.001 0.01
     python wnmf_experiment.py --dataset 100k --k 30 --epochs-global 50 100 150 200 --epochs-cluster 25 50 75 100
     python wnmf_experiment.py --dataset 1m --k 30 --algo H4_MFO+HHO --epochs-grid \\
@@ -93,9 +96,11 @@ from wnmf_utils import (
     load_assignment,
     load_memberships,
     load_centroids,
+    load_user_features,
     resolve_test_cluster_ids,
     split_by_cluster,
     remap_user_ids,
+    compute_cluster_item_means_imputed,
     save_dataframe_csv,
     save_results,
 )
@@ -864,9 +869,13 @@ def _knn_predict_from_sims(
     user_means: dict,
     global_mean: float,
     k_neighbors: int,
+    base_mean: Optional[float] = None,
 ) -> float:
-    """Ağırlıklı Pearson kNN tahmini (ortak formül)."""
-    base = float(user_means.get(u, global_mean))
+    """Ağırlıklı Pearson kNN tahmini (ortak formül). base_mean verilirse mean_u yerine o kullanılır."""
+    if base_mean is not None:
+        base = float(base_mean)
+    else:
+        base = float(user_means.get(u, global_mean))
     if not sims:
         return float(np.clip(base, 1.0, 5.0))
     sims.sort(key=lambda x: -abs(x[0]))
@@ -879,6 +888,105 @@ def _knn_predict_from_sims(
     if den < 1e-8:
         return float(np.clip(base, 1.0, 5.0))
     return float(np.clip(base + num / den, 1.0, 5.0))
+
+
+def _cluster_avg_mu_base(
+    u: int,
+    i: int,
+    cid: int,
+    *,
+    cluster_avg_base: str,
+    cluster_means: dict,
+    user_means: dict,
+    item_mean_offsets: dict,
+    global_mean: float,
+) -> float:
+    """ClusterAvg taban ortalaması: user | cluster | cluster_item_pop."""
+    mode = (cluster_avg_base or 'user').strip().lower()
+    if mode == 'cluster':
+        return float(np.clip(cluster_means.get(cid, global_mean), 1.0, 5.0))
+    if mode in ('cluster_item_pop', 'cluster+item', 'cluster_item'):
+        pop_off = float(item_mean_offsets.get(i, 0.0))
+        return float(np.clip(cluster_means.get(cid, global_mean) + pop_off, 1.0, 5.0))
+    return float(np.clip(user_means.get(u, global_mean), 1.0, 5.0))
+
+
+def _predict_weighted_cluster_avg(
+    u: int,
+    i: int,
+    cid: int,
+    cluster_users: dict,
+    user_ratings: dict,
+    user_means: dict,
+    cluster_means: dict,
+    item_mean_offsets: dict,
+    global_mean: float,
+    sim_index: dict,
+    *,
+    cluster_avg_base: str = 'user',
+    similarity: str = 'pearson',
+    item_popularity: dict,
+    min_common: int = 3,
+    sig_weight: int = 0,
+    sim_amp: float = 1.0,
+    k_neighbors: int = 0,
+) -> float:
+    """
+    Küme-içi ağırlıklı ortalama (GOA / Sparrow / Firefly tarzı):
+      pred(u,i) = mu_base + Σ_v sim(u,v)·(r(v,i)-mean_v) / Σ_v |sim(u,v)|
+    mu_base: --cluster-avg-base (user | cluster | cluster_item_pop).
+    yalnızca cid kümesindeki ve item i'yi puanlamış v için.
+    """
+    base = _cluster_avg_mu_base(
+        u,
+        i,
+        cid,
+        cluster_avg_base=cluster_avg_base,
+        cluster_means=cluster_means,
+        user_means=user_means,
+        item_mean_offsets=item_mean_offsets,
+        global_mean=global_mean,
+    )
+    members = cluster_users.get(cid, [])
+    sim_map = {v: s for s, v in sim_index.get(u, [])}
+    sims: List[Tuple[float, int]] = []
+
+    for v in members:
+        if v == u:
+            continue
+        if i not in user_ratings.get(v, {}):
+            continue
+        s = sim_map.get(v)
+        if s is None:
+            s = knn_user_similarity(
+                u,
+                v,
+                similarity=similarity,
+                user_ratings=user_ratings,
+                user_means=user_means,
+                item_popularity=item_popularity,
+                min_common=min_common,
+                sig_threshold=sig_weight,
+                sim_amp=sim_amp,
+            )
+        if abs(s) < 1e-8:
+            continue
+        sims.append((float(s), v))
+
+    if not sims:
+        return float(np.clip(base, 1.0, 5.0))
+
+    k_use = int(k_neighbors) if int(k_neighbors) > 0 else len(sims)
+    return _knn_predict_from_sims(
+        u,
+        i,
+        sims,
+        user_ratings,
+        user_means,
+        global_mean,
+        k_use,
+        base_mean=base,
+    )
 
 
 def _build_knn_sim_index(
@@ -1756,6 +1864,24 @@ def _is_cluster_mean_threshold(threshold: RelevanceThreshold) -> bool:
     return threshold == RELEVANCE_THRESHOLD_CLUSTER_MEAN
 
 
+def _compute_item_mean_offsets(
+    train: np.ndarray,
+    global_mean: float,
+) -> dict:
+    """Film ortalaması − global_mean (popülarite ofseti)."""
+    item_sums: dict = {}
+    item_counts: dict = {}
+    for row in train:
+        i, r = int(row[1]), float(row[2])
+        item_sums[i] = item_sums.get(i, 0.0) + r
+        item_counts[i] = item_counts.get(i, 0) + 1
+    return {
+        i: float(item_sums[i] / item_counts[i] - global_mean)
+        for i in item_sums
+        if item_counts[i] > 0
+    }
+
+
 def _compute_cluster_rating_means(
     train: np.ndarray,
     assignments: np.ndarray,
@@ -1902,6 +2028,67 @@ def _compute_topn_metrics(
     )
 
 
+def _compute_topn_jaccard(
+    eval_rows: np.ndarray,
+    top_n: int = 10,
+    threshold: RelevanceThreshold = 4.0,
+    train: Optional[np.ndarray] = None,
+    assignments: Optional[np.ndarray] = None,
+) -> float:
+    """Kullanıcı bazında Top-N öneri ve ilgili öğe kümeleri Jaccard ortalaması."""
+    if eval_rows is None or len(eval_rows) == 0:
+        return float('nan')
+
+    by_user = {}
+    for row in eval_rows:
+        u = int(row[0])
+        i = int(row[1])
+        r_true = float(row[2])
+        r_pred = float(row[3])
+        by_user.setdefault(u, []).append((i, r_true, r_pred))
+
+    users = set(by_user.keys())
+    th = _resolve_relevance_threshold(threshold, train, assignments, users)
+    k = max(1, int(top_n))
+    jaccards = []
+    for u, items in by_user.items():
+        t_u = _user_relevance_threshold(th, u)
+        relevant = {int(i) for i, r_true, _ in items if r_true >= t_u}
+        if not relevant:
+            continue
+        ranked = sorted(items, key=lambda x: x[2], reverse=True)[:k]
+        top_items = {int(i) for i, _, _ in ranked}
+        union = len(top_items | relevant)
+        jaccards.append((len(top_items & relevant) / union) if union > 0 else 0.0)
+
+    if not jaccards:
+        return float('nan')
+    return float(np.mean(jaccards))
+
+
+def _cluster_avg_predict_kwargs(args) -> dict:
+    """run_cluster_average için benzerlik / komşu hiperparametreleri."""
+    if args is None:
+        return {
+            'similarity': 'pearson',
+            'min_common': 3,
+            'sig_weight': 0,
+            'sim_amp': 1.0,
+            'cluster_avg_k_neighbors': 0,
+            'cluster_avg_base': 'user',
+        }
+    # 0 = kümedeki tüm uygun rater'lar (literatür formülü); >0 ise üst sınır.
+    knn_cap = int(getattr(args, 'cluster_avg_k_neighbors', 0) or 0)
+    return {
+        'similarity': str(getattr(args, 'similarity', 'pearson') or 'pearson'),
+        'min_common': int(getattr(args, 'min_common', 3) or 3),
+        'sig_weight': int(getattr(args, 'sig_weight', 0) or 0),
+        'sim_amp': float(getattr(args, 'sim_amp', 1.0) or 1.0),
+        'cluster_avg_k_neighbors': knn_cap,
+        'cluster_avg_base': str(getattr(args, 'cluster_avg_base', 'user') or 'user'),
+    }
+
+
 def _nearest_centroid_bundle(args, assign_dir: str, assignments: np.ndarray) -> dict:
     """--nearest-centroid için centroid yükleme ve kwargs paketi."""
     if args is None or not getattr(args, 'nearest_centroid', False):
@@ -1983,8 +2170,18 @@ def run_cluster_average(train, test, assignments, gray_mask,
                         centroid_metric: str = 'euclidean',
                         cluster_avg_hard: bool = False,
                         cluster_avg_leaky: bool = False,
+                        cluster_mean_impute_train: bool = False,
+                        debug_cluster_avg_hard: bool = False,
+                        debug_cluster_avg_hard_limit: int = 5,
+                        similarity: str = 'cosine',
+                        min_common: int = 3,
+                        sig_weight: int = 0,
+                        sim_amp: float = 1.0,
+                        cluster_avg_k_neighbors: int = 0,
+                        cluster_avg_base: str = 'user',
                         assign_dir: Optional[str] = None):
     t0 = time.time()
+    cluster_avg_base = (cluster_avg_base or 'user').strip().lower()
 
     test_cluster_ids = resolve_test_cluster_ids(
         train, assignments, centroids, nearest_centroid, n_items,
@@ -2010,41 +2207,125 @@ def run_cluster_average(train, test, assignments, gray_mask,
     # Ortalama kaynağı: train (doğru holdout) veya train+test (makale-tipi sızıntı)
     mean_rows = np.vstack([train, test]) if cluster_avg_leaky else train
     n_users = len(assignments)
-    item_sums = np.zeros(n_items, dtype=np.float64)
-    item_counts = np.zeros(n_items, dtype=np.int32)
-    user_sums = np.zeros(n_users, dtype=np.float64)
-    user_counts = np.zeros(n_users, dtype=np.int32)
-    for row in mean_rows:
-        u, i, r = int(row[0]), int(row[1]), float(row[2])
-        cid = int(assignments[u])
-        cluster_item_means[cid, i] += r
-        cluster_item_counts[cid, i] += 1
-        item_sums[i] += r
-        item_counts[i] += 1
-        if u < n_users:
-            user_sums[u] += r
-            user_counts[u] += 1
+    if cluster_mean_impute_train and not cluster_avg_leaky:
+        item_counts = np.zeros(n_items, dtype=np.int32)
+        user_counts = np.zeros(n_users, dtype=np.int32)
+        for row in train:
+            u, i = int(row[0]), int(row[1])
+            item_counts[i] += 1
+            if u < n_users:
+                user_counts[u] += 1
+        (
+            cluster_item_means,
+            cluster_item_counts,
+            global_mean,
+            item_means_arr,
+            user_means_arr,
+        ) = compute_cluster_item_means_imputed(
+            train,
+            assignments,
+            gray_mask,
+            n_items,
+            cluster_avg_hard=cluster_avg_hard,
+        )
+        print(
+            f"  [{algo_label}] küme-ortalama imputation: train eksik hücreler "
+            f"küme ortalamasıyla dolduruldu (2 geçiş)",
+            flush=True,
+        )
+    else:
+        item_sums = np.zeros(n_items, dtype=np.float64)
+        item_counts = np.zeros(n_items, dtype=np.int32)
+        user_sums = np.zeros(n_users, dtype=np.float64)
+        user_counts = np.zeros(n_users, dtype=np.int32)
+        for row in mean_rows:
+            u, i, r = int(row[0]), int(row[1]), float(row[2])
+            cid = int(assignments[u])
+            cluster_item_means[cid, i] += r
+            cluster_item_counts[cid, i] += 1
+            item_sums[i] += r
+            item_counts[i] += 1
+            if u < n_users:
+                user_sums[u] += r
+                user_counts[u] += 1
 
-    # Ortalamaları hesapla; eksik küme-item için fallback (makale: item→user→global)
-    global_mean = float(mean_rows[:, 2].mean())
-    item_means_arr = np.where(
-        item_counts > 0, item_sums / np.maximum(item_counts, 1), global_mean,
-    ).astype(np.float32)
-    user_means_arr = np.where(
-        user_counts > 0, user_sums / np.maximum(user_counts, 1), global_mean,
-    ).astype(np.float32)
-    for cid in range(n_clusters):
-        mask = cluster_item_counts[cid] > 0
-        cluster_item_means[cid, mask] /= cluster_item_counts[cid, mask]
-        if not cluster_avg_hard:
-            cluster_item_means[cid, ~mask] = global_mean
-        else:
-            cluster_item_means[cid, ~mask] = np.nan
+        global_mean = float(mean_rows[:, 2].mean())
+        item_means_arr = np.where(
+            item_counts > 0, item_sums / np.maximum(item_counts, 1), global_mean,
+        ).astype(np.float32)
+        user_means_arr = np.where(
+            user_counts > 0, user_sums / np.maximum(user_counts, 1), global_mean,
+        ).astype(np.float32)
+        for cid in range(n_clusters):
+            mask = cluster_item_counts[cid] > 0
+            cluster_item_means[cid, mask] /= cluster_item_counts[cid, mask]
+            if not cluster_avg_hard:
+                cluster_item_means[cid, ~mask] = global_mean
+            else:
+                cluster_item_means[cid, ~mask] = np.nan
+
+    # ClusterAvg (varsayılan): küme-içi sim ağırlıklı sapma; CalcAvgRating (--cluster-avg-hard) eski düz ortalama.
+    use_weighted_cluster_avg = not cluster_avg_hard
+
+    user_ratings: dict = {}
+    user_means_dict: dict = {}
+    cluster_means_dict: dict = {}
+    item_mean_offsets_dict: dict = {}
+    cluster_users: dict = {}
+    sim_index: dict = {}
+    item_popularity: dict = {}
+
+    if use_weighted_cluster_avg:
+        for row in mean_rows:
+            u_row, i_row, r_row = int(row[0]), int(row[1]), float(row[2])
+            user_ratings.setdefault(u_row, {})[i_row] = r_row
+        for u_row in range(n_users):
+            if user_counts[u_row] > 0:
+                user_means_dict[u_row] = float(user_means_arr[u_row])
+        for u_row in range(n_users):
+            cid_u = int(assignments[u_row])
+            if cid_u < 0:
+                continue
+            cluster_users.setdefault(cid_u, []).append(u_row)
+        cluster_mean_arr = _compute_cluster_rating_means(mean_rows, assignments)
+        cluster_means_dict = {
+            int(cid): float(cluster_mean_arr[cid]) for cid in range(len(cluster_mean_arr))
+        }
+        item_mean_offsets_dict = _compute_item_mean_offsets(mean_rows, global_mean)
+        item_popularity = build_item_popularity(user_ratings=user_ratings)
+        sim_index = _build_knn_sim_index(
+            user_ratings,
+            user_means_dict,
+            item_popularity,
+            similarity=similarity,
+            min_common=min_common,
+            sig_weight=sig_weight,
+            sim_amp=sim_amp,
+        )
+        base_labels = {
+            'user': 'mean_u',
+            'cluster': 'mean_cluster',
+            'cluster_item_pop': 'mean_cluster+item_pop',
+        }
+        base_tag = base_labels.get(cluster_avg_base, cluster_avg_base)
+        print(
+            f"  [{algo_label}] ClusterAvg: küme-içi ağırlıklı tahmin "
+            f"(taban={base_tag}, sim={similarity}, min_common={min_common})",
+            flush=True,
+        )
 
     # Test verisinde tahmin yap
     true_vals, pred_vals = [], []
     gray_true, gray_pred = [], []
     eval_rows = []
+    src_counts = {
+        'weighted_cluster': 0,
+        'cluster_mean': 0,
+        'item_mean': 0,
+        'user_mean': 0,
+        'global_mean': 0,
+    }
+    debug_left = max(int(debug_cluster_avg_hard_limit), 0)
 
     for row in test:
         u, i, r = int(row[0]), int(row[1]), float(row[2])
@@ -2052,25 +2333,111 @@ def run_cluster_average(train, test, assignments, gray_mask,
             w = np.asarray(memberships[u], dtype=np.float64)
             active = w >= SOFT_MEMBERSHIP_THRESHOLD
             if not np.any(active) or float(w[active].sum()) < 1e-8:
-                pred = float(np.clip(
-                    cluster_item_means[int(np.argmax(w)), i], 1.0, 5.0,
-                ))
+                if use_weighted_cluster_avg:
+                    cid_fb = int(np.argmax(w))
+                    pred = _predict_weighted_cluster_avg(
+                        u,
+                        i,
+                        cid_fb,
+                        cluster_users,
+                        user_ratings,
+                        user_means_dict,
+                        cluster_means_dict,
+                        item_mean_offsets_dict,
+                        global_mean,
+                        sim_index,
+                        cluster_avg_base=cluster_avg_base,
+                        similarity=similarity,
+                        item_popularity=item_popularity,
+                        min_common=min_common,
+                        sig_weight=sig_weight,
+                        sim_amp=sim_amp,
+                        k_neighbors=cluster_avg_k_neighbors,
+                    )
+                else:
+                    pred = float(np.clip(
+                        cluster_item_means[int(np.argmax(w)), i], 1.0, 5.0,
+                    ))
             else:
                 w_use = np.where(active, w, 0.0)
                 w_use /= w_use.sum()
-                pred = float(np.clip(np.dot(w_use, cluster_item_means[:, i]), 1.0, 5.0))
+                if use_weighted_cluster_avg:
+                    pred = 0.0
+                    for cid_soft, w_c in enumerate(w_use):
+                        if w_c <= 0.0:
+                            continue
+                        pred += w_c * _predict_weighted_cluster_avg(
+                            u,
+                            i,
+                            int(cid_soft),
+                            cluster_users,
+                            user_ratings,
+                            user_means_dict,
+                            cluster_means_dict,
+                            item_mean_offsets_dict,
+                            global_mean,
+                            sim_index,
+                            cluster_avg_base=cluster_avg_base,
+                            similarity=similarity,
+                            item_popularity=item_popularity,
+                            min_common=min_common,
+                            sig_weight=sig_weight,
+                            sim_amp=sim_amp,
+                            k_neighbors=cluster_avg_k_neighbors,
+                        )
+                else:
+                    pred = float(np.clip(np.dot(w_use, cluster_item_means[:, i]), 1.0, 5.0))
+        elif use_weighted_cluster_avg:
+            cid = int(test_cluster_ids[u])
+            pred = _predict_weighted_cluster_avg(
+                u,
+                i,
+                cid,
+                cluster_users,
+                user_ratings,
+                user_means_dict,
+                cluster_means_dict,
+                item_mean_offsets_dict,
+                global_mean,
+                sim_index,
+                cluster_avg_base=cluster_avg_base,
+                similarity=similarity,
+                item_popularity=item_popularity,
+                min_common=min_common,
+                sig_weight=sig_weight,
+                sim_amp=sim_amp,
+                k_neighbors=cluster_avg_k_neighbors,
+            )
+            src_counts['weighted_cluster'] += 1
         else:
             cid = int(test_cluster_ids[u])
             val = cluster_item_means[cid, i]
+            source = 'cluster_mean'
             if cluster_avg_hard and (np.isnan(val) or cluster_item_counts[cid, i] == 0):
-                if item_counts[i] > 0:
-                    pred = float(item_means_arr[i])
-                elif user_counts[u] > 0:
+                if user_counts[u] > 0:
                     pred = float(user_means_arr[u])
+                    source = 'user_mean'
                 else:
                     pred = global_mean
+                    source = 'global_mean'
             else:
                 pred = float(val if not np.isnan(val) else global_mean)
+                if np.isnan(val):
+                    source = 'global_mean'
+            pred = float(np.clip(pred, 1.0, 5.0))
+            if cluster_avg_hard:
+                src_counts[source] += 1
+                if debug_cluster_avg_hard and debug_left > 0:
+                    cluster_mean_dbg = float(val) if not np.isnan(val) else float('nan')
+                    print(
+                        f"  [{algo_label}] Tahmin kaynağı: source={source}, "
+                        f"mu={pred:.4f}, cluster_mean={cluster_mean_dbg:.4f} "
+                        f"(u={u}, i={i}, cid={cid})",
+                        flush=True,
+                    )
+                    debug_left -= 1
+
+        if use_weighted_cluster_avg or use_soft:
             pred = float(np.clip(pred, 1.0, 5.0))
 
         if gray_mask[u]:
@@ -2090,6 +2457,24 @@ def run_cluster_average(train, test, assignments, gray_mask,
         eval_rows=eval_rows_arr, train=train, assignments=assignments,
     )
     precision, recall, f1, ndcg = _compute_topn_metrics(
+        eval_rows_arr,
+        top_n=top_n,
+        threshold=relevance_threshold,
+        train=train, assignments=assignments,
+    )
+    jaccard = _compute_topn_jaccard(
+        eval_rows_arr,
+        top_n=top_n,
+        threshold=relevance_threshold,
+        train=train, assignments=assignments,
+    )
+    jaccard = _compute_topn_jaccard(
+        eval_rows_arr,
+        top_n=top_n,
+        threshold=relevance_threshold,
+        train=train, assignments=assignments,
+    )
+    jaccard = _compute_topn_jaccard(
         eval_rows_arr,
         top_n=top_n,
         threshold=relevance_threshold,
@@ -2116,15 +2501,29 @@ def run_cluster_average(train, test, assignments, gray_mask,
         scenario = 'calc_avg_rating_nc' if use_nc else 'calc_avg_rating'
         tag = 'CalcAvgRating'
     else:
-        scenario = 'cluster_avg_nc' if use_nc else 'cluster_avg'
+        base_scenario = {
+            'user': 'cluster_avg',
+            'cluster': 'cluster_avg_cmean',
+            'cluster_item_pop': 'cluster_avg_cmean_itempop',
+        }.get(cluster_avg_base, 'cluster_avg')
+        scenario = f'{base_scenario}_nc' if use_nc else base_scenario
         tag = 'ClusterAvg'
     leak_note = ' [train+test ort.]' if cluster_avg_leaky else ''
     print(
         f"  [{algo_label} | {tag}{'+NC' if use_nc else ''}{leak_note}] "
         f"MAE={mae:.4f} RMSE={rmse:.4f} | "
-        f"P@10={precision:.4f} R@10={recall:.4f} NDCG@10={ndcg:.4f} | "
+        f"P@10={precision:.4f} R@10={recall:.4f} NDCG@10={ndcg:.4f} J@10={jaccard:.4f} | "
         f"Gray MAE={gray_mae:.4f} ({elapsed:.1f}s)",
     )
+    if cluster_avg_hard:
+        print(
+            f"  [{algo_label} | {tag}] kaynak dağılımı: "
+            f"cluster_mean={src_counts['cluster_mean']} "
+            f"item_mean={src_counts['item_mean']} "
+            f"user_mean={src_counts['user_mean']} "
+            f"global_mean={src_counts['global_mean']}",
+            flush=True,
+        )
 
     return {
         'scenario'    : scenario,
@@ -2148,6 +2547,7 @@ def run_cluster_average(train, test, assignments, gray_mask,
         'recall_at_10'    : recall,
         'f1_at_10'        : f1,
         'ndcg_at_10'      : ndcg,
+        'jaccard_at_10'   : jaccard,
     }
 
 
@@ -2210,7 +2610,7 @@ def knn_user_similarity(
     sig_threshold: int = 0,
     sim_amp: float = 1.0,
 ) -> float:
-    """kNN kullanıcı–kullanıcı benzerliği: pearson | pearson_iuf | cosine."""
+    """kNN kullanıcı–kullanıcı benzerliği: pearson | pearson_iuf | cosine | msd."""
     u_items = set(user_ratings.get(ua, {}).keys())
     v_items = set(user_ratings.get(va, {}).keys())
     common = list(u_items & v_items)
@@ -2224,6 +2624,11 @@ def knn_user_similarity(
         if denom < 1e-8:
             return 0.0
         return float(np.clip(np.dot(u_r, v_r) / denom, 0.0, 1.0))
+
+    if similarity == 'msd':
+        return _msd_user_similarity(
+            ua, va, user_ratings, min_common=min_common,
+        )
 
     if similarity not in ('pearson', 'pearson_iuf'):
         raise ValueError(f"desteklenmeyen similarity: {similarity}")
@@ -2301,18 +2706,21 @@ def _fit_surprise_knn_algo(
     min_common: int,
     reader=None,
 ):
-    """Tek rating alt-kümesi: Surprise KNNBaseline veya KNNWithMeans."""
+    """Tek rating alt-kümesi: Surprise KNNBaseline / KNNWithMeans / CoClustering."""
     variant = (knn_variant or 'baseline').strip().lower()
     use_baseline = variant in ('baseline', 'knnbaseline', 'knn_baseline')
+    use_coclustering = variant in ('coclustering', 'co_clustering', 'co-clustering')
 
     try:
         from surprise import Reader
-        if use_baseline:
+        if use_coclustering:
+            from surprise import CoClustering as AlgoCls
+        elif use_baseline:
             from surprise import KNNBaseline as AlgoCls
         else:
             from surprise import KNNWithMeans as AlgoCls
     except ImportError:
-        if use_baseline:
+        if use_baseline or use_coclustering:
             return None
         return _fit_local_knn_with_means(
             rows,
@@ -2327,13 +2735,24 @@ def _fit_surprise_knn_algo(
         return None
 
     trainset = _numpy_ratings_to_surprise_trainset(rows, reader)
-    algo = AlgoCls(
-        k=max(1, int(k_neighbors)),
-        sim_options=_surprise_sim_options(
-            similarity, min_common, baseline=use_baseline,
-        ),
-        verbose=False,
-    )
+    if use_coclustering:
+        n_u = len(np.unique(rows[:, 0].astype(np.int64)))
+        n_i = len(np.unique(rows[:, 1].astype(np.int64)))
+        algo = AlgoCls(
+            n_cltr_u=max(2, min(20, int(np.sqrt(max(n_u, 1))))),
+            n_cltr_i=max(2, min(20, int(np.sqrt(max(n_i, 1))))),
+            n_epochs=20,
+            random_state=42,
+            verbose=False,
+        )
+    else:
+        algo = AlgoCls(
+            k=max(1, int(k_neighbors)),
+            sim_options=_surprise_sim_options(
+                similarity, min_common, baseline=use_baseline,
+            ),
+            verbose=False,
+        )
     algo.fit(trainset)
     return algo
 
@@ -2433,6 +2852,8 @@ def _resolve_cluster_surprise_sim(similarity: str, knn_variant: str) -> str:
     """Cluster Surprise yolu: baseline modunda pearson -> pearson_baseline."""
     s = (similarity or 'pearson').strip().lower()
     variant = (knn_variant or 'baseline').strip().lower()
+    if variant in ('coclustering', 'co_clustering', 'co-clustering'):
+        return s
     if variant in ('baseline', 'knnbaseline', 'knn_baseline'):
         if s in ('pearson', 'pearson_iuf', 'pearson_baseline'):
             return 'pearson_baseline'
@@ -2678,6 +3099,8 @@ def _predict_full_soft_knn(
 
 def run_cluster_knn(train, test, assignments, gray_mask, memberships,
                     n_items, algo_label,
+                    user_features=None,
+                    use_latent_similarity: bool = False,
                     similarity: str = 'pearson',
                     min_common: int = 3,
                     k_neighbors: int = 30,
@@ -2857,7 +3280,20 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
     )
 
     backend_norm = (cluster_knn_backend or 'surprise').strip().lower()
+    use_native_backend = backend_norm in (
+        'native', 'cluster_predictor', 'baseline_native',
+    )
     use_manual_backend = backend_norm in ('manual', 'legacy', 'pearson')
+    if use_native_backend and (
+        use_weighted_cluster or use_full_soft or expand_knn
+    ):
+        print(
+            f"  [{algo_label}] uyarı: --cluster-knn-backend native, "
+            f"weighted_cluster/full_soft/expand-knn ile uyumsuz; manual kullanılıyor.",
+            flush=True,
+        )
+        use_native_backend = False
+        use_manual_backend = True
     use_legacy_knn = (
         use_manual_backend
         or bool(expand_knn)
@@ -2868,9 +3304,288 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
     use_baseline_surprise = surprise_variant in (
         'baseline', 'knnbaseline', 'knn_baseline',
     )
-    surprise_label = 'KNNBaseline' if use_baseline_surprise else 'KNNWithMeans'
+    use_coclustering_surprise = surprise_variant in (
+        'coclustering', 'co_clustering', 'co-clustering',
+    )
+    if use_coclustering_surprise:
+        surprise_label = 'CoClustering'
+    else:
+        surprise_label = 'KNNBaseline' if use_baseline_surprise else 'KNNWithMeans'
     cluster_kwm_models = None
     global_kwm_model = None
+    if use_latent_similarity and user_features is not None:
+        from sklearn.preprocessing import normalize
+
+        U = np.asarray(user_features, dtype=np.float64)
+        if U.shape[0] < n_users:
+            print(
+                f"  [{algo_label}] uyarı: user_features satır sayısı ({U.shape[0]}) "
+                f"kullanıcı sayısından ({n_users}) az; latent kNN atlanıyor.",
+                flush=True,
+            )
+        else:
+            U_norm = normalize(U, norm='l2')
+
+            latent_sim_index = {}
+            for u in range(n_users):
+                cid = int(assignments[u])
+                neighbors = cluster_users.get(cid, [])
+                sims = []
+                for v in neighbors:
+                    if v == u:
+                        continue
+                    sim = float(np.dot(U_norm[u], U_norm[v]))
+                    if sim > 0:
+                        sims.append((sim, v))
+                sims.sort(key=lambda x: -x[0])
+                latent_sim_index[u] = sims
+
+            print(
+                f"  [{algo_label}] tahmin: latent uzay kNN "
+                f"(k={k_neighbors}, küme-içi cosine)",
+                flush=True,
+            )
+
+            true_vals, pred_vals = [], []
+            gray_true, gray_pred = [], []
+            eval_rows = []
+            for row in test:
+                u, i, r = int(row[0]), int(row[1]), float(row[2])
+                neighbors = [
+                    (s, v) for s, v in latent_sim_index.get(u, [])
+                    if i in user_ratings.get(v, {})
+                ][:k_neighbors]
+
+                base = float(user_means.get(u, global_mean))
+                if not neighbors:
+                    pred = base
+                else:
+                    num = sum(
+                        s * (user_ratings[v][i] - user_means.get(v, global_mean))
+                        for s, v in neighbors
+                    )
+                    den = sum(abs(s) for s, _ in neighbors)
+                    pred = float(np.clip(
+                        base + (num / den if den > 1e-8 else 0),
+                        1.0, 5.0,
+                    ))
+
+                if gray_mask[u]:
+                    gray_true.append(r)
+                    gray_pred.append(pred)
+                else:
+                    true_vals.append(r)
+                    pred_vals.append(pred)
+                eval_rows.append((u, i, r, pred))
+
+            all_true = true_vals + gray_true
+            all_pred = pred_vals + gray_pred
+            mae, rmse = _compute_metrics(all_true, all_pred)
+            eval_rows_arr = np.array(eval_rows, dtype=np.float32)
+            accuracy = _compute_binary_accuracy(
+                all_true, all_pred, threshold=relevance_threshold,
+                eval_rows=eval_rows_arr, train=train, assignments=assignments,
+            )
+
+            gray_mae, gray_rmse = float('nan'), float('nan')
+            if gray_true:
+                gray_errors = np.array(gray_true) - np.array(gray_pred)
+                gray_mae = float(np.mean(np.abs(gray_errors)))
+                gray_rmse = float(np.sqrt(np.mean(gray_errors ** 2)))
+
+            white_mae, white_rmse = _compute_metrics(true_vals, pred_vals)
+            precision, recall, f1, ndcg = _compute_topn_metrics(
+                eval_rows_arr,
+                top_n=top_n,
+                threshold=relevance_threshold,
+                train=train, assignments=assignments,
+            )
+            jaccard = _compute_topn_jaccard(
+                eval_rows_arr,
+                top_n=top_n,
+                threshold=relevance_threshold,
+                train=train, assignments=assignments,
+            )
+
+            elapsed = time.time() - t0
+            _knn_tag = 'ClusterKNN-latent'
+            _scenario = 'cluster_knn_latent'
+            _knn_mode_out = 'cluster_latent'
+            if n_gray > 0:
+                _knn_tag += '+GSsplit'
+                _scenario = 'cluster_knn_latent_gs_split'
+            print(
+                f"  [{algo_label} | {_knn_tag}|latent|k={k_neighbors}] "
+                f"MAE={mae:.4f} RMSE={rmse:.4f} | "
+                f"P@10={precision:.4f} R@10={recall:.4f} NDCG@10={ndcg:.4f} J@10={jaccard:.4f} | "
+                f"Gray MAE={gray_mae:.4f} ({elapsed:.1f}s)",
+            )
+
+            out = {
+                'scenario': _scenario,
+                'algo_label': algo_label,
+                'mae': mae,
+                'rmse': rmse,
+                'gray_mae': gray_mae,
+                'gray_rmse': gray_rmse,
+                'white_mae': white_mae,
+                'white_rmse': white_rmse,
+                'n_clusters': int(assignments.max()) + 1,
+                'n_train': len(train),
+                'n_test': len(test),
+                'time_seconds': elapsed,
+                'cluster_mae_std': float('nan'),
+                'cluster_mae_mean': float('nan'),
+                'cluster_mae_min': float('nan'),
+                'cluster_mae_max': float('nan'),
+                'accuracy': accuracy,
+                'precision_at_10': precision,
+                'recall_at_10': recall,
+                'f1_at_10': f1,
+                'ndcg_at_10': ndcg,
+                'jaccard_at_10': jaccard,
+                'similarity': 'latent',
+                'k_neighbors': k_neighbors,
+                'knn_mode': _knn_mode_out,
+                'cluster_weight_alpha': float('nan'),
+                'cluster_weight_alpha_mode': '',
+                'cluster_weight_base': float('nan'),
+            }
+            if return_eval_rows:
+                out['eval_rows'] = eval_rows_arr
+            return out
+    elif use_latent_similarity and user_features is None:
+        print(
+            f"  [{algo_label}] uyarı: --use-latent-similarity açık ama "
+            f"user_features.npy yok; standart kNN kullanılıyor.",
+            flush=True,
+        )
+
+    if use_native_backend:
+        from cluster_predictor import (
+            ClusterPredictor,
+            build_rating_matrix,
+            map_wnmf_similarity,
+        )
+
+        native_sim = map_wnmf_similarity(similarity)
+        R_train = build_rating_matrix(train, n_users, n_items)
+        native_pred = ClusterPredictor(
+            k_neighbors=k_neighbors,
+            sim_metric=native_sim,
+            min_support=min_common,
+        )
+        native_pred.fit(R_train, assignments)
+        print(
+            f"  [{algo_label}] tahmin: native küme kNN "
+            f"(sim={native_sim}, k={k_neighbors}, min_support={min_common})",
+            flush=True,
+        )
+
+        def _predict_global_knn_native(u, i):
+            neighbors = [
+                (s, v) for s, v in global_sim_index.get(u, [])
+                if i in user_ratings.get(v, {})
+            ]
+            return _knn_predict_from_sims(
+                u, i, neighbors, user_ratings, user_means, global_mean, k_neighbors,
+            )
+
+        true_vals, pred_vals = [], []
+        gray_true, gray_pred = [], []
+        eval_rows = []
+        for row in test:
+            u, i, r = int(row[0]), int(row[1]), float(row[2])
+            if gray_mask[u]:
+                pr = _predict_global_knn_native(u, i)
+            else:
+                pr = native_pred.predict(u, i)
+
+            if gray_mask[u]:
+                gray_true.append(r)
+                gray_pred.append(pr)
+            else:
+                true_vals.append(r)
+                pred_vals.append(pr)
+            eval_rows.append((u, i, r, pr))
+
+        all_true = true_vals + gray_true
+        all_pred = pred_vals + gray_pred
+        mae, rmse = _compute_metrics(all_true, all_pred)
+        eval_rows_arr = np.array(eval_rows, dtype=np.float32)
+        accuracy = _compute_binary_accuracy(
+            all_true, all_pred, threshold=relevance_threshold,
+            eval_rows=eval_rows_arr, train=train, assignments=assignments,
+        )
+
+        gray_mae, gray_rmse = float('nan'), float('nan')
+        if gray_true:
+            gray_errors = np.array(gray_true) - np.array(gray_pred)
+            gray_mae = float(np.mean(np.abs(gray_errors)))
+            gray_rmse = float(np.sqrt(np.mean(gray_errors ** 2)))
+
+        white_mae, white_rmse = _compute_metrics(true_vals, pred_vals)
+        precision, recall, f1, ndcg = _compute_topn_metrics(
+            eval_rows_arr,
+            top_n=top_n,
+            threshold=relevance_threshold,
+            train=train, assignments=assignments,
+        )
+        jaccard = _compute_topn_jaccard(
+            eval_rows_arr,
+            top_n=top_n,
+            threshold=relevance_threshold,
+            train=train, assignments=assignments,
+        )
+
+        elapsed = time.time() - t0
+        _knn_tag = 'ClusterKNN-native'
+        _scenario = 'cluster_knn_native_baseline'
+        _knn_mode_out = 'cluster_native'
+        if n_gray > 0:
+            _knn_tag += '+GSsplit'
+            _scenario = 'cluster_knn_native_baseline_gs_split'
+        print(
+            f"  [{algo_label} | {_knn_tag}|{native_sim}|k={k_neighbors}] "
+            f"MAE={mae:.4f} RMSE={rmse:.4f} | "
+            f"P@10={precision:.4f} R@10={recall:.4f} NDCG@10={ndcg:.4f} J@10={jaccard:.4f} | "
+            f"Gray MAE={gray_mae:.4f} ({elapsed:.1f}s)",
+        )
+
+        out = {
+            'scenario': _scenario,
+            'algo_label': algo_label,
+            'mae': mae,
+            'rmse': rmse,
+            'gray_mae': gray_mae,
+            'gray_rmse': gray_rmse,
+            'white_mae': white_mae,
+            'white_rmse': white_rmse,
+            'n_clusters': int(assignments.max()) + 1,
+            'n_train': len(train),
+            'n_test': len(test),
+            'time_seconds': elapsed,
+            'cluster_mae_std': float('nan'),
+            'cluster_mae_mean': float('nan'),
+            'cluster_mae_min': float('nan'),
+            'cluster_mae_max': float('nan'),
+            'accuracy': accuracy,
+            'precision_at_10': precision,
+            'recall_at_10': recall,
+            'f1_at_10': f1,
+            'ndcg_at_10': ndcg,
+            'jaccard_at_10': jaccard,
+            'similarity': native_sim,
+            'k_neighbors': k_neighbors,
+            'knn_mode': _knn_mode_out,
+            'cluster_weight_alpha': float('nan'),
+            'cluster_weight_alpha_mode': '',
+            'cluster_weight_base': float('nan'),
+        }
+        if return_eval_rows:
+            out['eval_rows'] = eval_rows_arr
+        return out
+
     if not use_legacy_knn:
         cluster_kwm_models, global_kwm_model, _ = _build_cluster_surprise_knn_models(
             train,
@@ -3104,10 +3819,20 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
         threshold=relevance_threshold,
         train=train, assignments=assignments,
     )
+    jaccard = _compute_topn_jaccard(
+        eval_rows_arr,
+        top_n=top_n,
+        threshold=relevance_threshold,
+        train=train, assignments=assignments,
+    )
 
     elapsed = time.time() - t0
     if not use_legacy_knn:
-        if use_baseline_surprise:
+        if use_coclustering_surprise:
+            _knn_tag = 'ClusterCoClustering'
+            _scenario = 'cluster_coclustering'
+            _knn_mode_out = 'cluster_coclustering'
+        elif use_baseline_surprise:
             _knn_tag = 'ClusterKNNBaseline'
             _scenario = 'cluster_knn_baseline'
             _knn_mode_out = 'cluster_knb'
@@ -3153,7 +3878,7 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
     print(
         f"  [{algo_label} | {_knn_tag}|{similarity}|k={k_neighbors}] "
         f"MAE={mae:.4f} RMSE={rmse:.4f} | "
-        f"P@10={precision:.4f} R@10={recall:.4f} NDCG@10={ndcg:.4f} | "
+        f"P@10={precision:.4f} R@10={recall:.4f} NDCG@10={ndcg:.4f} J@10={jaccard:.4f} | "
         f"Gray MAE={gray_mae:.4f} ({elapsed:.1f}s)",
     )
 
@@ -3179,6 +3904,7 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
         'recall_at_10'    : recall,
         'f1_at_10'        : f1,
         'ndcg_at_10'      : ndcg,
+        'jaccard_at_10'   : jaccard,
         'similarity'      : similarity,
         'k_neighbors'     : k_neighbors,
         'knn_mode'        : _knn_mode_out,
@@ -3740,6 +4466,10 @@ def run_cluster_knn_fusion(
             train=train, assignments=user_assignments,
         )
         user_recs = {}
+    jaccard = _compute_topn_jaccard(
+        eval_rows_arr, top_n=top_n, threshold=relevance_threshold,
+        train=train, assignments=user_assignments,
+    )
 
     coverage_val = float('nan')
     diversity_val = float('nan')
@@ -3789,6 +4519,7 @@ def run_cluster_knn_fusion(
         'recall_at_10'    : recall,
         'f1_at_10'        : f1,
         'ndcg_at_10'      : ndcg,
+        'jaccard_at_10'   : jaccard,
         'similarity'      : similarity,
         'k_neighbors'     : k_user,
         'k_neighbors_item': k_item,
@@ -3860,6 +4591,70 @@ def _compute_metrics(true_list, pred_list):
     return float(np.mean(np.abs(errors))), float(np.sqrt(np.mean(errors ** 2)))
 
 
+def compute_wcss(user_matrix: np.ndarray, assignments: np.ndarray) -> float:
+    """
+    Kullanıcı vektörleri üzerinde klasik WCSS (within-cluster sum of squares).
+    Geçersiz küme id'leri (<0) hesaplamaya katılmaz.
+    """
+    if user_matrix is None or assignments is None:
+        return float('nan')
+    if len(assignments) == 0 or user_matrix.shape[0] == 0:
+        return float('nan')
+
+    n = min(int(user_matrix.shape[0]), int(len(assignments)))
+    X = np.asarray(user_matrix[:n], dtype=np.float64)
+    a = np.asarray(assignments[:n], dtype=np.int64)
+    valid = a >= 0
+    if not np.any(valid):
+        return float('nan')
+
+    Xv = X[valid]
+    av = a[valid]
+    wcss = 0.0
+    for cid in np.unique(av):
+        m = av == cid
+        Xi = Xv[m]
+        if Xi.shape[0] <= 1:
+            continue
+        centroid = Xi.mean(axis=0, dtype=np.float64)
+        diff = Xi - centroid
+        wcss += float(np.einsum('ij,ij->', diff, diff))
+    return float(wcss)
+
+
+def _print_assignment_diagnostics(
+    algo_label: str,
+    assignments: np.ndarray,
+    user_features: Optional[np.ndarray],
+) -> None:
+    """Assignment kalite/dağılım tanı logları."""
+    a = np.asarray(assignments, dtype=np.int64)
+    valid = a[a >= 0]
+    if valid.size == 0:
+        print(f"  [{algo_label}] Assignment diag: geçerli küme etiketi yok.", flush=True)
+        return
+
+    sizes = np.bincount(valid)
+    print(
+        f"  [{algo_label}] Cluster size: min={int(sizes.min())} "
+        f"max={int(sizes.max())} std={float(sizes.std()):.1f}",
+        flush=True,
+    )
+
+    if user_features is None:
+        print(
+            f"  [{algo_label}] WCSS: user_features yok (hesap atlandı).",
+            flush=True,
+        )
+        return
+
+    wcss = compute_wcss(np.asarray(user_features), a)
+    if np.isnan(wcss):
+        print(f"  [{algo_label}] WCSS: hesaplanamadi.", flush=True)
+    else:
+        print(f"  [{algo_label}] WCSS={wcss:.2f}", flush=True)
+
+
 # ============================================================
 # ALGO-DÜZEYİNDE PARALEL WORKER
 # ============================================================
@@ -3909,6 +4704,7 @@ def _mp_run_algo_job(job):
 
     expand_knn = bool(getattr(mp_args, 'expand_knn', False))
     knn_mode = str(getattr(mp_args, 'knn_mode', 'cluster') or 'cluster')
+    use_latent_similarity = bool(getattr(mp_args, 'use_latent_similarity', False))
     surprise_knn_variant = str(
         getattr(mp_args, 'cluster_knn_variant', 'baseline') or 'baseline'
     )
@@ -3922,8 +4718,20 @@ def _mp_run_algo_job(job):
         _knv = list(knn_spec)
 
     try:
+        n_users_expected = int(max(train[:, 0].max(), test[:, 0].max())) + 1
         assignments, gray_mask = load_assignment(assign_dir)
         memberships = load_memberships(assign_dir)
+        user_features = load_user_features(assign_dir, len(assignments))
+        assignments, gray_mask, memberships, user_features = _align_assignment_bundle(
+            assignments,
+            gray_mask,
+            memberships,
+            user_features,
+            n_users_expected=n_users_expected,
+            algo_label=label,
+            assign_dir=assign_dir,
+        )
+        _print_assignment_diagnostics(label, assignments, user_features)
         rows: List[dict] = []
 
         if run_cluster_avg_flag:
@@ -3934,7 +4742,17 @@ def _mp_run_algo_job(job):
                 relevance_threshold=relevance_threshold,
                 cluster_avg_hard=bool(getattr(mp_args, 'cluster_avg_hard', False)),
                 cluster_avg_leaky=bool(getattr(mp_args, 'cluster_avg_leaky', False)),
+                cluster_mean_impute_train=bool(
+                    getattr(mp_args, 'cluster_mean_impute_train', False)
+                ),
+                debug_cluster_avg_hard=bool(
+                    getattr(mp_args, 'debug_cluster_avg_hard', False)
+                ),
+                debug_cluster_avg_hard_limit=int(
+                    getattr(mp_args, 'debug_cluster_avg_hard_limit', 5) or 5
+                ),
                 assign_dir=assign_dir,
+                **_cluster_avg_predict_kwargs(mp_args),
                 **nc,
             )
             row['dataset'] = dataset_name
@@ -3945,6 +4763,8 @@ def _mp_run_algo_job(job):
             for kv in _knv:
                 row = run_cluster_knn(
                     train, test, assignments, gray_mask, memberships, n_items, label,
+                    user_features=user_features,
+                    use_latent_similarity=use_latent_similarity,
                     similarity=similarity,
                     min_common=min_common,
                     k_neighbors=int(kv),
@@ -3999,6 +4819,63 @@ def _mp_run_algo_job(job):
               + "".join(f"    {l}" for l in traceback.format_exc().splitlines(keepends=True)),
               flush=True)
         return label, []
+
+
+def _align_assignment_bundle(
+    assignments: np.ndarray,
+    gray_mask: np.ndarray,
+    memberships: Optional[np.ndarray],
+    user_features: Optional[np.ndarray],
+    *,
+    n_users_expected: int,
+    algo_label: str,
+    assign_dir: str,
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
+    """
+    Prune ile üretilmiş assignment'lar kullanıcı sayısını düşürebilir.
+    Eval tarafında user-id uzayı tam (0..N-1) beklendiği için dizileri güvenli şekilde
+    hizala: eksik kullanıcıları gray/fallback yap, fazla satırları kırp.
+    """
+    cur_n = int(len(assignments))
+    exp_n = int(n_users_expected)
+    if cur_n == exp_n:
+        return assignments, gray_mask, memberships, user_features
+
+    print(
+        f"  [{algo_label}] Not: assignment user sayısı ({cur_n}) "
+        f"eval kullanıcı sayısından ({exp_n}) farklı; "
+        f"eksik kullanıcılar gray/fallback ile hizalanıyor. ({assign_dir})",
+        flush=True,
+    )
+
+    if cur_n < exp_n:
+        pad = exp_n - cur_n
+        assignments = np.pad(assignments, (0, pad), mode='constant', constant_values=-1)
+        gray_mask = np.pad(gray_mask, (0, pad), mode='constant', constant_values=True)
+        if memberships is not None:
+            if memberships.ndim == 1:
+                memberships = memberships[:, None]
+            memberships = np.pad(
+                memberships, ((0, pad), (0, 0)),
+                mode='constant', constant_values=0.0
+            )
+        if user_features is not None:
+            if user_features.ndim == 1:
+                user_features = user_features[:, None]
+            user_features = np.pad(
+                user_features, ((0, pad), (0, 0)),
+                mode='constant', constant_values=0.0
+            )
+        return assignments, gray_mask, memberships, user_features
+
+    # cur_n > exp_n
+    assignments = assignments[:exp_n]
+    gray_mask = gray_mask[:exp_n]
+    if memberships is not None:
+        memberships = memberships[:exp_n]
+    if user_features is not None:
+        user_features = user_features[:exp_n]
+    return assignments, gray_mask, memberships, user_features
 
 
 
@@ -4452,8 +5329,20 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
                 _save_row_to_db(dataset_name, row, k_used, args, fold_override=fold)
     else:
         for label, assign_dir in active_algos:
+            n_users_expected = int(max(train[:, 0].max(), test[:, 0].max())) + 1
             assignments, gray_mask = load_assignment(assign_dir)
             memberships = load_memberships(assign_dir)
+            user_features = load_user_features(assign_dir, len(assignments))
+            assignments, gray_mask, memberships, user_features = _align_assignment_bundle(
+                assignments,
+                gray_mask,
+                memberships,
+                user_features,
+                n_users_expected=n_users_expected,
+                algo_label=label,
+                assign_dir=assign_dir,
+            )
+            _print_assignment_diagnostics(label, assignments, user_features)
             nc = _nearest_centroid_bundle(args, assign_dir, assignments)
 
             if run_cluster_avg:
@@ -4463,7 +5352,17 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
                     relevance_threshold=relevance_threshold,
                     cluster_avg_hard=bool(getattr(args, 'cluster_avg_hard', False)),
                     cluster_avg_leaky=bool(getattr(args, 'cluster_avg_leaky', False)),
+                    cluster_mean_impute_train=bool(
+                        getattr(args, 'cluster_mean_impute_train', False)
+                    ),
+                    debug_cluster_avg_hard=bool(
+                        getattr(args, 'debug_cluster_avg_hard', False)
+                    ),
+                    debug_cluster_avg_hard_limit=int(
+                        getattr(args, 'debug_cluster_avg_hard_limit', 5) or 5
+                    ),
                     assign_dir=assign_dir,
+                    **_cluster_avg_predict_kwargs(args),
                     **nc,
                 )
                 row['dataset'] = dataset_name
@@ -4482,6 +5381,10 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
                 for kv in knn_vals:
                     row = run_cluster_knn(
                         train, test, assignments, gray_mask, memberships, n_items, label,
+                        user_features=user_features,
+                        use_latent_similarity=bool(
+                            getattr(args, 'use_latent_similarity', False)
+                        ) if args else False,
                         similarity=similarity,
                         min_common=min_common,
                         k_neighbors=int(kv),
@@ -4647,6 +5550,8 @@ _CLUSTER_KNN_SCENARIOS = (
     'cluster_knn_with_means_gs_split',
     'cluster_knn_baseline',
     'cluster_knn_baseline_gs_split',
+    'cluster_knn_native_baseline',
+    'cluster_knn_native_baseline_gs_split',
 )
 
 
@@ -4656,6 +5561,7 @@ _COMPARE_METRIC_ROWS = (
     ('precision_at_10', 'Prec@10'),
     ('recall_at_10', 'Rec@10'),
     ('ndcg_at_10', 'NDCG@10'),
+    ('jaccard_at_10', 'Jacc@10'),
 )
 
 
@@ -4786,17 +5692,17 @@ def _print_summary(results, dataset_name):
             f"{'tag':<36} {'Algoritma':<16} {'Senaryo':<14} {_kpref}"
             f"{'MAE':>8} {'RMSE':>8} "
             f"{'ClStd':>8} {'GS MAE':>8} {'Wh MAE':>8} "
-            f"{'Acc':>8} {'Prec':>8} {'Rec':>8} {'F1':>8} {'NDCG':>8}"
+            f"{'Acc':>8} {'Prec':>8} {'Rec':>8} {'F1':>8} {'NDCG':>8} {'Jacc':>8}"
         )
-        w = 36 + 16 + 14 + len(_kpref) + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 6
+        w = 36 + 16 + 14 + len(_kpref) + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 6
     else:
         print(
             f"{'Algoritma':<20} {'Senaryo':<16} {_kpref}"
             f"{'MAE':>8} {'RMSE':>8} "
             f"{'ClStd':>8} {'GS MAE':>8} {'Wh MAE':>8} "
-            f"{'Acc':>8} {'Prec':>8} {'Rec':>8} {'F1':>8} {'NDCG':>8}"
+            f"{'Acc':>8} {'Prec':>8} {'Rec':>8} {'F1':>8} {'NDCG':>8} {'Jacc':>8}"
         )
-        w = 72 + len(_kpref) + 8 + 8 + 8 + 8 + 8
+        w = 72 + len(_kpref) + 8 + 8 + 8 + 8 + 8 + 8
     print("-" * max(w, 72))
 
     for r in results:
@@ -4814,6 +5720,8 @@ def _print_summary(results, dataset_name):
         f1_str = f"{f1v:.4f}" if not (isinstance(f1v, float) and np.isnan(f1v)) else "  —  "
         nd = r.get('ndcg_at_10', float('nan'))
         nd_str = f"{nd:.4f}" if not (isinstance(nd, float) and np.isnan(nd)) else "  —  "
+        jc = r.get('jaccard_at_10', float('nan'))
+        jc_str = f"{jc:.4f}" if not (isinstance(jc, float) and np.isnan(jc)) else "  —  "
         cms = r.get('cluster_mae_std', float('nan'))
         cms_str = (
             f"{cms:.4f}"
@@ -4836,7 +5744,8 @@ def _print_summary(results, dataset_name):
                 f"{pr_str:>8} "
                 f"{rc_str:>8} "
                 f"{f1_str:>8} "
-                f"{nd_str:>8}"
+                f"{nd_str:>8} "
+                f"{jc_str:>8}"
             )
         else:
             print(
@@ -4852,7 +5761,8 @@ def _print_summary(results, dataset_name):
                 f"{pr_str:>8} "
                 f"{rc_str:>8} "
                 f"{f1_str:>8} "
-                f"{nd_str:>8}"
+                f"{nd_str:>8} "
+                f"{jc_str:>8}"
             )
     print("=" * 72)
 
@@ -4895,7 +5805,7 @@ def _aggregate_fold_results(rows: List[dict], n_splits: int) -> List[dict]:
         base['fold_rmse_values'] = ';'.join(f"{v:.6f}" for v in rmses)
         base['mean_mae'] = float(np.mean(maes))
         base['mean_rmse'] = float(np.mean(rmses))
-        for metric_key in ('precision_at_10', 'recall_at_10', 'f1_at_10', 'ndcg_at_10'):
+        for metric_key in ('precision_at_10', 'recall_at_10', 'f1_at_10', 'ndcg_at_10', 'jaccard_at_10'):
             vals = [float(r.get(metric_key, np.nan)) for r in group_rows]
             if np.all(np.isnan(vals)):
                 base[metric_key] = float('nan')
@@ -5099,10 +6009,36 @@ def parse_args():
              'soft membership yok (senaryo: calc_avg_rating).',
     )
     p.add_argument(
+        '--cluster-avg-base',
+        choices=['user', 'cluster', 'cluster_item_pop'],
+        default='user',
+        help='ClusterAvg taban: user=mean_u (varsayılan); cluster=mean_cluster(cid); '
+             'cluster_item_pop=mean_cluster+(mean_item-global_mean).',
+    )
+    p.add_argument(
         '--cluster-avg-leaky',
         action='store_true',
         help='Küme-item ortalamasını train+test ile hesapla (makale-tipi sızıntı; '
              'senaryo: calc_avg_rating_leaky). Tahmin yine test çiftlerinde.',
+    )
+    p.add_argument(
+        '--cluster-mean-impute-train',
+        action='store_true',
+        help='ClusterAvg: train eksik (u,i) hücrelerini küme ortalamasıyla doldurup '
+             'küme×item ortalamasını yeniden hesapla (2 geçiş).',
+    )
+    p.add_argument(
+        '--debug-cluster-avg-hard',
+        action='store_true',
+        help='calc_avg_rating sırasında tahmin kaynağını (cluster/item/user/global) '
+             'satır bazında kısa örneklerle logla.',
+    )
+    p.add_argument(
+        '--debug-cluster-avg-hard-limit',
+        type=int,
+        default=5,
+        help='--debug-cluster-avg-hard için algoritma başına maksimum örnek log satırı '
+             '(varsayılan: 5).',
     )
     p.add_argument(
         '--no-cluster-knn', action='store_true',
@@ -5129,9 +6065,10 @@ def parse_args():
     )
     p.add_argument(
         '--similarity',
-        choices=['pearson', 'pearson_iuf', 'cosine'],
+        choices=['pearson', 'pearson_iuf', 'cosine', 'msd'],
         default='pearson',
-        help='kNN benzerlik: pearson (default), pearson_iuf (IUF ağırlıklı), cosine'
+        help='kNN benzerlik: pearson (default), pearson_iuf (IUF ağırlıklı), cosine, '
+             'msd (Surprise MSD; küme Surprise kNN ile önerilir)',
     )
     p.add_argument(
         '--knn', nargs='+', type=int, default=[30], metavar='K',
@@ -5141,20 +6078,29 @@ def parse_args():
     )
     p.add_argument(
         '--cluster-knn-variant',
-        choices=['baseline', 'withmeans'],
+        choices=['baseline', 'withmeans', 'coclustering'],
         default='baseline',
         dest='cluster_knn_variant',
-        help='Cluster kNN Surprise modeli: baseline=KNNBaseline (vars.), withmeans=KNNWithMeans. '
+        help='Cluster kNN Surprise modeli: baseline=KNNBaseline (vars.), '
+             'withmeans=KNNWithMeans, coclustering=CoClustering. '
              'Yalnız --cluster-knn-backend surprise iken geçerli.',
     )
     p.add_argument(
         '--cluster-knn-backend',
-        choices=['surprise', 'manual'],
+        choices=['surprise', 'manual', 'native'],
         default='surprise',
         dest='cluster_knn_backend',
-        help='Meta-algoritma küme tahmini: surprise=Surprise KNNBaseline/küme (vars., önerilen); '
-             'manual=manuel Pearson/cosine kNN (expand-knn olmadan küme-içi komşular). '
-             'expand-knn / weighted_cluster / full_soft → her zaman manual.',
+        help='Küme kNN motoru: surprise=Surprise KNNBaseline/WithMeans (vars.); '
+             'native=Surprise\'sız sapma tabanlı küme kNN (cluster_predictor.py); '
+             'manual=manuel Pearson/cosine kNN. '
+             'expand-knn / weighted_cluster / full_soft → manual (native uyumsuz).',
+    )
+    p.add_argument(
+        '--use-latent-similarity',
+        action='store_true',
+        dest='use_latent_similarity',
+        help='Cluster kNN: Surprise yerine WNMF user_features (U) üzerinde latent cosine '
+             'benzerliği kullan (user_features.npy gerekir).',
     )
     p.add_argument(
         '--min-common', type=int, default=3, metavar='N',
