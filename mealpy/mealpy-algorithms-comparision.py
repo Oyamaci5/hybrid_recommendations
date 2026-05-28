@@ -233,8 +233,9 @@ def compute_fcm_objective(matrix, solution, K, m: float = 2.0,
     d2_final = euclidean_distance_batch(X, centroids)
     j_val    = float(np.sum((memberships ** float(m)) * d2_final))
     hard_assignments = np.argmax(memberships, axis=1).astype(np.int32)
+    centroids_flat = centroids.astype(np.float32).flatten()
 
-    return j_val, hard_assignments, memberships.astype(np.float32)
+    return j_val, hard_assignments, memberships.astype(np.float32), centroids_flat
 
 def compute_wcss_fast(matrix, solution, K, metric='pearson'):
     """
@@ -243,7 +244,7 @@ def compute_wcss_fast(matrix, solution, K, metric='pearson'):
     """
     centroids = solution.reshape(K, matrix.shape[1])
     if metric == 'fuzzy':
-        j_val, hard_assignments, _ = compute_fcm_objective(matrix, solution, K, m=2.0)
+        j_val, hard_assignments, _, _ = compute_fcm_objective(matrix, solution, K, m=2.0)
         return float(j_val), hard_assignments
     if metric == 'euclidean':
         dist_matrix = euclidean_distance_batch(matrix, centroids)

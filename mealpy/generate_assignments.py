@@ -101,11 +101,15 @@ DATA_100K = os.path.join(os.path.dirname(BASE_DIR), 'data', 'ml-100k', 'u.data')
 DATA_100K_TRAIN = os.path.join(os.path.dirname(BASE_DIR), 'data', 'ml-100k', 'u1.base')
 DATA_100K_TEST = os.path.join(os.path.dirname(BASE_DIR), 'data', 'ml-100k', 'u1.test')
 DATA_1M   = os.path.join(os.path.dirname(BASE_DIR), 'data', 'ml-1m',   'ratings.dat')
+DATA_FILMTRUST = os.path.join(
+    os.path.dirname(BASE_DIR), 'data', 'filmtrust', 'ratings.txt',
+)
 N_USERS_100K = 943
 N_ITEMS_100K = 1682
 
 K_100K_DEFAULT = 7
 K_1M_DEFAULT   = 7
+K_FILMTRUST_DEFAULT = 15
 
 GLOBAL_EPOCH   = 30
 LOCAL_EPOCH    = 20
@@ -954,6 +958,11 @@ def save_assignment(assignments, gray_mask, best_sol, best_fit,
     np.save(os.path.join(save_dir, 'best_sol.npy'),        best_sol)
     if user_features is not None:
         np.save(os.path.join(save_dir, 'user_features.npy'), user_features)
+        if args is not None and getattr(args, 'feature_extraction', None) == 'wnmf':
+            np.save(
+                os.path.join(save_dir, 'wnmf_user_vectors.npy'),
+                user_features,
+            )
 
     sil_euc = sil_cos = float('nan')
     if user_features is not None:
@@ -1009,6 +1018,12 @@ def save_assignment(assignments, gray_mask, best_sol, best_fit,
     if user_features is not None and not np.isnan(sil_euc):
         print(f"      Silhouette    : {sil_euc:.4f} (euclidean, WNMF W, white users)")
         print(f"      Silhouette    : {sil_cos:.4f} (cosine, WNMF W, white users)")
+    if (
+        user_features is not None
+        and args is not None
+        and getattr(args, 'feature_extraction', None) == 'wnmf'
+    ):
+        print(f"      WNMF W        : wnmf_user_vectors.npy {tuple(user_features.shape)}")
 
     if _DB_AVAILABLE:
         # preprocessing label belirle
@@ -1048,7 +1063,12 @@ def save_assignment(assignments, gray_mask, best_sol, best_fit,
         preprocessing = '_'.join(prep_parts) if prep_parts else 'none'
 
         # dataset adını belirle
-        ds = 'ml100k' if 'ml100k' in save_dir else 'ml1m'
+        if 'ml100k' in save_dir:
+            ds = 'ml100k'
+        elif 'filmtrust' in save_dir:
+            ds = 'filmtrust'
+        else:
+            ds = 'ml1m'
 
         lof_scores_arr = extra_data.get('lof_scores') if extra_data else None
 
@@ -1436,15 +1456,35 @@ def _run_one_core(
                 cluster_matrix, best_sol, K, metric=cluster_metric,
             )
         if cluster_metric == 'fuzzy':
-            _, fcm_assignments, memberships = compute_fcm_objective(
+            _, fcm_assignments, memberships, _ = compute_fcm_objective(
                 cluster_matrix, best_sol, K, m=2.0,
             )
             if _refined_labels is None:
                 assignments = fcm_assignments
     elif cluster_metric == 'fuzzy':
-        _, assignments, memberships = compute_fcm_objective(
+        _, assignments, memberships, _ = compute_fcm_objective(
             cluster_matrix, best_sol, K, m=2.0,
         )
+
+    # Meta-sezgisel sonrası FCM: başlangıç centroid = algo çıktısı, J_m minimize.
+    # B0_KMEANS ve dahili KMEANS zaten Öklid Lloyd; FCM post-refine atlanır (kmref ile aynı mantık).
+    fcm_j = None
+    if getattr(args, 'fcm', False) and not is_kmeans_branch:
+        fcm_iters = int(getattr(args, 'fcm_iter', 50) or 50)
+        fcm_j, assignments, memberships, best_sol = compute_fcm_objective(
+            cluster_matrix,
+            best_sol,
+            K,
+            m=2.0,
+            max_iter=fcm_iters,
+            tol=1e-6,
+        )
+        print(
+            f'    FCM post-refine ({fcm_iters} iter): J_m={fcm_j:.4f}, '
+            f'aktif küme {len(np.unique(assignments))}/{K}',
+        )
+    elif getattr(args, 'fcm', False) and is_kmeans_branch:
+        print(f'    FCM post-refine: atlandı ({label} zaten KMeans baseline)')
 
     if disable_gray_sheep:
         gray_mask = np.zeros(len(assignments), dtype=bool)
@@ -1485,19 +1525,8 @@ def _run_one_core(
         )
         print(f"    {fit_label}    : {best_fit:.6f}  (WCSS rapor: {best_wcss:.4f})")
 
-    if getattr(args, 'fcm', False):
-        from sklearn.preprocessing import normalize
-
-        X_cluster  = normalize(cluster_matrix, norm='l2')
-        centroids  = best_sol.reshape(K, cluster_matrix.shape[1])
-        # Gerçek FCM: centroid + membership iterate ediyor
-        memberships = compute_memberships(
-            X_cluster, centroids, m=2.0, max_iter=50, tol=1e-6
-        )
-        # Hard assignment membership'ten
-        assignments = np.argmax(memberships, axis=1).astype(np.int32)
-        print(f'FCM memberships kaydedildi: {memberships.shape}, '
-          f'aktif küme: {len(np.unique(assignments))}/{K}')
+    if fcm_j is not None:
+        best_wcss = float(fcm_j)
 
     save_assignment(
         assignments, gray_mask, best_sol, best_wcss,
@@ -1635,8 +1664,20 @@ def _import_wnmf_loaders():
     wnmf_dir = os.path.join(_REPO_ROOT, 'wnmf')
     if wnmf_dir not in sys.path:
         sys.path.insert(0, wnmf_dir)
-    from wnmf_utils import load_ratings_100k, load_ratings_100k_all, load_ratings_1m
-    return load_ratings_100k, load_ratings_100k_all, load_ratings_1m
+    from wnmf_utils import (
+        load_ratings_100k,
+        load_ratings_100k_all,
+        load_ratings_1m,
+        load_ratings_filmtrust,
+        load_filmtrust_matrix,
+    )
+    return (
+        load_ratings_100k,
+        load_ratings_100k_all,
+        load_ratings_1m,
+        load_ratings_filmtrust,
+        load_filmtrust_matrix,
+    )
 
 
 def _ratings_to_dense_matrix(train, n_users, n_items):
@@ -1695,6 +1736,29 @@ def load_movielens_train_only_1m(fold=None, random_seed=SEED, ratings_path=None)
     _, _, load_ratings_1m = _import_wnmf_loaders()
     ratings_path = ratings_path or DATA_1M
     train, test = load_ratings_1m(ratings_path, random_seed=random_seed, fold=fold)
+    n_users = int(max(train[:, 0].max(), test[:, 0].max())) + 1
+    n_items = int(max(train[:, 1].max(), test[:, 1].max())) + 1
+    matrix = _ratings_to_dense_matrix(train, n_users, n_items)
+    total = matrix.size
+    nonzero = np.count_nonzero(matrix)
+    fold_label = (
+        f'fold {fold}/5 (seed={random_seed})'
+        if fold is not None and fold != 1
+        else f'%20 holdout (seed={random_seed})'
+    )
+    print(f"Matrix shape (train-only, {fold_label}): {matrix.shape}")
+    print(f"  Train ratings: {len(train):,}  |  Test (hariç): {len(test):,}")
+    print(f"  Sparsity     : {1 - nonzero / total:.3f}")
+    return matrix
+
+
+def load_filmtrust_train_only(random_seed=SEED, ratings_path=None, fold=None):
+    """FilmTrust train rating'lerinden dense matris (test hücreleri 0)."""
+    _, _, _, load_ratings_filmtrust, _ = _import_wnmf_loaders()
+    ratings_path = ratings_path or DATA_FILMTRUST
+    train, test = load_ratings_filmtrust(
+        ratings_path, random_seed=random_seed, fold=fold,
+    )
     n_users = int(max(train[:, 0].max(), test[:, 0].max())) + 1
     n_items = int(max(train[:, 1].max(), test[:, 1].max())) + 1
     matrix = _ratings_to_dense_matrix(train, n_users, n_items)
@@ -2074,7 +2138,7 @@ def prepare_matrix_for_clustering(
             max_iter=1000,
             init='nndsvda',
         )
-        X_cluster = normalize(nmf.fit_transform(R_matrix))
+        X_cluster = nmf.fit_transform(R_matrix)
         print(f"NMF reconstruction error: {nmf.reconstruction_err_:.2f}")
     elif feature_extraction == 'nmf':
         from sklearn.decomposition import NMF
@@ -2084,7 +2148,7 @@ def prepare_matrix_for_clustering(
         min_val = float(np.min(R_nmf))
         if min_val < 0.0:
             R_nmf = np.maximum(R_nmf, 0.0)  # sıfırla, kaydırma
-        X_cluster = normalize(nmf.fit_transform(R_nmf))
+        X_cluster = nmf.fit_transform(R_nmf)
     elif feature_extraction == 'pca':
         from sklearn.decomposition import PCA
         from sklearn.preprocessing import normalize
@@ -2103,8 +2167,6 @@ def prepare_matrix_for_clustering(
             init_method=wnmf_init_method,
             inmed_trim=inmed_trim,
         )
-        if not paper_style:
-            X_cluster = normalize(X_cluster)
     else:
         X_cluster = R_matrix
 
@@ -2137,7 +2199,12 @@ def run_dataset(dataset_name, matrix, K, out_root, algo_filter=None,
 
     # Yeni düzen: K yalnızca assign_suffix sonunda (..._k{K}); label önünde _k{K} yok.
     # Eski düzen (args yok): K ≠ varsayılan → label_k{K} + out_suffix.
-    default_k = K_100K_DEFAULT if dataset_name == 'ml100k' else K_1M_DEFAULT
+    if dataset_name == 'ml100k':
+        default_k = K_100K_DEFAULT
+    elif dataset_name == 'filmtrust':
+        default_k = K_FILMTRUST_DEFAULT
+    else:
+        default_k = K_1M_DEFAULT
 
     skip_existing = bool(getattr(args, 'skip_existing', False)) if args is not None else False
 
@@ -2157,6 +2224,8 @@ def run_dataset(dataset_name, matrix, K, out_root, algo_filter=None,
                 assign_suffix += '_pwcss'
             if getattr(args, 'kmeans_refine', True) and label != 'B0_KMEANS':
                 assign_suffix += '_kmref'
+            if getattr(args, 'fcm', False) and label != 'B0_KMEANS' and g_name != 'KMEANS':
+                assign_suffix += '_fcm'
         else:
             k_suffix = '' if K == default_k else f'_k{K}'
         save_dir = os.path.join(out_root, dataset_name, f"{label}{k_suffix}{out_suffix}{assign_suffix}")
@@ -2264,8 +2333,8 @@ def parse_args():
         description="Assignment üretici — percentile veya LOF gray sheep"
     )
     p.add_argument(
-        '--dataset', choices=['100k', '1m', 'both'], default='both',
-        help="Hangi dataset (default: both)"
+        '--dataset', choices=['100k', '1m', 'filmtrust', 'both'], default='both',
+        help="Hangi dataset (default: both; filmtrust=FilmTrust ratings.txt)"
     )
     p.add_argument(
         '--algo', nargs='+', choices=labels, default=None,
@@ -2312,7 +2381,13 @@ def parse_args():
     )
     p.add_argument(
         '--fcm', action='store_true',
-        help='FCM soft membership üret',
+        help='Meta-sezgisel centroidlerinden sonra FCM ile J_m minimize et (post-refine); '
+             'memberships.npy + güncellenmiş best_sol. B0_KMEANS ve KMEANS dalları atlanır. '
+             'Arama hedefi değişmez (--cluster-metric euclidean ile uyumlu).',
+    )
+    p.add_argument(
+        '--fcm-iter', type=int, default=50, metavar='N',
+        help='--fcm post-refine iterasyon sayısı (default: 50)',
     )
     p.add_argument(
         '--no-prune', action='store_true',
@@ -2447,6 +2522,10 @@ def parse_args():
         help=f"ML-1M için K (default: {K_1M_DEFAULT})"
     )
     p.add_argument(
+        '--k-filmtrust', type=int, default=None,
+        help=f"FilmTrust için K (default: {K_FILMTRUST_DEFAULT})",
+    )
+    p.add_argument(
         '--n-neighbors', type=int, default=LOF_N_NEIGHBORS,
         help=f"LOF komşu sayısı (default: {LOF_N_NEIGHBORS}, sadece --lof ile)"
     )
@@ -2456,6 +2535,7 @@ def parse_args():
     )
     p.add_argument('--data-100k', default=DATA_100K)
     p.add_argument('--data-1m',   default=DATA_1M)
+    p.add_argument('--data-filmtrust', default=DATA_FILMTRUST)
     p.add_argument(
         '--train-only', action='store_true',
         help='Yalnızca train rating\'leri ile matris oluştur (test hücreleri 0). '
@@ -2538,8 +2618,12 @@ def parse_args():
         help='--ha-adaptive-epoch aktifken tolerance alt sınırı (default: 1e-6).',
     )
     args = p.parse_args()
-    if args.k is not None and (args.k_100k is not None or args.k_1m is not None):
-        p.error('--k (tek veya çoklu) ile --k-100k / --k-1m birlikte kullanılamaz')
+    if args.k is not None and (
+        args.k_100k is not None or args.k_1m is not None or args.k_filmtrust is not None
+    ):
+        p.error(
+            '--k (tek veya çoklu) ile --k-100k / --k-1m / --k-filmtrust birlikte kullanılamaz'
+        )
     if args.pca_variance is not None:
         if not (0 < args.pca_variance <= 1):
             p.error('--pca (0, 1] aralığında olmalı (örn. 0.80)')
@@ -2608,6 +2692,11 @@ def parse_args():
     if args.no_gray_sheep and args.lof:
         print('  Uyarı: --no-gray-sheep aktif; --lof yok sayılıyor.')
         args.lof = False
+    if args.fcm and args.cluster_metric == 'fuzzy':
+        print(
+            '  Uyarı: --fcm ve --cluster-metric fuzzy birlikte; arama zaten FCM J ile '
+            'yapılıyor, post-refine tekrarlı olabilir. Tipik: euclidean + --fcm.',
+        )
     user_init_mode = args.init_mode
     if args.paper_mode:
         if args.lof:
@@ -2760,6 +2849,7 @@ if __name__ == '__main__':
     if k_multi is None:
         k_100k = args.k_100k or K_100K_DEFAULT
         k_1m   = args.k_1m   or K_1M_DEFAULT
+        k_filmtrust = args.k_filmtrust or K_FILMTRUST_DEFAULT
 
     # Çıktı klasörü — LOF ve percentile ayrı tutulur; early-stop ayrı kökte
     if args.out_root:
@@ -2798,7 +2888,9 @@ if __name__ == '__main__':
     if k_multi is not None:
         print(f"K listesi     : {k_multi}  (her değer sırayla işlenir)")
     else:
-        print(f"ML-100K K   : {k_100k}  |  ML-1M K: {k_1m}")
+        print(
+            f"ML-100K K   : {k_100k}  |  ML-1M K: {k_1m}  |  FilmTrust K: {k_filmtrust}"
+        )
     if args.lof:
         print(f"LOF         : n_neighbors={args.n_neighbors}, contamination={contamination}")
     baseline_epoch, global_epoch, local_epoch, pop_size = _resolve_train_hyperparams(args)
@@ -2823,6 +2915,11 @@ if __name__ == '__main__':
         )
     else:
         print("KMeans ref  : Kapalı (--no-kmeans-refine)")
+    if getattr(args, 'fcm', False):
+        print(
+            f"FCM post    : Açık (meta sonrası J_m, max_iter={args.fcm_iter}; "
+            f"B0_KMEANS/KMEANS atlanır)"
+        )
     feat_bits = []
     if args.min_user_ratings <= 0 and args.min_item_ratings <= 0:
         feat_bits.append('Prune: kapalı')
@@ -3064,6 +3161,80 @@ if __name__ == '__main__':
                     init_mode=args.init_mode,
                     disable_gray_sheep=args.disable_gray_sheep,
                 )
+
+        if args.dataset in ('filmtrust',):
+            if args.fitness in ('knn_mae', 'knn_mae_legacy'):
+                print(
+                    '  Uyari: FilmTrust + knn_mae fitness henuz desteklenmiyor; '
+                    'atlaniyor.',
+                    file=sys.stderr,
+                )
+            elif args.train_only:
+                print(
+                    f"\nFilmTrust train-only yukleniyor "
+                    f"(fold={args.fold}, seed={SEED})"
+                )
+                matrix_ft = load_filmtrust_train_only(
+                    random_seed=SEED,
+                    ratings_path=args.data_filmtrust,
+                    fold=args.fold,
+                )
+            else:
+                print(f"\nFilmTrust yukleniyor: {args.data_filmtrust}")
+                _, _, _, _, load_filmtrust_matrix = _import_wnmf_loaders()
+                matrix_ft = load_filmtrust_matrix(args.data_filmtrust)
+            if args.fitness not in ('knn_mae', 'knn_mae_legacy'):
+                prep_ft = prepare_matrix_for_clustering(
+                    matrix_ft,
+                    args.zscore,
+                    args.pca_variance,
+                    args.wnmf_features,
+                    preprocess=args.preprocess,
+                    feature_extraction=args.feature_extraction,
+                    svd_components=args.svd_components,
+                    min_user_ratings=args.min_user_ratings,
+                    min_item_ratings=args.min_item_ratings,
+                    wnmf_init_method=args.wnmf_init,
+                    inmed_trim=(args.inmed_trim_low, args.inmed_trim_high),
+                    paper_style=getattr(args, 'paper_style', False),
+                )
+                matrix_ft = prep_ft
+                if args.save_wnmf_u and args.feature_extraction == 'wnmf':
+                    os.makedirs(args.save_wnmf_u, exist_ok=True)
+                    u_path = os.path.join(args.save_wnmf_u, 'filmtrust_U.npy')
+                    np.save(u_path, matrix_ft)
+                    print(f"  WNMF U kaydedildi: {u_path}")
+                if k_multi is not None:
+                    for K in k_multi:
+                        run_dataset(
+                            'filmtrust', matrix_ft, K, out_root,
+                            algo_filter=selected_algos,
+                            use_lof=args.lof,
+                            lof_n_neighbors=args.n_neighbors,
+                            lof_contamination=contamination,
+                            max_workers=_pool_cap(),
+                            out_suffix=out_suffix,
+                            args=args,
+                            run_id=db_run_id,
+                            cluster_metric=args.cluster_metric,
+                            init_mode=args.init_mode,
+                            disable_gray_sheep=args.disable_gray_sheep,
+                        )
+                else:
+                    run_dataset(
+                        'filmtrust', matrix_ft, k_filmtrust, out_root,
+                        algo_filter=selected_algos,
+                        use_lof=args.lof,
+                        lof_n_neighbors=args.n_neighbors,
+                        lof_contamination=contamination,
+                        max_workers=_pool_cap(),
+                        out_suffix=out_suffix,
+                        args=args,
+                        run_id=db_run_id,
+                        cluster_metric=args.cluster_metric,
+                        init_mode=args.init_mode,
+                        disable_gray_sheep=args.disable_gray_sheep,
+                    )
 
         print(f"\n{'='*60}")
         print(f"TAMAMLANDI — toplam {(time.time()-t_total)/60:.1f} dakika")

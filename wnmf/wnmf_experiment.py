@@ -93,10 +93,15 @@ from wnmf_utils import (
     load_ratings_100k,
     load_ratings_100k_all,
     load_ratings_1m,
+    load_ratings_filmtrust,
     load_assignment,
     load_memberships,
     load_centroids,
     load_user_features,
+    build_user_profile_matrix,
+    build_cluster_rating_centroids,
+    compute_item_global_means,
+    predict_centroid,
     resolve_test_cluster_ids,
     split_by_cluster,
     remap_user_ids,
@@ -113,12 +118,16 @@ DATA_100K_TRAIN = os.path.join(os.path.dirname(BASE_DIR), 'data', 'ml-100k', 'u1
 DATA_100K_TEST  = os.path.join(os.path.dirname(BASE_DIR), 'data', 'ml-100k', 'u1.test')
 DATA_100K_ALL   = os.path.join(os.path.dirname(BASE_DIR), 'data', 'ml-100k', 'u.data')
 DATA_1M         = os.path.join(os.path.dirname(BASE_DIR), 'data', 'ml-1m', 'ratings.dat')
+DATA_FILMTRUST  = os.path.join(
+    os.path.dirname(BASE_DIR), 'data', 'filmtrust', 'ratings.txt',
+)
 ASSIGN_ROOT     = os.path.join(os.path.dirname(BASE_DIR), 'mealpy','results', 'assignments_lof')
 OUT_ROOT        = os.path.join(os.path.dirname(BASE_DIR), 'results', 'wnmf')
 
-# generate_assignments.py K_100K_DEFAULT / K_1M_DEFAULT ile aynı olmalı (klasör adı _k{K} eki)
+# generate_assignments.py K_*_DEFAULT ile aynı olmalı (klasör adı _k{K} eki)
 ASSIGN_K_DEFAULT_100K = 7
 ASSIGN_K_DEFAULT_1M   = 7
+ASSIGN_K_DEFAULT_FILMTRUST = 15
 
 LATENT_DIM       = 20
 LEARNING_RATE    = 0.01
@@ -172,9 +181,16 @@ def _epoch_cartesian_pairs(eg: List[int], ec: List[int]) -> List[Tuple[int, int]
     return list(product(eg, ec))
 
 
+LAMBDA_SHRINK_DEFAULT = 25.0
+LAMBDA_SHRINK_CANDIDATES: Tuple[float, ...] = (10.0, 25.0, 50.0)
+
+
 def _format_hyperparam_tag(
     k_used: int,
     cknn_suffix: Optional[int] = None,
+    *,
+    lambda_shrink: float = LAMBDA_SHRINK_DEFAULT,
+    lambda_shrink_mode: str = 'fixed',
 ) -> str:
     """CSV / dosya adlarında hangi hiperparametre koşusunun olduğunu gösterir."""
     base = (
@@ -183,12 +199,21 @@ def _format_hyperparam_tag(
     )
     if cknn_suffix is not None:
         base += f"_cknn{int(cknn_suffix)}"
+    ls_mode = (lambda_shrink_mode or 'fixed').strip().lower()
+    if ls_mode == 'de':
+        base += '_lsde'
+    else:
+        base += f"_ls{int(round(float(lambda_shrink)))}"
     return base
 
 
 def _result_row_meta(
     k_used: int,
     cknn_suffix: Optional[int] = None,
+    *,
+    lambda_shrink: float = LAMBDA_SHRINK_DEFAULT,
+    lambda_shrink_mode: str = 'fixed',
+    cluster_knn_backend: str = 'native',
 ) -> dict:
     return {
         'assignment_k'    : k_used,
@@ -197,7 +222,15 @@ def _result_row_meta(
         'regularization'  : REGULARIZATION,
         'epochs_global'   : N_EPOCHS_GLOBAL,
         'epochs_cluster'  : N_EPOCHS_CLUSTER,
-        'hyperparam_tag'  : _format_hyperparam_tag(k_used, cknn_suffix),
+        'hyperparam_tag'  : _format_hyperparam_tag(
+            k_used,
+            cknn_suffix,
+            lambda_shrink=lambda_shrink,
+            lambda_shrink_mode=lambda_shrink_mode,
+        ),
+        'lambda_shrink': float(lambda_shrink),
+        'lambda_shrink_mode': str(lambda_shrink_mode or 'fixed'),
+        'cluster_knn_backend': str(cluster_knn_backend or 'native'),
     }
 
 
@@ -228,6 +261,8 @@ def _normalize_db_dataset_name(dataset_name: str) -> str:
         return 'ml100k'
     if ds == '1m':
         return 'ml1m'
+    if ds in ('filmtrust', 'ft'):
+        return 'filmtrust'
     return ds
 
 
@@ -331,7 +366,13 @@ def _should_skip_existing_run(
     if len(list(knn_list)) > 1:
         # Farklı kNN değerleri farklı satırlarda; tek etiketle güvenilir eşleşme olmaz
         return False
-    tag = _format_hyperparam_tag(k_used)
+    ls_mode = 'de' if getattr(args, 'lambda_shrink_de', False) else 'fixed'
+    ls_val = float(getattr(args, 'lambda_shrink', LAMBDA_SHRINK_DEFAULT) or LAMBDA_SHRINK_DEFAULT)
+    tag = _format_hyperparam_tag(
+        k_used,
+        lambda_shrink=ls_val,
+        lambda_shrink_mode=ls_mode,
+    )
     if use_cv_mean_branch:
         for p in _iter_cv_mean_result_paths(dataset_name, k_used, mode):
             if _csv_has_hyperparam_combo(p, tag, use_sp):
@@ -356,8 +397,33 @@ def _resolved_assignment_k(
     return default_k
 
 
-# KMeans refinement klasör etiketi (generate_assignments: B0_KMEANS hariç _kmref eklenir)
+def _assign_k_default(dataset_name: str) -> int:
+    """Dataset adına göre varsayılan küme sayısı."""
+    ds = (dataset_name or '').strip().lower()
+    if ds == 'ml100k':
+        return ASSIGN_K_DEFAULT_100K
+    if ds == 'filmtrust':
+        return ASSIGN_K_DEFAULT_FILMTRUST
+    return ASSIGN_K_DEFAULT_1M
+
+
+def _assignment_k_for_dataset(
+    dataset_name: str,
+    assignment_k_100k: Optional[int],
+    assignment_k_1m: Optional[int],
+    assignment_k_filmtrust: Optional[int] = None,
+) -> Optional[int]:
+    ds = (dataset_name or '').strip().lower()
+    if ds == 'ml100k':
+        return assignment_k_100k
+    if ds == 'filmtrust':
+        return assignment_k_filmtrust
+    return assignment_k_1m
+
+
+# generate_assignments: B0_KMEANS hariç eklenen klasör sonekleri
 _ASSIGN_KMREF_SUFFIX = '_kmref'
+_ASSIGN_FCM_SUFFIX = '_fcm'
 
 
 def _assign_suffix_strip_trailing_kmref(assign_suffix: str) -> Optional[str]:
@@ -365,6 +431,38 @@ def _assign_suffix_strip_trailing_kmref(assign_suffix: str) -> Optional[str]:
     if assign_suffix.endswith(_ASSIGN_KMREF_SUFFIX):
         return assign_suffix[: -len(_ASSIGN_KMREF_SUFFIX)]
     return None
+
+
+def _assign_suffix_strip_trailing_fcm(assign_suffix: str) -> Optional[str]:
+    """Sonda _fcm varsa kaldırılmış sonek; yoksa None."""
+    if assign_suffix.endswith(_ASSIGN_FCM_SUFFIX):
+        return assign_suffix[: -len(_ASSIGN_FCM_SUFFIX)]
+    return None
+
+
+def _assign_suffix_b0_alternatives(assign_suffix: str) -> List[str]:
+    """
+    B0_KMEANS klasör adlarında _kmref / _fcm olmaz; --assign-suffix'te varsa
+    denenecek alternatif sonekler (orijinal hariç, sıralı).
+    """
+    alts: List[str] = []
+    seen = {assign_suffix}
+    candidates: List[str] = []
+    no_fcm = _assign_suffix_strip_trailing_fcm(assign_suffix)
+    if no_fcm is not None:
+        candidates.append(no_fcm)
+    no_km = _assign_suffix_strip_trailing_kmref(assign_suffix)
+    if no_km is not None:
+        candidates.append(no_km)
+    if no_fcm is not None:
+        no_both = _assign_suffix_strip_trailing_kmref(no_fcm)
+        if no_both is not None:
+            candidates.append(no_both)
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            alts.append(c)
+    return alts
 
 
 def _assign_suffix_trailing_cluster_k(assign_suffix: str) -> Optional[int]:
@@ -376,6 +474,8 @@ def _assign_suffix_trailing_cluster_k(assign_suffix: str) -> Optional[int]:
     if not assign_suffix:
         return None
     base = assign_suffix
+    if base.endswith(_ASSIGN_FCM_SUFFIX):
+        base = base[: -len(_ASSIGN_FCM_SUFFIX)]
     if base.endswith(_ASSIGN_KMREF_SUFFIX):
         base = base[: -len(_ASSIGN_KMREF_SUFFIX)]
     m = re.search(r'_k(\d+)(?:_pwcss)?$', base)
@@ -410,7 +510,7 @@ def _algo_assignment_dir(
     Yeni düzen (suffix sonunda _k{K}): label önüne _k{K} eklenmez; --k ile suffix K'sı
     farklı olsa bile klasör eşlemesi suffix sondaki K'ya göre yapılır.
     """
-    default_k = ASSIGN_K_DEFAULT_100K if dataset_name == 'ml100k' else ASSIGN_K_DEFAULT_1M
+    default_k = _assign_k_default(dataset_name)
     trailing_k = _assign_suffix_trailing_cluster_k(assign_suffix)
     if trailing_k is not None:
         label_k = ''
@@ -2179,9 +2279,11 @@ def run_cluster_average(train, test, assignments, gray_mask,
                         sim_amp: float = 1.0,
                         cluster_avg_k_neighbors: int = 0,
                         cluster_avg_base: str = 'user',
+                        cluster_predict_centroid: bool = False,
                         assign_dir: Optional[str] = None):
     t0 = time.time()
     cluster_avg_base = (cluster_avg_base or 'user').strip().lower()
+    use_centroid_predict = bool(cluster_predict_centroid)
 
     test_cluster_ids = resolve_test_cluster_ids(
         train, assignments, centroids, nearest_centroid, n_items,
@@ -2265,7 +2367,24 @@ def run_cluster_average(train, test, assignments, gray_mask,
                 cluster_item_means[cid, ~mask] = np.nan
 
     # ClusterAvg (varsayılan): küme-içi sim ağırlıklı sapma; CalcAvgRating (--cluster-avg-hard) eski düz ortalama.
-    use_weighted_cluster_avg = not cluster_avg_hard
+    # --cluster-predict-centroid: train küme rating centroid'i (item uzayı).
+    use_weighted_cluster_avg = not cluster_avg_hard and not use_centroid_predict
+
+    R_train = None
+    rating_centroids = None
+    rating_centroid_counts = None
+    item_global_means = None
+    if use_centroid_predict:
+        R_train = build_user_profile_matrix(train, n_users, n_items)
+        rating_centroids, rating_centroid_counts = build_cluster_rating_centroids(
+            R_train, test_cluster_ids, n_clusters,
+        )
+        item_global_means = compute_item_global_means(R_train, global_mean)
+        print(
+            f"  [{algo_label}] CentroidRating: train küme centroid (item uzayı), "
+            f"fallback kume -> global item ort.",
+            flush=True,
+        )
 
     user_ratings: dict = {}
     user_means_dict: dict = {}
@@ -2320,6 +2439,9 @@ def run_cluster_average(train, test, assignments, gray_mask,
     eval_rows = []
     src_counts = {
         'weighted_cluster': 0,
+        'centroid': 0,
+        'centroid_fallback_cluster': 0,
+        'centroid_fallback_global': 0,
         'cluster_mean': 0,
         'item_mean': 0,
         'user_mean': 0,
@@ -2329,7 +2451,27 @@ def run_cluster_average(train, test, assignments, gray_mask,
 
     for row in test:
         u, i, r = int(row[0]), int(row[1]), float(row[2])
-        if use_soft:
+        if use_centroid_predict:
+            cid = int(test_cluster_ids[u])
+            pred = predict_centroid(
+                u,
+                i,
+                test_cluster_ids,
+                rating_centroids,
+                R_train,
+                rating_centroid_counts,
+                item_global_means,
+            )
+            if rating_centroid_counts[cid, i] > 0:
+                src_counts['centroid'] += 1
+            else:
+                cluster_users = np.where(test_cluster_ids == cid)[0]
+                raters = cluster_users[R_train[cluster_users, i] > 0]
+                if len(raters) > 0:
+                    src_counts['centroid_fallback_cluster'] += 1
+                else:
+                    src_counts['centroid_fallback_global'] += 1
+        elif use_soft:
             w = np.asarray(memberships[u], dtype=np.float64)
             active = w >= SOFT_MEMBERSHIP_THRESHOLD
             if not np.any(active) or float(w[active].sum()) < 1e-8:
@@ -2494,7 +2636,10 @@ def run_cluster_average(train, test, assignments, gray_mask,
         nearest_centroid and centroids is not None
         and centroids.shape[1] == n_items
     )
-    if cluster_avg_leaky:
+    if use_centroid_predict:
+        scenario = 'centroid_rating_nc' if use_nc else 'centroid_rating'
+        tag = 'CentroidRating'
+    elif cluster_avg_leaky:
         scenario = 'calc_avg_rating_leaky_nc' if use_nc else 'calc_avg_rating_leaky'
         tag = 'CalcAvgRating+LEAK'
     elif cluster_avg_hard:
@@ -2524,6 +2669,14 @@ def run_cluster_average(train, test, assignments, gray_mask,
             f"global_mean={src_counts['global_mean']}",
             flush=True,
         )
+    if use_centroid_predict:
+        print(
+            f"  [{algo_label} | {tag}] kaynak dağılımı: "
+            f"centroid={src_counts['centroid']} "
+            f"fallback_cluster={src_counts['centroid_fallback_cluster']} "
+            f"fallback_global={src_counts['centroid_fallback_global']}",
+            flush=True,
+        )
 
     return {
         'scenario'    : scenario,
@@ -2551,11 +2704,221 @@ def run_cluster_average(train, test, assignments, gray_mask,
     }
 
 
+def _sample_train_holdout(
+    train: np.ndarray,
+    n_val: int,
+    seed: int = 42,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Train'den val örneği ayır (λ seçimi / DE için)."""
+    tr = np.asarray(train, dtype=np.float64)
+    if tr.size == 0 or n_val <= 0:
+        return tr, np.zeros((0, 3), dtype=np.float64)
+    n_val = min(int(n_val), len(tr))
+    rng = np.random.default_rng(int(seed))
+    idx = rng.choice(len(tr), size=n_val, replace=False)
+    mask = np.zeros(len(tr), dtype=bool)
+    mask[idx] = True
+    return tr[~mask], tr[mask]
+
+
+def _val_mae_for_lambda_shrink(
+    train: np.ndarray,
+    assignments: np.ndarray,
+    gray_mask: np.ndarray,
+    lambda_shrink: float,
+    val_sample: np.ndarray,
+    *,
+    k_neighbors: int = 30,
+    similarity: str = 'cosine',
+    min_common: int = 3,
+) -> float:
+    """
+    Shrinkage tabanlı küme kNN proxy MAE (DE / grid λ seçimi).
+    Taban: mu_eff[cid]; komşu sapması: r - mean_v (manuel kNN ile uyumlu).
+    """
+    val_sample = np.asarray(val_sample, dtype=np.float64)
+    if val_sample.size == 0:
+        return float('inf')
+
+    train = np.asarray(train, dtype=np.float64)
+    assignments = np.asarray(assignments, dtype=np.int64).ravel()
+    gray_mask = np.asarray(gray_mask, dtype=bool)
+    n_users = len(assignments)
+    global_mean = float(train[:, 2].mean()) if len(train) else 3.0
+
+    user_ratings: dict = {}
+    for row in train:
+        u, i, r = int(row[0]), int(row[1]), float(row[2])
+        user_ratings.setdefault(u, {})[i] = r
+    user_means = {
+        u: float(np.mean(list(d.values())))
+        for u, d in user_ratings.items()
+    }
+    white_set = {u for u in range(n_users) if u < len(gray_mask) and not gray_mask[u]}
+    cluster_users: dict = {}
+    for u in white_set:
+        cluster_users.setdefault(int(assignments[u]), []).append(u)
+
+    mu_eff = compute_cluster_mu_shrinkage(
+        train, cluster_users, global_mean, lambda_shrink=float(lambda_shrink),
+    )
+    item_popularity = build_item_popularity(user_ratings=user_ratings)
+    k_neighbors = max(1, int(k_neighbors))
+    errors: List[float] = []
+
+    for row in val_sample:
+        u, i, r_true = int(row[0]), int(row[1]), float(row[2])
+        if u >= len(assignments):
+            continue
+        cid = int(assignments[u])
+        if gray_mask[u]:
+            pred = float(user_means.get(u, global_mean))
+        else:
+            base = float(mu_eff.get(cid, global_mean))
+            sims: List[Tuple[float, int]] = []
+            for v in cluster_users.get(cid, []):
+                if v == u or i not in user_ratings.get(v, {}):
+                    continue
+                s = knn_user_similarity(
+                    u,
+                    v,
+                    similarity=similarity,
+                    user_ratings=user_ratings,
+                    user_means=user_means,
+                    item_popularity=item_popularity,
+                    min_common=min_common,
+                )
+                if abs(s) > 0.0:
+                    sims.append((float(s), v))
+            pred = _knn_predict_from_sims(
+                u,
+                i,
+                sims,
+                user_ratings,
+                user_means,
+                global_mean,
+                k_neighbors,
+                base_mean=base,
+            )
+        errors.append(abs(r_true - pred))
+
+    if not errors:
+        return float('inf')
+    return float(np.mean(errors))
+
+
+def _select_lambda_shrink_de(
+    train: np.ndarray,
+    assignments: np.ndarray,
+    gray_mask: np.ndarray,
+    *,
+    k_neighbors: int = 30,
+    similarity: str = 'cosine',
+    min_common: int = 3,
+    n_val: int = 500,
+    seed: int = 42,
+    algo_label: str = '',
+) -> Tuple[float, Dict[float, float]]:
+    """DE ile λ ∈ {10, 25, 50} seçimi; scipy yoksa grid."""
+    train_fit, val_sample = _sample_train_holdout(train, n_val, seed=seed)
+    if val_sample.size == 0:
+        return LAMBDA_SHRINK_DEFAULT, {}
+
+    scores: Dict[float, float] = {}
+    for lam in LAMBDA_SHRINK_CANDIDATES:
+        scores[float(lam)] = _val_mae_for_lambda_shrink(
+            train_fit,
+            assignments,
+            gray_mask,
+            lam,
+            val_sample,
+            k_neighbors=k_neighbors,
+            similarity=similarity,
+            min_common=min_common,
+        )
+
+    n_c = len(LAMBDA_SHRINK_CANDIDATES)
+
+    def _objective(x: np.ndarray) -> float:
+        idx = int(np.clip(np.round(float(x[0])), 0, n_c - 1))
+        lam = LAMBDA_SHRINK_CANDIDATES[idx]
+        return scores[float(lam)]
+
+    best_idx = int(np.argmin([scores[float(l)] for l in LAMBDA_SHRINK_CANDIDATES]))
+    try:
+        from scipy.optimize import differential_evolution
+
+        res = differential_evolution(
+            _objective,
+            bounds=[(0.0, float(n_c - 1))],
+            maxiter=12,
+            popsize=5,
+            seed=int(seed),
+            polish=False,
+            atol=0.0,
+            tol=0.0,
+            updating='immediate',
+        )
+        best_idx = int(np.clip(np.round(float(res.x[0])), 0, n_c - 1))
+        method = 'de_scipy'
+    except ImportError:
+        method = 'de_grid'
+
+    best_lam = float(LAMBDA_SHRINK_CANDIDATES[best_idx])
+    tag = f"  [{algo_label}] " if algo_label else '  '
+    score_txt = ', '.join(
+        f"lam={int(lam_c)}->{scores[lam_c]:.4f}" for lam_c in LAMBDA_SHRINK_CANDIDATES
+    )
+    print(
+        f"{tag}lambda-shrink DE ({method}): secilen lam={best_lam:g}  "
+        f"[{score_txt}]",
+        flush=True,
+    )
+    return best_lam, scores
+
+
+def resolve_lambda_shrink(
+    args,
+    train: np.ndarray,
+    assignments: np.ndarray,
+    gray_mask: np.ndarray,
+    *,
+    k_neighbors: int = 30,
+    similarity: str = 'cosine',
+    min_common: int = 3,
+    algo_label: str = '',
+) -> Tuple[float, str]:
+    """CLI: sabit --lambda-shrink veya --lambda-shrink-de."""
+    if args is not None and bool(getattr(args, 'lambda_shrink_de', False)):
+        n_val = int(getattr(args, 'lambda_shrink_de_samples', 500) or 500)
+        seed = int(getattr(args, 'random_seed', RANDOM_SEED) or RANDOM_SEED)
+        lam, _ = _select_lambda_shrink_de(
+            train,
+            assignments,
+            gray_mask,
+            k_neighbors=k_neighbors,
+            similarity=similarity,
+            min_common=min_common,
+            n_val=n_val,
+            seed=seed,
+            algo_label=algo_label,
+        )
+        return lam, 'de'
+    lam = float(
+        getattr(args, 'lambda_shrink', LAMBDA_SHRINK_DEFAULT)
+        if args is not None
+        else LAMBDA_SHRINK_DEFAULT
+    )
+    if not np.isfinite(lam) or lam < 0:
+        lam = LAMBDA_SHRINK_DEFAULT
+    return lam, 'fixed'
+
+
 def compute_cluster_mu_shrinkage(
     train: np.ndarray,
     cluster_users: dict,
     mu_global: float,
-    lambda_shrink: float = 25.0,
+    lambda_shrink: float = LAMBDA_SHRINK_DEFAULT,
 ) -> dict:
     """
     Her küme için shrinkage ile ayarlanmış etkin ortalama.
@@ -3109,7 +3472,7 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
                     sim_amp: float = 1.0,
                     knn_mode: str = 'cluster',
                     surprise_knn_variant: str = 'baseline',
-                    cluster_knn_backend: str = 'surprise',
+                    cluster_knn_backend: str = 'native',
                     top_n: int = 10,
                     relevance_threshold: float = 4.0,
                     centroids=None,
@@ -3118,6 +3481,9 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
                     assign_dir: Optional[str] = None,
                     cluster_weight_alpha: Union[float, str] = 1.0,
                     cluster_weight_base: float = 1.0,
+                    lambda_shrink: float = LAMBDA_SHRINK_DEFAULT,
+                    lambda_shrink_mode: str = 'fixed',
+                    knn_args=None,
                     return_eval_rows: bool = False):
     t0 = time.time()
     k_neighbors = max(1, int(k_neighbors))
@@ -3151,11 +3517,33 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
         cid = int(assignments[u])
         cluster_users.setdefault(cid, []).append(u)
 
+    if knn_args is not None and bool(getattr(knn_args, 'lambda_shrink_de', False)):
+        lambda_shrink, lambda_shrink_mode = resolve_lambda_shrink(
+            knn_args,
+            train,
+            assignments,
+            gray_mask,
+            k_neighbors=k_neighbors,
+            similarity=similarity,
+            min_common=min_common,
+            algo_label=algo_label,
+        )
+    elif knn_args is not None:
+        lambda_shrink = float(
+            getattr(knn_args, 'lambda_shrink', lambda_shrink) or LAMBDA_SHRINK_DEFAULT
+        )
+        lambda_shrink_mode = 'fixed'
+    lambda_shrink = float(lambda_shrink if np.isfinite(lambda_shrink) else LAMBDA_SHRINK_DEFAULT)
+    lambda_shrink_mode = str(lambda_shrink_mode or 'fixed')
+
     mu_eff = compute_cluster_mu_shrinkage(
-        train, cluster_users, global_mean, lambda_shrink=25.0,
+        train, cluster_users, global_mean, lambda_shrink=lambda_shrink,
     )
+    backend_norm = (cluster_knn_backend or 'native').strip().lower()
     print(
-        f"  Cluster mu_eff: min={min(mu_eff.values()):.3f} "
+        f"  Cluster mu_eff (lam={lambda_shrink:g}, mode={lambda_shrink_mode}, "
+        f"backend={backend_norm}): "
+        f"min={min(mu_eff.values()):.3f} "
         f"max={max(mu_eff.values()):.3f} "
         f"global={global_mean:.3f}"
     )
@@ -3193,6 +3581,11 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
 
     knn_mode_norm = (knn_mode or 'cluster').strip().lower()
     use_weighted_cluster = knn_mode_norm == 'weighted_cluster'
+    _knn_meta = {
+        'lambda_shrink': lambda_shrink,
+        'lambda_shrink_mode': lambda_shrink_mode,
+        'cluster_knn_backend': backend_norm,
+    }
     alpha_auto = (
         isinstance(cluster_weight_alpha, str)
         and str(cluster_weight_alpha).strip().lower() == 'auto'
@@ -3279,7 +3672,6 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
         and memberships.shape[1] >= (int(assignments.max()) + 1)
     )
 
-    backend_norm = (cluster_knn_backend or 'surprise').strip().lower()
     use_native_backend = backend_norm in (
         'native', 'cluster_predictor', 'baseline_native',
     )
@@ -3450,6 +3842,7 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
                 'cluster_weight_alpha': float('nan'),
                 'cluster_weight_alpha_mode': '',
                 'cluster_weight_base': float('nan'),
+                **_knn_meta,
             }
             if return_eval_rows:
                 out['eval_rows'] = eval_rows_arr
@@ -3487,8 +3880,17 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
                 (s, v) for s, v in global_sim_index.get(u, [])
                 if i in user_ratings.get(v, {})
             ]
+            cid_u = int(assignments[u]) if u < len(assignments) else -1
+            fallback = float(user_means.get(u, mu_eff.get(cid_u, global_mean)))
             return _knn_predict_from_sims(
-                u, i, neighbors, user_ratings, user_means, global_mean, k_neighbors,
+                u,
+                i,
+                neighbors,
+                user_ratings,
+                user_means,
+                global_mean,
+                k_neighbors,
+                base_mean=fallback,
             )
 
         true_vals, pred_vals = [], []
@@ -3581,6 +3983,7 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
             'cluster_weight_alpha': float('nan'),
             'cluster_weight_alpha_mode': '',
             'cluster_weight_base': float('nan'),
+            **_knn_meta,
         }
         if return_eval_rows:
             out['eval_rows'] = eval_rows_arr
@@ -3699,7 +4102,9 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
             cluster_mu = mu_eff.get(cid_u, global_mean)
             fallback = float(user_means.get(u, cluster_mu))
             if gray_mask[u]:
-                return _predict_surprise_kwm(global_kwm_model, u, i, fallback)
+                return _predict_surprise_kwm(
+                    global_kwm_model, u, i, fallback,
+                )
 
             if use_soft:
                 weights = np.asarray(memberships[u], dtype=np.float64)
@@ -3919,6 +4324,7 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
         'cluster_weight_base': (
             cluster_weight_base if (use_weighted_cluster and alpha_auto) else float('nan')
         ),
+        **_knn_meta,
     }
     if return_eval_rows:
         out['eval_rows'] = eval_rows_arr
@@ -4709,7 +5115,7 @@ def _mp_run_algo_job(job):
         getattr(mp_args, 'cluster_knn_variant', 'baseline') or 'baseline'
     )
     cluster_knn_backend = str(
-        getattr(mp_args, 'cluster_knn_backend', 'surprise') or 'surprise'
+        getattr(mp_args, 'cluster_knn_backend', 'native') or 'native'
     )
 
     if isinstance(knn_spec, int):
@@ -4745,6 +5151,9 @@ def _mp_run_algo_job(job):
                 cluster_mean_impute_train=bool(
                     getattr(mp_args, 'cluster_mean_impute_train', False)
                 ),
+                cluster_predict_centroid=bool(
+                    getattr(mp_args, 'cluster_predict_centroid', False)
+                ),
                 debug_cluster_avg_hard=bool(
                     getattr(mp_args, 'debug_cluster_avg_hard', False)
                 ),
@@ -4777,6 +5186,7 @@ def _mp_run_algo_job(job):
                     top_n=top_n,
                     relevance_threshold=relevance_threshold,
                     assign_dir=assign_dir,
+                    knn_args=mp_args,
                     **nc,
                 )
                 row['dataset'] = dataset_name
@@ -4957,6 +5367,7 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
                 assignment_k: Optional[int] = None,
                 assignment_k_100k: Optional[int] = None,
                 assignment_k_1m: Optional[int] = None,
+                assignment_k_filmtrust: Optional[int] = None,
                 weighted_v: bool = False,
                 use_bias: bool = True,
                 use_cluster_bias: bool = False,
@@ -5029,8 +5440,10 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
                 compute_div = bool(getattr(args, 'diversity', False))
 
     root = assign_root if assign_root is not None else ASSIGN_ROOT
-    dk   = ASSIGN_K_DEFAULT_100K if dataset_name == 'ml100k' else ASSIGN_K_DEFAULT_1M
-    k_ds = assignment_k_100k if dataset_name == 'ml100k' else assignment_k_1m
+    dk = _assign_k_default(dataset_name)
+    k_ds = _assignment_k_for_dataset(
+        dataset_name, assignment_k_100k, assignment_k_1m, assignment_k_filmtrust,
+    )
     k_used = _resolved_assignment_k(k_ds, assignment_k, dk)
     suffix_k = _assign_suffix_trailing_cluster_k(assign_suffix)
     if suffix_k is not None and suffix_k != k_used:
@@ -5263,12 +5676,8 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
                         flush=True,
                     )
                     continue
-        if (
-            not os.path.isdir(assign_dir)
-            and label == 'B0_KMEANS'
-        ):
-            alt_suffix = _assign_suffix_strip_trailing_kmref(assign_suffix)
-            if alt_suffix is not None:
+        if not os.path.isdir(assign_dir) and label == 'B0_KMEANS':
+            for alt_suffix in _assign_suffix_b0_alternatives(assign_suffix):
                 cand = _algo_assignment_dir(
                     root,
                     dataset_name,
@@ -5277,13 +5686,15 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
                     assign_suffix=alt_suffix,
                 )
                 if os.path.isdir(cand):
+                    stripped = assign_suffix[len(alt_suffix):] if assign_suffix.startswith(alt_suffix) else ''
                     print(
-                        f"\n  [{label}] Not: --assign-suffix {_ASSIGN_KMREF_SUFFIX!r} "
-                        f"B0_KMEANS klasöründe yok (refinement uygulanmaz); "
-                        f"soneksiz kullanılıyor: …{alt_suffix}",
+                        f"\n  [{label}] Not: B0_KMEANS için --assign-suffix sondaki "
+                        f"{stripped!r} yok (KMeans/FCM post-refine uygulanmaz); "
+                        f"kullanılan: …{alt_suffix}",
                         flush=True,
                     )
                     assign_dir = cand
+                    break
         if not os.path.isdir(assign_dir):
             kmref_try = assign_dir + _ASSIGN_KMREF_SUFFIX
             if os.path.isdir(kmref_try):
@@ -5355,6 +5766,9 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
                     cluster_mean_impute_train=bool(
                         getattr(args, 'cluster_mean_impute_train', False)
                     ),
+                    cluster_predict_centroid=bool(
+                        getattr(args, 'cluster_predict_centroid', False)
+                    ),
                     debug_cluster_avg_hard=bool(
                         getattr(args, 'debug_cluster_avg_hard', False)
                     ),
@@ -5376,8 +5790,8 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
                     getattr(args, 'cluster_knn_variant', 'baseline') or 'baseline'
                 ) if args else 'baseline'
                 cluster_knn_backend = str(
-                    getattr(args, 'cluster_knn_backend', 'surprise') or 'surprise'
-                ) if args else 'surprise'
+                    getattr(args, 'cluster_knn_backend', 'native') or 'native'
+                ) if args else 'native'
                 for kv in knn_vals:
                     row = run_cluster_knn(
                         train, test, assignments, gray_mask, memberships, n_items, label,
@@ -5397,6 +5811,7 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
                         top_n=top_n,
                         relevance_threshold=relevance_threshold,
                         assign_dir=assign_dir,
+                        knn_args=args,
                         **nc,
                     )
                     row['dataset'] = dataset_name
@@ -5501,7 +5916,23 @@ def run_dataset(dataset_name, train, test, algo_filter=None,
             knv = r.get('k_neighbors')
             if knv is not None:
                 ck_tag = int(knv)
-        meta = _result_row_meta(k_used, cknn_suffix=ck_tag)
+        meta = _result_row_meta(
+            k_used,
+            cknn_suffix=ck_tag,
+            lambda_shrink=float(
+                r.get('lambda_shrink', getattr(args, 'lambda_shrink', LAMBDA_SHRINK_DEFAULT))
+                if args is not None
+                else r.get('lambda_shrink', LAMBDA_SHRINK_DEFAULT)
+            ),
+            lambda_shrink_mode=str(
+                r.get('lambda_shrink_mode', 'fixed') or 'fixed'
+            ),
+            cluster_knn_backend=str(
+                r.get('cluster_knn_backend', getattr(args, 'cluster_knn_backend', 'native'))
+                if args is not None
+                else r.get('cluster_knn_backend', 'native')
+            ),
+        )
         tagged.append({**meta, **r, 'result_subdir': sub, 'use_svdpp': bool(use_svdpp)})
     results = tagged
 
@@ -5837,7 +6268,17 @@ def _save_cv_mean_results(dataset_name: str, k_used: int, mode: str,
 
 def parse_args():
     p = argparse.ArgumentParser(description="WNMF karşılaştırma deneyi")
-    p.add_argument('--dataset', choices=['100k', '1m', 'both'], default='both')
+    p.add_argument(
+        '--dataset',
+        choices=['100k', '1m', 'filmtrust', 'both'],
+        default='both',
+        help='Veri seti: 100k, 1m, filmtrust veya both (filmtrust haric).',
+    )
+    p.add_argument(
+        '--data-filmtrust',
+        default=DATA_FILMTRUST,
+        help='FilmTrust ratings.txt yolu',
+    )
     p.add_argument(
         '--eval-split',
         choices=['official', 'random'],
@@ -5942,6 +6383,11 @@ def parse_args():
         help='Sadece ML-1M için assignment K (--k üzerine yazar)',
     )
     p.add_argument(
+        '--k-filmtrust', type=int, default=None,
+        dest='assignment_k_filmtrust',
+        help=f'Sadece FilmTrust için assignment K (varsayılan: {ASSIGN_K_DEFAULT_FILMTRUST})',
+    )
+    p.add_argument(
         '--assign-root', type=str, default=None,
         help='Assignment kök dizini (varsayılan: mealpy/results/assignments_lof)',
     )
@@ -6007,6 +6453,12 @@ def parse_args():
         action='store_true',
         help='Thakrar et al. (2025) CalculateAverageRating: küme-içi train ortalaması, '
              'soft membership yok (senaryo: calc_avg_rating).',
+    )
+    p.add_argument(
+        '--cluster-predict-centroid',
+        action='store_true',
+        help='ClusterAvg yerine train küme rating centroid tahmini (item uzayı; '
+             'senaryo: centroid_rating). --cluster-avg-hard ile birlikte kullanılabilir.',
     )
     p.add_argument(
         '--cluster-avg-base',
@@ -6088,12 +6540,35 @@ def parse_args():
     p.add_argument(
         '--cluster-knn-backend',
         choices=['surprise', 'manual', 'native'],
-        default='surprise',
+        default='native',
         dest='cluster_knn_backend',
-        help='Küme kNN motoru: surprise=Surprise KNNBaseline/WithMeans (vars.); '
-             'native=Surprise\'sız sapma tabanlı küme kNN (cluster_predictor.py); '
+        help='Küme kNN motoru: native=ClusterPredictor küme bias+kNN (varsayılan); '
+             'surprise=Surprise KNNBaseline/WithMeans; '
              'manual=manuel Pearson/cosine kNN. '
              'expand-knn / weighted_cluster / full_soft → manual (native uyumsuz).',
+    )
+    p.add_argument(
+        '--lambda-shrink',
+        type=float,
+        default=LAMBDA_SHRINK_DEFAULT,
+        metavar='L',
+        dest='lambda_shrink',
+        help='Küme shrinkage λ: mu_eff için α=n/(n+λ) (varsayılan: 25; adaylar: 10, 25, 50).',
+    )
+    p.add_argument(
+        '--lambda-shrink-de',
+        action='store_true',
+        dest='lambda_shrink_de',
+        help='λ değerini {10,25,50} kümesinde DE ile seç (scipy yoksa grid). '
+             'Her algoritma için train holdout val MAE.',
+    )
+    p.add_argument(
+        '--lambda-shrink-de-samples',
+        type=int,
+        default=500,
+        metavar='N',
+        dest='lambda_shrink_de_samples',
+        help='--lambda-shrink-de: holdout val örnek sayısı (varsayılan: 500).',
     )
     p.add_argument(
         '--use-latent-similarity',
@@ -6319,9 +6794,13 @@ def parse_args():
     if args.min_common < 1:
         p.error('--min-common en az 1 olmalı')
     if args.assignment_k is not None and (
-        args.assignment_k_100k is not None or args.assignment_k_1m is not None
+        args.assignment_k_100k is not None
+        or args.assignment_k_1m is not None
+        or args.assignment_k_filmtrust is not None
     ):
-        p.error('--k (tek veya çoklu) ile --k-100k / --k-1m birlikte kullanılamaz')
+        p.error(
+            '--k (tek veya çoklu) ile --k-100k / --k-1m / --k-filmtrust birlikte kullanılamaz'
+        )
     if args.fold is not None and args.fold not in (1, 2, 3, 4, 5):
         p.error('--fold 1..5 olmalı veya tamamen verilmemeli')
     if args.algo is not None:
@@ -6433,6 +6912,9 @@ if __name__ == '__main__':
     if args.dataset in ('100k', 'both'):
         print(f"Eval split    : {args.eval_split}"
               + (' (u.data, rastgele %20)' if args.eval_split == 'random' else ' (u1.base/u1.test)'))
+    if args.dataset == 'filmtrust':
+        fold_ft = f', fold={args.fold}' if args.fold else ''
+        print(f"Eval split    : rastgele %20 (ratings.txt{fold_ft})")
     print(f"Mod           : {args.mode}")
     print(f"Algoritmalar  : {args.algo or ALGO_LABELS}")
     print(f"Epoch çiftleri: {len(epoch_pairs)} adet {'(grid/Cartesian)' if args.epochs_grid else '(zip/yayılım)'}")
@@ -6449,8 +6931,12 @@ if __name__ == '__main__':
     if args.assignment_k is not None:
         print(f"Assignment K  : {list(args.assignment_k)}")
     else:
-        print(f"Assignment K  : --k-100k={args.assignment_k_100k}  --k-1m={args.assignment_k_1m} "
-              f"(veya varsayılan 90/150)")
+        print(
+            f"Assignment K  : --k-100k={args.assignment_k_100k}  "
+            f"--k-1m={args.assignment_k_1m}  "
+            f"--k-filmtrust={args.assignment_k_filmtrust} "
+            f"(veya varsayılanlar)"
+        )
     if args.assign_root:
         print(f"Assignment kök: {args.assign_root}")
     if args.sync_assign_suffix_latent:
@@ -6496,9 +6982,24 @@ if __name__ == '__main__':
         tag_k = '-'.join(map(str, ks)) if len(ks) > 1 else str(ks[0])
         all_tags.append(f"ml1m_k{tag_k}")
 
+    def _k_iter_filmtrust():
+        if args.assignment_k is not None:
+            return args.assignment_k
+        return [
+            _resolved_assignment_k(
+                args.assignment_k_filmtrust, None, ASSIGN_K_DEFAULT_FILMTRUST,
+            ),
+        ]
+
+    if args.dataset == 'filmtrust':
+        ks = _k_iter_filmtrust()
+        tag_k = '-'.join(map(str, ks)) if len(ks) > 1 else str(ks[0])
+        all_tags.append(f"filmtrust_k{tag_k}")
+
     train_100k = test_100k = None
     train_1m   = test_1m = None
-    full_100k = full_1m = None
+    train_filmtrust = test_filmtrust = None
+    full_100k = full_1m = full_filmtrust = None
     if args.dataset in ('100k', 'both'):
         if args.eval_split == 'random':
             train_100k, test_100k = load_ratings_100k_all(
@@ -6520,11 +7021,19 @@ if __name__ == '__main__':
         train_1m, test_1m = load_ratings_1m(
             DATA_1M, random_seed=RANDOM_SEED, fold=args.fold,
         )
+    if args.dataset == 'filmtrust':
+        train_filmtrust, test_filmtrust = load_ratings_filmtrust(
+            getattr(args, 'data_filmtrust', DATA_FILMTRUST),
+            random_seed=RANDOM_SEED,
+            fold=args.fold,
+        )
     if args.fold is None:
         if train_100k is not None and test_100k is not None:
             full_100k = np.concatenate([train_100k, test_100k], axis=0)
         if train_1m is not None and test_1m is not None:
             full_1m = np.concatenate([train_1m, test_1m], axis=0)
+        if train_filmtrust is not None and test_filmtrust is not None:
+            full_filmtrust = np.concatenate([train_filmtrust, test_filmtrust], axis=0)
 
     svdpp_sequence = [False, True] if args.compare_mf_svdpp else [bool(args.svdpp)]
 
@@ -6719,6 +7228,110 @@ if __name__ == '__main__':
                             assignment_k=K,
                             assignment_k_100k=None,
                             assignment_k_1m=None,
+                            weighted_v=args.weighted_v,
+                            use_bias=args.use_bias,
+                            use_cluster_bias=args.cluster_bias,
+                            run_cluster_avg=not args.no_cluster_avg,
+                            do_cluster_knn=not args.no_cluster_knn,
+                            top_n=args.top_n,
+                            relevance_threshold=args.relevance_threshold,
+                            similarity=args.similarity,
+                            knn=args.knn,
+                            min_common=args.min_common,
+                            expand_knn=args.expand_knn,
+                            knn_mode=args.knn_mode,
+                            hybrid_alpha=args.hybrid_alpha,
+                            use_svdpp=use_sp,
+                            run_command=RUN_COMMAND,
+                            args=args,
+                            fold=args.fold,
+                        )
+                        combo_rows.extend(rows)
+
+            if args.dataset == 'filmtrust':
+                for K in _k_iter_filmtrust():
+                    if _should_skip_existing_run(
+                        args,
+                        'filmtrust',
+                        K,
+                        args.mode,
+                        args.fold,
+                        use_sp,
+                        args.fold is None and full_filmtrust is not None,
+                    ):
+                        print(
+                            f"[skip-existing] filmtrust K={K}  "
+                            f"tag={_format_hyperparam_tag(K)}  use_svdpp={use_sp}"
+                        )
+                        continue
+                    if args.fold is None and full_filmtrust is not None:
+                        fold_rows_ft: List[dict] = []
+                        print(
+                            "\n[filmtrust] 5-Fold CV baslatiliyor "
+                            "(n_splits=5, shuffle=True, random_state=42)"
+                        )
+                        for fold_idx, (cv_train, cv_test) in enumerate(
+                            _build_kfold_splits(
+                                full_filmtrust, n_splits=5, shuffle=True, random_state=42,
+                            ),
+                            start=1,
+                        ):
+                            print(f"\n[filmtrust] Fold {fold_idx}/5")
+                            rows = run_dataset(
+                                'filmtrust', cv_train, cv_test,
+                                algo_filter=args.algo,
+                                run_global=not args.no_global,
+                                mode=args.mode,
+                                cluster_workers=args.jobs,
+                                algo_workers=args.algo_jobs,
+                                assign_root=args.assign_root,
+                                assign_suffix=args.assign_suffix,
+                                assignment_k=K,
+                                assignment_k_100k=None,
+                                assignment_k_1m=None,
+                                assignment_k_filmtrust=None,
+                                weighted_v=args.weighted_v,
+                                use_bias=args.use_bias,
+                                use_cluster_bias=args.cluster_bias,
+                                run_cluster_avg=not args.no_cluster_avg,
+                                do_cluster_knn=not args.no_cluster_knn,
+                                top_n=args.top_n,
+                                relevance_threshold=args.relevance_threshold,
+                                similarity=args.similarity,
+                                knn=args.knn,
+                                min_common=args.min_common,
+                                expand_knn=args.expand_knn,
+                                knn_mode=args.knn_mode,
+                                hybrid_alpha=args.hybrid_alpha,
+                                use_svdpp=use_sp,
+                                run_command=RUN_COMMAND,
+                                args=args,
+                                fold=fold_idx,
+                            )
+                            for row in rows:
+                                row['cv_fold'] = fold_idx
+                            fold_rows_ft.extend(rows)
+                        mean_rows = _aggregate_fold_results(fold_rows_ft, n_splits=5)
+                        for row in mean_rows:
+                            _save_row_to_db('filmtrust', row, K, args)
+                        _save_cv_mean_results(
+                            'filmtrust', K, args.mode, mean_rows, RUN_COMMAND,
+                        )
+                        combo_rows.extend(mean_rows)
+                    else:
+                        rows = run_dataset(
+                            'filmtrust', train_filmtrust, test_filmtrust,
+                            algo_filter=args.algo,
+                            run_global=not args.no_global,
+                            mode=args.mode,
+                            cluster_workers=args.jobs,
+                            algo_workers=args.algo_jobs,
+                            assign_root=args.assign_root,
+                            assign_suffix=args.assign_suffix,
+                            assignment_k=K,
+                            assignment_k_100k=None,
+                            assignment_k_1m=None,
+                            assignment_k_filmtrust=None,
                             weighted_v=args.weighted_v,
                             use_bias=args.use_bias,
                             use_cluster_bias=args.cluster_bias,

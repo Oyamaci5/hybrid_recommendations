@@ -49,6 +49,7 @@ __pycache__/
 .env.local
 venv/
 env/
+.venv/
 
 # IDE and editors
 .vscode/*

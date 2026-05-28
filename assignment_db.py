@@ -755,6 +755,8 @@ def _infer_assign_suffix_from_row(row: dict) -> str:
         inner = f'_none_k{k}'
     if 'kmeans-refine' in cmd_l:
         inner += '_kmref'
+    if ' --fcm' in cmd_l or '--fcm ' in cmd_l or cmd_l.rstrip().endswith('--fcm'):
+        inner += '_fcm'
     parts.append(inner)
     return normalize_assign_suffix(''.join(parts))
 

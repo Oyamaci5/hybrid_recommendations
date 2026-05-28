@@ -6,6 +6,8 @@ WNMF deneyleri için yardımcı fonksiyonlar.
 İçerik:
     load_ratings_100k()    — ML-100K train/test yükle
     load_ratings_1m()      — ML-1M train/test yükle
+    load_ratings_filmtrust() — FilmTrust train/test yükle
+    load_filmtrust_matrix()  — FilmTrust tam matris (assignment üretimi)
     load_assignment()      — assignments.npy + gray_sheep_mask.npy yükle
     load_centroids()         — best_sol.npy centroid matrisi (opsiyonel)
     nearest_centroid_assignments() — train profiline göre en yakın küme
@@ -122,6 +124,100 @@ def load_ratings_100k_all(ratings_path: str, test_ratio: float = 0.2,
           f"Film: {int(max(train[:, 1].max(), test[:, 1].max())) + 1}")
 
     return train, test
+
+
+def _remap_filmtrust_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """FilmTrust ham ID'lerini 0-indexed sürekli indekslere map et."""
+    users = {u: i for i, u in enumerate(sorted(df['user_id'].unique()))}
+    items = {it: j for j, it in enumerate(sorted(df['item_id'].unique()))}
+    out = df.copy()
+    out['user_id'] = out['user_id'].map(users).astype(np.int32)
+    out['item_id'] = out['item_id'].map(items).astype(np.int32)
+    return out
+
+
+def load_ratings_filmtrust(
+    ratings_path: str,
+    test_ratio: float = 0.2,
+    random_seed: int = 42,
+    fold: Optional[int] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    FilmTrust ratings.txt → train/test (0-indexed user/item).
+
+    fold None veya 1: train_test_split (test_ratio, seed).
+    fold=2..5: KFold(5) parçası (ML-100K random protokolü ile uyumlu).
+    """
+    if fold is not None and not (1 <= fold <= 5):
+        raise ValueError(
+            f"load_ratings_filmtrust: fold None veya 1..5 olmalı, gelen: {fold}"
+        )
+
+    df = pd.read_csv(
+        ratings_path,
+        sep=r'\s+',
+        names=['user_id', 'item_id', 'rating'],
+        engine='python',
+    )
+    df = _remap_filmtrust_dataframe(df)
+
+    if fold is None or fold == 1:
+        train_df, test_df = train_test_split(
+            df,
+            test_size=test_ratio,
+            random_state=random_seed,
+            shuffle=True,
+        )
+        split_label = f'rastgele %{int(round(test_ratio * 100))} (seed={random_seed})'
+    else:
+        kf = KFold(n_splits=5, shuffle=True, random_state=random_seed)
+        splits = list(kf.split(df))
+        train_idx, test_idx = splits[fold - 1]
+        train_df = df.iloc[train_idx]
+        test_df = df.iloc[test_idx]
+        split_label = f'KFold fold {fold}/5 (seed={random_seed})'
+
+    train = train_df[['user_id', 'item_id', 'rating']].values.astype(np.float32)
+    test = test_df[['user_id', 'item_id', 'rating']].values.astype(np.float32)
+
+    print(f"FilmTrust yüklendi ({split_label})")
+    print(f"  Kaynak: {ratings_path}")
+    print(f"  Train: {len(train):,} rating")
+    print(f"  Test : {len(test):,} rating")
+    print(
+        f"  Kullanıcı: {int(max(train[:, 0].max(), test[:, 0].max())) + 1}, "
+        f"Film: {int(max(train[:, 1].max(), test[:, 1].max())) + 1}"
+    )
+    return train, test
+
+
+def load_filmtrust_matrix(ratings_path: str) -> np.ndarray:
+    """FilmTrust tüm rating'lerinden dense kullanıcı×item matrisi (eksik=0)."""
+    df = pd.read_csv(
+        ratings_path,
+        sep=r'\s+',
+        names=['user_id', 'item_id', 'rating'],
+        engine='python',
+    )
+    df = _remap_filmtrust_dataframe(df)
+    matrix = (
+        df.pivot_table(
+            index='user_id',
+            columns='item_id',
+            values='rating',
+            fill_value=0,
+        )
+        .values.astype(np.float32)
+    )
+    total = matrix.size
+    nonzero = np.count_nonzero(matrix)
+    rated = matrix[matrix > 0]
+    print(f"FilmTrust matris yüklendi: {ratings_path}")
+    print(f"  Shape    : {matrix.shape}")
+    print(f"  Sparsity : {1 - nonzero / total:.3f}")
+    if rated.size:
+        print(f"  Rating   : {rated.min():.1f} - {rated.max():.1f}")
+    return matrix
 
 
 def load_ratings_1m(ratings_path: str, test_ratio: float = 0.2,
@@ -407,6 +503,75 @@ def resolve_test_cluster_ids(
         flush=True,
     )
     return test_ids
+
+
+def build_cluster_rating_centroids(
+    R_train: np.ndarray,
+    assignments: np.ndarray,
+    n_clusters: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Train profillerinden küme başına item uzayı centroid'i.
+    centroids[cid, i] = kümede i'yi puanlayan kullanıcıların ortalaması; yoksa 0.
+    """
+    R_train = np.asarray(R_train, dtype=np.float64)
+    assignments = np.asarray(assignments, dtype=np.int32)
+    n_items = int(R_train.shape[1])
+    n_clusters = int(n_clusters)
+    sums = np.zeros((n_clusters, n_items), dtype=np.float64)
+    counts = np.zeros((n_clusters, n_items), dtype=np.int32)
+    n_users = min(len(assignments), R_train.shape[0])
+    for u in range(n_users):
+        cid = int(assignments[u])
+        if cid < 0 or cid >= n_clusters:
+            continue
+        mask = R_train[u] > 0
+        if not np.any(mask):
+            continue
+        sums[cid, mask] += R_train[u, mask]
+        counts[cid, mask] += 1
+    centroids = np.zeros((n_clusters, n_items), dtype=np.float32)
+    nz = counts > 0
+    centroids[nz] = (sums[nz] / counts[nz]).astype(np.float32)
+    return centroids, counts
+
+
+def compute_item_global_means(R_train: np.ndarray, default_mean: float) -> np.ndarray:
+    """Her item için tüm kullanıcı train ortalaması; hiç rating yoksa default_mean."""
+    R_train = np.asarray(R_train, dtype=np.float64)
+    n_items = int(R_train.shape[1])
+    counts = (R_train > 0).sum(axis=0)
+    sums = np.where(R_train > 0, R_train, 0.0).sum(axis=0)
+    out = np.full(n_items, float(default_mean), dtype=np.float64)
+    mask = counts > 0
+    out[mask] = sums[mask] / counts[mask]
+    return out
+
+
+def predict_centroid(
+    u: int,
+    i: int,
+    cluster_ids: np.ndarray,
+    centroids: np.ndarray,
+    R_train: np.ndarray,
+    centroid_counts: np.ndarray,
+    item_global_means: np.ndarray,
+) -> float:
+    """
+    Küme rating centroid'inden doğrudan tahmin.
+    centroid[cid, i] yoksa (0) → küme üyeleri ortalaması → global item ortalaması.
+    """
+    cid = int(cluster_ids[int(u)])
+    pred = float(centroids[cid, int(i)])
+    if centroid_counts[cid, int(i)] > 0:
+        return float(np.clip(pred, 1.0, 5.0))
+    cluster_users = np.where(cluster_ids == cid)[0]
+    raters = cluster_users[R_train[cluster_users, int(i)] > 0]
+    if len(raters) > 0:
+        pred = float(R_train[raters, int(i)].mean())
+    else:
+        pred = float(item_global_means[int(i)])
+    return float(np.clip(pred, 1.0, 5.0))
 
 
 # ============================================================
