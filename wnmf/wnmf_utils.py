@@ -79,8 +79,11 @@ def load_ratings_100k_all(ratings_path: str, test_ratio: float = 0.2,
     """
     ML-100K u.data dosyasından tüm rating'leri yükle ve train/test'e böl.
 
-    fold None veya 1: train_test_split ile test_ratio (varsayılan %%20).
-    fold=2..5: KFold(n_splits=5, shuffle=True, random_state=random_seed).
+    fold None: train_test_split ile test_ratio (varsayılan %%20) — tek holdout.
+    fold 1..5: KFold(n_splits=5, shuffle=True, random_state=random_seed);
+        fold i → splits[i-1] (tüm CV fold'ları aynı bölme şeması).
+
+    Official ML-100K için load_ratings_100k(u{N}.base, u{N}.test) kullanın.
 
     Döndürülen array'lerde user_id ve item_id 0-indexed (943×1682 ile uyumlu).
     """
@@ -97,7 +100,7 @@ def load_ratings_100k_all(ratings_path: str, test_ratio: float = 0.2,
     df['user_id'] -= 1
     df['item_id'] -= 1
 
-    if fold is None or fold == 1:
+    if fold is None:
         train_df, test_df = train_test_split(
             df,
             test_size=test_ratio,
@@ -108,7 +111,7 @@ def load_ratings_100k_all(ratings_path: str, test_ratio: float = 0.2,
     else:
         kf = KFold(n_splits=5, shuffle=True, random_state=random_seed)
         splits = list(kf.split(df))
-        train_idx, test_idx = splits[fold - 1]
+        train_idx, test_idx = splits[int(fold) - 1]
         train_df = df.iloc[train_idx]
         test_df = df.iloc[test_idx]
         split_label = f'KFold fold {fold}/5 (seed={random_seed})'
@@ -145,8 +148,7 @@ def load_ratings_filmtrust(
     """
     FilmTrust ratings.txt → train/test (0-indexed user/item).
 
-    fold None veya 1: train_test_split (test_ratio, seed).
-    fold=2..5: KFold(5) parçası (ML-100K random protokolü ile uyumlu).
+    fold None: train_test_split; fold 1..5: KFold(5) parçası (ML-100K random ile uyumlu).
     """
     if fold is not None and not (1 <= fold <= 5):
         raise ValueError(
@@ -161,7 +163,7 @@ def load_ratings_filmtrust(
     )
     df = _remap_filmtrust_dataframe(df)
 
-    if fold is None or fold == 1:
+    if fold is None:
         train_df, test_df = train_test_split(
             df,
             test_size=test_ratio,
@@ -172,7 +174,7 @@ def load_ratings_filmtrust(
     else:
         kf = KFold(n_splits=5, shuffle=True, random_state=random_seed)
         splits = list(kf.split(df))
-        train_idx, test_idx = splits[fold - 1]
+        train_idx, test_idx = splits[int(fold) - 1]
         train_df = df.iloc[train_idx]
         test_df = df.iloc[test_idx]
         split_label = f'KFold fold {fold}/5 (seed={random_seed})'
@@ -226,8 +228,7 @@ def load_ratings_1m(ratings_path: str, test_ratio: float = 0.2,
     ML-1M formatında rating'leri yükle ve train/test'e böl.
 
     ML-1M'in hazır fold'ları yok.
-    fold None veya 1: train_test_split ile test_ratio (varsayılan %20), random_state=random_seed.
-    fold=2..5: KFold(n_splits=5, shuffle=True, random_state=random_seed) parçası splits[fold-1].
+    fold None: train_test_split; fold 1..5: KFold(5) parçası splits[fold-1].
     Dosya formatı: UserID::MovieID::Rating::Timestamp
 
     Parametreler
@@ -235,7 +236,7 @@ def load_ratings_1m(ratings_path: str, test_ratio: float = 0.2,
     ratings_path : str   — ratings.dat dosya yolu
     test_ratio   : float — holdout için test oranı; KFold fold'larında yok sayılır
     random_seed  : int   — holdout ve KFold için random_state
-    fold         : int veya None — None/1: holdout; 2..5: KFold parçası
+    fold         : int veya None — None: holdout; 1..5: KFold parçası
 
     Döndürür
     --------
@@ -260,7 +261,7 @@ def load_ratings_1m(ratings_path: str, test_ratio: float = 0.2,
 
     df = pd.DataFrame(rows, columns=['user_id', 'item_id', 'rating'])
 
-    if fold is None or fold == 1:
+    if fold is None:
         train_df, test_df = train_test_split(
             df,
             test_size=test_ratio,
@@ -270,7 +271,7 @@ def load_ratings_1m(ratings_path: str, test_ratio: float = 0.2,
     else:
         kf = KFold(n_splits=5, shuffle=True, random_state=random_seed)
         splits = list(kf.split(df))
-        train_idx, test_idx = splits[fold - 1]
+        train_idx, test_idx = splits[int(fold) - 1]
         train_df = df.iloc[train_idx]
         test_df = df.iloc[test_idx]
 

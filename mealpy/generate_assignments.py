@@ -75,6 +75,7 @@ from mealpy_comparison_v2 import (
     load_movielens,
     mkmeans_plus_plus_init,
     make_fitness_function,
+    MO_WEIGHT_PRESETS,
     compute_wcss_fast,
     compute_fcm_objective,
     detect_gray_sheep,
@@ -225,6 +226,7 @@ ALGO_CONFIG = [
     ('SFOA', 'SFOA', None),
     ('SFOA_06', 'SFOA_06', None),
     ('LIT_CIRCLESA', 'CircleSA.OriginalCircleSA', None),
+    ('AGTO', 'AGTO.OriginalAGTO', None),
     ('LIT_GOA', 'GOA.OriginalGOA', None),
     ('LIT_GWO', 'GWO.OriginalGWO', None),
     ('LIT_SSA', 'SSA.OriginalSSA', None),
@@ -412,11 +414,48 @@ def _centroid_value_upper_bound(matrix: np.ndarray) -> float:
     return float(np.max(ub))
 
 
-def _make_problem(matrix, K, metric: str = 'pearson', cluster_objective: str = 'multi'):
+def _parse_mo_weights_arg(value):
+    """--mo-weights: preset adı veya '0.4,0.3,0.3'."""
+    from mealpy_comparison_v2 import _normalize_mo_weights
+    if value is None or str(value).strip() == '':
+        return MO_WEIGHT_PRESETS['default']
+    return _normalize_mo_weights(str(value).strip())
+
+
+def _fitness_config_from_args(args):
+    """Meta WCSS/multi-objective fitness yapılandırması."""
+    if args is None:
+        return {'objective': 'multi'}
+    cfg = {
+        'objective': getattr(args, 'cluster_objective', 'multi') or 'multi',
+        'mo_weights': _parse_mo_weights_arg(getattr(args, 'mo_weights', None)),
+        'repulsion_lambda': float(
+            getattr(args, 'centroid_repulsion_lambda', 0.0) or 0.0
+        ),
+        'repulsion_dmin': getattr(args, 'centroid_repulsion_dmin', None),
+    }
+    if cfg['repulsion_dmin'] is not None:
+        cfg['repulsion_dmin'] = float(cfg['repulsion_dmin'])
+    if getattr(args, 'cluster_metric', '') == 'fuzzy':
+        cfg['fcm_m'] = _fcm_m_from_args(args)
+    return cfg
+
+
+def _make_problem(
+    matrix,
+    K,
+    metric: str = 'pearson',
+    cluster_objective: str = 'multi',
+    fitness_config: dict | None = None,
+):
     lb, ub = _centroid_search_bounds(matrix, K)
+    fc = dict(fitness_config or {'objective': cluster_objective})
+    fc.setdefault('objective', cluster_objective)
     return {
         "obj_func"       : make_fitness_function(
-            matrix, K, metric=metric, objective=cluster_objective,
+            matrix, K, metric=metric,
+            fcm_m=float(fc.get('fcm_m', 2.0) or 2.0),
+            **{k: v for k, v in fc.items() if k != 'fcm_m'},
         ),
         "bounds"         : FloatVar(
                                lb=lb.tolist(),
@@ -429,9 +468,32 @@ def _make_problem(matrix, K, metric: str = 'pearson', cluster_objective: str = '
     }
 
 
+def _resolve_problem(
+    matrix,
+    K,
+    problem=None,
+    metric: str = 'pearson',
+    cluster_objective: str = 'multi',
+    fitness_config: dict | None = None,
+):
+    """WCSS problemi veya dışarıdan verilen centroid fitness problemi."""
+    if problem is not None:
+        return problem
+    return _make_problem(
+        matrix, K, metric=metric, cluster_objective=cluster_objective,
+        fitness_config=fitness_config,
+    )
+
+
 def run_single(algo_info, matrix, K, init, epoch, pop_size, metric: str = 'pearson',
-               cluster_objective: str = 'multi'):
-    problem = _make_problem(matrix, K, metric=metric, cluster_objective=cluster_objective)
+               cluster_objective: str = 'multi', fitness_config: dict | None = None,
+               problem=None):
+    custom_problem = problem is not None
+    problem = _resolve_problem(
+        matrix, K, problem=problem,
+        metric=metric, cluster_objective=cluster_objective,
+        fitness_config=fitness_config,
+    )
     sp      = get_special_params(algo_info['full_name'], epoch, pop_size)
     model   = algo_info['class'](**(sp or {'epoch': epoch, 'pop_size': pop_size}))
     try:
@@ -439,7 +501,10 @@ def run_single(algo_info, matrix, K, init, epoch, pop_size, metric: str = 'pears
     except TypeError:
         model.solve(problem)
     best_fit = float(model.g_best.target.fitness)
-    print(f"    {algo_info['full_name'].split('.')[0]} WCSS: {best_fit:.4f}")
+    metric_label = 'fitness' if custom_problem else 'WCSS'
+    print(
+        f"    {algo_info['full_name'].split('.')[0]} {metric_label}: {best_fit:.4f}"
+    )
     return model.g_best.solution, best_fit
 
 
@@ -546,13 +611,17 @@ def run_single_with_early_stop(
     tolerance: float = EARLY_STOP_TOLERANCE,
     block_size: int = EARLY_STOP_BLOCK_SIZE,
     cluster_objective: str = 'multi',
+    fitness_config: dict | None = None,
+    problem=None,
 ):
     """
     mealpy epoch callback olmadığı için optimizasyonu bloklar halinde çalıştırır.
     patience ardışık blok boyunca tolerance altında iyileşme yoksa durur.
     """
-    problem = _make_problem(
-        matrix, K, metric=metric, cluster_objective=cluster_objective,
+    problem = _resolve_problem(
+        matrix, K, problem=problem,
+        metric=metric, cluster_objective=cluster_objective,
+        fitness_config=fitness_config,
     )
     lb = np.array(problem["bounds"].lb)
     ub = np.array(problem["bounds"].ub)
@@ -603,11 +672,15 @@ def run_ha_avoahgs_with_early_stop(
     p1: float = 0.4,
     hgs_rate: float = 0.7,
     cluster_objective: str = 'multi',
+    fitness_config: dict | None = None,
+    problem=None,
 ):
     from optimizers.HA_AVOAHGS import HA_AVOAHGS
 
-    problem = _make_problem(
-        matrix, K, metric=metric, cluster_objective=cluster_objective,
+    problem = _resolve_problem(
+        matrix, K, problem=problem,
+        metric=metric, cluster_objective=cluster_objective,
+        fitness_config=fitness_config,
     )
     lb = np.array(problem["bounds"].lb)
     ub = np.array(problem["bounds"].ub)
@@ -654,11 +727,15 @@ def run_iwo_hho_with_early_stop(
     tolerance: float = EARLY_STOP_TOLERANCE,
     block_size: int = EARLY_STOP_BLOCK_SIZE,
     cluster_objective: str = 'multi',
+    fitness_config: dict | None = None,
+    problem=None,
 ):
     from optimizers.iwo_hho import IWO_HHO_Clustering
 
-    problem = _make_problem(
-        matrix, K, metric=metric, cluster_objective=cluster_objective,
+    problem = _resolve_problem(
+        matrix, K, problem=problem,
+        metric=metric, cluster_objective=cluster_objective,
+        fitness_config=fitness_config,
     )
     lb = np.array(problem["bounds"].lb)
     ub = np.array(problem["bounds"].ub)
@@ -694,9 +771,13 @@ def run_iwo_hho_with_early_stop(
 
 
 def run_hybrid(g_info, l_info, matrix, K, init, g_epoch, l_epoch, pop_size,
-               metric: str = 'pearson', cluster_objective: str = 'multi'):
-    problem = _make_problem(
-        matrix, K, metric=metric, cluster_objective=cluster_objective,
+               metric: str = 'pearson', cluster_objective: str = 'multi',
+               fitness_config: dict | None = None, problem=None):
+    custom_problem = problem is not None
+    problem = _resolve_problem(
+        matrix, K, problem=problem,
+        metric=metric, cluster_objective=cluster_objective,
+        fitness_config=fitness_config,
     )
 
     sp_g    = get_special_params(g_info['full_name'], g_epoch, pop_size)
@@ -707,7 +788,11 @@ def run_hybrid(g_info, l_info, matrix, K, init, g_epoch, l_epoch, pop_size,
         g_model.solve(problem)
     best_g_sol = g_model.g_best.solution
     best_g_fit = float(g_model.g_best.target.fitness)
-    print(f"    Global ({g_info['full_name'].split('.')[0]}) WCSS: {best_g_fit:.4f}")
+    metric_label = 'fitness' if custom_problem else 'WCSS'
+    print(
+        f"    Global ({g_info['full_name'].split('.')[0]}) "
+        f"{metric_label}: {best_g_fit:.4f}"
+    )
 
     sp_l    = get_special_params(l_info['full_name'], l_epoch, pop_size)
     l_model = l_info['class'](**(sp_l or {'epoch': l_epoch, 'pop_size': pop_size}))
@@ -730,26 +815,34 @@ def run_hybrid(g_info, l_info, matrix, K, init, g_epoch, l_epoch, pop_size,
     except TypeError:
         l_model.solve(problem)
     best_l_fit = float(l_model.g_best.target.fitness)
-    print(f"    Local  ({l_info['full_name'].split('.')[0]}) WCSS: {best_l_fit:.4f}")
+    print(
+        f"    Local  ({l_info['full_name'].split('.')[0]}) "
+        f"{metric_label}: {best_l_fit:.4f}"
+    )
 
     if best_l_fit < best_g_fit:
         best_sol, best_fit, improved = l_model.g_best.solution, best_l_fit, True
     else:
         best_sol, best_fit, improved = best_g_sol, best_g_fit, False
-    print(f"    Lokal iyilestirdi: {improved}  ->  Final WCSS: {best_fit:.4f}")
+    print(
+        f"    Lokal iyilestirdi: {improved}  ->  Final {metric_label}: {best_fit:.4f}"
+    )
     return best_sol, best_fit
 
 
 def run_parallel_hybrid(g_info, l_info, matrix, K, init, g_epoch, l_epoch, pop_size,
-                        metric: str = 'pearson', cluster_objective: str = 'multi'):
+                        metric: str = 'pearson', cluster_objective: str = 'multi',
+                        fitness_config: dict | None = None, problem=None):
     """Etikette '||' geçen hibrit: iki algoritmayı ayrı çalıştırıp en iyi WCSS'yi seçer."""
     sol_g, fit_g = run_single(
         g_info, matrix, K, init, g_epoch, pop_size,
         metric=metric, cluster_objective=cluster_objective,
+        fitness_config=fitness_config, problem=problem,
     )
     sol_l, fit_l = run_single(
         l_info, matrix, K, init, l_epoch, pop_size,
         metric=metric, cluster_objective=cluster_objective,
+        fitness_config=fitness_config, problem=problem,
     )
     if fit_l < fit_g:
         return sol_l, fit_l
@@ -762,7 +855,9 @@ def run_memetic_hybrid(base_info, matrix, K, init,
                        ga_crossover_rate=0.3,
                        ga_mutation_rate=0.1,
                        metric: str = 'pearson',
-                       cluster_objective: str = 'multi'):
+                       cluster_objective: str = 'multi',
+                       fitness_config: dict | None = None,
+                       problem=None):
     """
     Memetic hibrit: Sürü algoritması + GA operatör enjeksiyonu.
 
@@ -777,8 +872,10 @@ def run_memetic_hybrid(base_info, matrix, K, init,
     """
     import numpy as np
 
-    problem = _make_problem(
-        matrix, K, metric=metric, cluster_objective=cluster_objective,
+    problem = _resolve_problem(
+        matrix, K, problem=problem,
+        metric=metric, cluster_objective=cluster_objective,
+        fitness_config=fitness_config,
     )
     lb = np.array(problem["bounds"].lb)
     ub = np.array(problem["bounds"].ub)
@@ -1140,6 +1237,48 @@ def _refine_centroids_with_kmeans(
         return None
 
 
+def _repair_empty_clusters(matrix, best_sol, assignments, K):
+    """Boş kümeleri, atamaları topluca ezmeden onarır.
+
+    Meta-sezgisel atamalarının geri kalanını KORUR. Yalnızca boş kalan her küme
+    için, birden fazla üyeli kümelerden kendi merkezine en uzak (en kötü oturan)
+    noktayı o boş kümeye taşır ve boş kümenin merkezini o noktaya çeker. Lloyd
+    yakınsamasıyla tüm atamaları yeniden hesaplamaz → algoritmalar arası farklar
+    korunur.
+
+    Dönüş: (assignments (int32), centroids (K, dim), n_moved).
+    """
+    X = np.asarray(matrix, dtype=np.float64)
+    assignments = np.asarray(assignments, dtype=np.int32).copy()
+    centroids = np.asarray(best_sol, dtype=np.float64).reshape(K, X.shape[1]).copy()
+    n_moved = 0
+
+    for _ in range(K):  # en fazla K geçiş yeter (her geçiş ≥1 boş küme doldurur)
+        counts = np.bincount(assignments, minlength=K)
+        empties = np.where(counts == 0)[0]
+        if empties.size == 0:
+            break
+        if np.count_nonzero(counts > 1) == 0:
+            # Onarılamaz: aktif nokta sayısı < istenen küme sayısı.
+            break
+        donor_idx = np.where(counts[assignments] > 1)[0]
+        # Aday noktaların kendi merkezine Öklid mesafesi (en kötü oturan önce).
+        d = np.linalg.norm(X[donor_idx] - centroids[assignments[donor_idx]], axis=1)
+        order = donor_idx[np.argsort(-d)]
+        oi = 0
+        for cid in empties:
+            while oi < len(order):
+                p = int(order[oi])
+                oi += 1
+                src = int(assignments[p])
+                if np.sum(assignments == src) > 1:  # bağışçıda en az 1 üye kalsın
+                    assignments[p] = int(cid)
+                    centroids[cid] = X[p]
+                    n_moved += 1
+                    break
+    return assignments, centroids, n_moved
+
+
 def _run_one_core(
     label,
     g_name,
@@ -1173,21 +1312,33 @@ def _run_one_core(
     cluster_objective = (
         getattr(args, 'cluster_objective', 'multi') if args is not None else 'multi'
     )
+    fitness_config = (
+        _fitness_config_from_args(args) if args is not None
+        else {'objective': cluster_objective}
+    )
     # B0_KMEANS her zaman gerçek KMeans baseline olarak çalışmalı.
-    # knn_mae/latent_dev gibi fitness'lar yalnızca meta-sezgisel dallar için
-    # centroid optimizer'ı tetikler.
+    # knn_mae/latent_dev: --algo etiketi centroid aramasını yürütür; ardından kmref.
     use_centroid_opt = (
         label != 'B0_KMEANS'
         and fitness_mode in ('latent_dev', 'knn_mae', 'knn_mae_legacy')
     )
+    centroid_problem = None
+    fitness_evaluator = None
+    search_matrix = matrix
+    flat_fitness_fn = None
+
     if use_centroid_opt:
-        opt_note = (
-            f", fitness={fitness_mode}, "
-            f"centroid_algo={getattr(args, 'centroid_algo', 'MFO')}"
-        )
+        opt_note = f", fitness={fitness_mode}, centroid_search={label}"
     else:
         opt_note = ""
     obj_note = f", cluster_objective={cluster_objective}" if not use_centroid_opt else ""
+    if not use_centroid_opt and cluster_objective == 'multi':
+        mw = fitness_config.get('mo_weights', MO_WEIGHT_PRESETS['default'])
+        rep_l = float(fitness_config.get('repulsion_lambda', 0.0) or 0.0)
+        obj_note = (
+            f", cluster_objective={cluster_objective}, "
+            f"mo=({mw[0]:g},{mw[1]:g},{mw[2]:g}), repulsion={rep_l:g}"
+        )
     print(
         f"\n  [{label}] başlıyor "
         f"(gray sheep: {mode_str}, küme metrik: {cluster_metric}, init: {init_mode}"
@@ -1201,7 +1352,7 @@ def _run_one_core(
     cluster_matrix = matrix
 
     if use_centroid_opt:
-        from centroid_optimizer import CentroidOptimizer, load_wnmf_w_matrix
+        from centroid_optimizer import CentroidFitnessEvaluator, load_wnmf_w_matrix
 
         model_path = getattr(args, 'wnmf_model_path', None) if args is not None else None
         if model_path:
@@ -1214,13 +1365,10 @@ def _run_one_core(
             )
         w_matrix_for_save = W_matrix
         cluster_matrix = W_matrix
-        opt = CentroidOptimizer(
+        search_matrix = W_matrix
+        fitness_evaluator = CentroidFitnessEvaluator(
             W_matrix,
             K,
-            n_agents=int(getattr(args, 'centroid_agents', POP_SIZE) or POP_SIZE),
-            n_iter=int(getattr(args, 'centroid_iter', baseline_epoch) or baseline_epoch),
-            algo=str(getattr(args, 'centroid_algo', 'MFO') or 'MFO'),
-            seed=seed,
             train_ratings=getattr(args, 'centroid_train_ratings', None),
             val_ratings=getattr(args, 'centroid_val_ratings', None),
             n_train_sample=int(getattr(args, 'centroid_train_sample', 500) or 500),
@@ -1231,239 +1379,310 @@ def _run_one_core(
             min_common=int(getattr(args, 'min_common', 3) or 3),
             bias_epochs=int(getattr(args, 'centroid_bias_epochs', 5) or 5),
             use_native_predictor=fitness_mode == 'knn_mae',
+            seed=seed,
         )
-        opt_result = opt.optimize()
-        best_sol = opt_result['centroids'].astype(np.float32, copy=False).flatten()
-        assignments = opt_result['assignments'].astype(np.int32, copy=False)
-        best_fit = float(opt_result['fitness'])
-        init = []
-    elif g_name == 'KMEANS':
+        centroid_problem = fitness_evaluator.make_problem()
+        flat_fitness_fn = fitness_evaluator.make_flat_fitness_fn()
+        print(
+            f"  Centroid arama: {label} -> {fitness_evaluator.fitness_label()} "
+            f"(epoch={int(getattr(args, 'centroid_iter', baseline_epoch) or baseline_epoch)}, "
+            f"agents={int(getattr(args, 'centroid_agents', pop_size) or pop_size)})",
+            flush=True,
+        )
+
+    if g_name == 'KMEANS':
         init = []
     else:
         init = _multi_start_init(
-            matrix, K=K, pop_size=pop_size, seed=seed, n_restarts=10,
+            search_matrix, K=K, pop_size=pop_size, seed=seed, n_restarts=10,
             metric=cluster_metric, init_mode=init_mode,
             cluster_objective=cluster_objective,
+            fitness_config=fitness_config,
         )
 
-    if not use_centroid_opt:
-        if label == 'B0_KMEANS':
-            from sklearn.cluster import KMeans
+    opt_epoch = (
+        int(getattr(args, 'centroid_iter', baseline_epoch) or baseline_epoch)
+        if use_centroid_opt else baseline_epoch
+    )
+    opt_pop = (
+        int(getattr(args, 'centroid_agents', pop_size) or pop_size)
+        if use_centroid_opt else pop_size
+    )
 
-            user_matrix = matrix
-            km = KMeans(n_clusters=K, n_init=10, max_iter=500, random_state=42)
-            km.fit(user_matrix)
-            best_sol = km.cluster_centers_.flatten()
-            best_fit = float(km.inertia_)
-            assignments = km.labels_
-        elif label == 'HA_AVOAHGS':
-            if args is not None and getattr(args, 'early_stop', False):
-                es_max, es_pat, es_tol, es_block, es_note = _resolve_ha_epoch_policy(
-                    args, matrix, K, pop_size,
-                )
-                print(f"    HA epoch policy: {es_note}")
-                best_sol, best_fit, actual_epochs, convergence_history = (
-                    run_ha_avoahgs_with_early_stop(
-                        matrix, K, init, es_max, pop_size,
-                        metric=cluster_metric,
-                        patience=es_pat,
-                        tolerance=es_tol,
-                        block_size=es_block,
-                        cluster_objective=cluster_objective,
-                    )
-                )
-                print(f"    Early-stop epoch: {actual_epochs}/{es_max}")
-            else:
-                from optimizers.HA_AVOAHGS import HA_AVOAHGS
+    if label == 'B0_KMEANS':
+        from sklearn.cluster import KMeans
 
-                model = HA_AVOAHGS(
-                    epoch=baseline_epoch,
-                    pop_size=pop_size,
-                    p1=0.4,
-                    hgs_rate=0.7,
-                )
-                problem = _make_problem(
-                    matrix, K, metric=cluster_metric,
-                    cluster_objective=cluster_objective,
-                )
-                try:
-                    model.solve(problem, starting_solutions=init[:pop_size])
-                except TypeError:
-                    model.solve(problem)
-                best_sol = model.g_best.solution
-                best_fit = float(model.g_best.target.fitness)
-        elif g_name == 'KMEANS':
-            from sklearn.cluster import KMeans
-            from sklearn.preprocessing import normalize
-
-            matrix_norm = normalize(matrix, norm='l2')
-            kmeans = KMeans(
-                n_clusters=K,
-                init=_sklearn_kmeans_init(args),
-                n_init=10,
-                random_state=seed,
-                max_iter=300,
-                verbose=0
+        user_matrix = matrix
+        km = KMeans(n_clusters=K, n_init=10, max_iter=500, random_state=42)
+        km.fit(user_matrix)
+        best_sol = km.cluster_centers_.flatten()
+        best_fit = float(km.inertia_)
+        assignments = km.labels_
+    elif label == 'HA_AVOAHGS':
+        ha_p1 = _avoahgs_p1_from_args(args)
+        ha_hgs = _avoahgs_hgs_rate_from_args(args)
+        print(f"    HA_AVOAHGS params: p1={ha_p1:g}, hgs_rate={ha_hgs:g}")
+        if args is not None and getattr(args, 'early_stop', False):
+            es_max, es_pat, es_tol, es_block, es_note = _resolve_ha_epoch_policy(
+                args, search_matrix, K, opt_pop,
             )
-            kmeans.fit(matrix_norm)
-            assignments_km = kmeans.labels_
-
-            best_sol = kmeans.cluster_centers_.flatten()
-            best_fit = float(kmeans.inertia_)
-            assignments = assignments_km
-        elif l_name == 'GAop':
-            best_sol, best_fit = run_memetic_hybrid(
-                algo_map[g_name], matrix, K, init,
-                total_epoch=global_epoch + local_epoch,
-                pop_size=pop_size,
-                ga_inject_interval=10,
-                ga_crossover_rate=0.3,
-                ga_mutation_rate=0.1,
-                metric=cluster_metric,
-                cluster_objective=cluster_objective,
-            )
-        elif g_name == 'LF_HHO' or label == 'LF_HHO':
-            lf_hho = LevyHHO_Clustering(
-                n_agents=pop_size,
-                n_iter=baseline_epoch,
-                k=K,
-                levy_scale=1.0,
-                stagnation_tol=10,
-                seed=seed,
-            )
-            centers = lf_hho.optimize(matrix)
-            _ = lf_hho.assign(matrix, centers)
-            best_sol = centers.flatten()
-            best_fit, _ = compute_wcss_fast(
-                matrix, best_sol, K, metric=cluster_metric,
-            )
-        elif g_name == 'IWO_HHO' or label == 'IWO_HHO':
-            if args is not None and getattr(args, 'early_stop', False):
-                es_max = getattr(args, 'early_stop_max_epoch', EARLY_STOP_MAX_EPOCH)
-                best_sol, best_fit, actual_epochs, convergence_history = (
-                    run_iwo_hho_with_early_stop(
-                        matrix, K, init, es_max, pop_size, seed,
-                        metric=cluster_metric,
-                        patience=getattr(args, 'early_stop_patience', EARLY_STOP_PATIENCE),
-                        tolerance=getattr(args, 'early_stop_tolerance', EARLY_STOP_TOLERANCE),
-                        block_size=getattr(args, 'early_stop_block', EARLY_STOP_BLOCK_SIZE),
-                        cluster_objective=cluster_objective,
-                    )
-                )
-                print(f"    Early-stop epoch: {actual_epochs}/{es_max}")
-            else:
-                from optimizers.iwo_hho import IWO_HHO_Clustering
-
-                problem = _make_problem(
-                    matrix, K, metric=cluster_metric,
-                    cluster_objective=cluster_objective,
-                )
-                iwo_hho = IWO_HHO_Clustering(
-                    epoch=baseline_epoch,
-                    pop_size=pop_size,
-                    seed=seed,
-                )
-                try:
-                    best_sol, best_fit = iwo_hho.solve(
-                        problem, starting_solutions=init[:pop_size],
-                    )
-                except TypeError:
-                    best_sol, best_fit = iwo_hho.solve(problem)
-        elif label in ('SFOA', 'SFOA_06') or g_name in ('SFOA', 'SFOA_06'):
-            gp_map = {'SFOA': 0.5, 'SFOA_06': 0.6}
-            sfoa_key = label if label in gp_map else g_name
-            sfoa = SFOA_Clustering(
-                n_agents=pop_size,
-                n_iter=baseline_epoch,
-                k=K,
-                Gp=gp_map[sfoa_key],
-                seed=seed,
-            )
-            centers = sfoa.optimize(matrix)
-            _ = sfoa.assign(matrix, centers)
-            best_sol = centers.flatten()
-            best_fit, _ = compute_wcss_fast(
-                matrix, best_sol, K, metric=cluster_metric,
-            )
-        elif l_name is None:
-            if args is not None and getattr(args, 'early_stop', False):
-                es_max = getattr(args, 'early_stop_max_epoch', EARLY_STOP_MAX_EPOCH)
-                best_sol, best_fit, actual_epochs, convergence_history = (
-                    run_single_with_early_stop(
-                        algo_map[g_name], matrix, K, init, es_max, pop_size,
-                        metric=cluster_metric,
-                        patience=getattr(args, 'early_stop_patience', EARLY_STOP_PATIENCE),
-                        tolerance=getattr(args, 'early_stop_tolerance', EARLY_STOP_TOLERANCE),
-                        block_size=getattr(args, 'early_stop_block', EARLY_STOP_BLOCK_SIZE),
-                        cluster_objective=cluster_objective,
-                    )
-                )
-                print(f"    Early-stop epoch: {actual_epochs}/{es_max}")
-            else:
-                best_sol, best_fit = run_single(
-                    algo_map[g_name], matrix, K, init, baseline_epoch, pop_size,
+            print(f"    HA epoch policy: {es_note}")
+            best_sol, best_fit, actual_epochs, convergence_history = (
+                run_ha_avoahgs_with_early_stop(
+                    search_matrix, K, init, es_max, opt_pop,
                     metric=cluster_metric,
+                    patience=es_pat,
+                    tolerance=es_tol,
+                    block_size=es_block,
+                    p1=ha_p1,
+                    hgs_rate=ha_hgs,
                     cluster_objective=cluster_objective,
+                    fitness_config=fitness_config,
+                    problem=centroid_problem,
                 )
-        elif '||' in label:
-            best_sol, best_fit = run_parallel_hybrid(
-                algo_map[g_name], algo_map[l_name],
-                matrix, K, init, global_epoch, local_epoch, pop_size,
-                metric=cluster_metric,
-                cluster_objective=cluster_objective,
             )
+            print(f"    Early-stop epoch: {actual_epochs}/{es_max}")
         else:
-            best_sol, best_fit = run_hybrid(
-                algo_map[g_name], algo_map[l_name],
-                matrix, K, init, global_epoch, local_epoch, pop_size,
+            from optimizers.HA_AVOAHGS import HA_AVOAHGS
+
+            model = HA_AVOAHGS(
+                epoch=opt_epoch,
+                pop_size=opt_pop,
+                p1=ha_p1,
+                hgs_rate=ha_hgs,
+            )
+            problem = _resolve_problem(
+                search_matrix, K, problem=centroid_problem,
+                metric=cluster_metric, cluster_objective=cluster_objective,
+                fitness_config=fitness_config,
+            )
+            try:
+                model.solve(problem, starting_solutions=init[:opt_pop])
+            except TypeError:
+                model.solve(problem)
+            best_sol = model.g_best.solution
+            best_fit = float(model.g_best.target.fitness)
+    elif g_name == 'KMEANS':
+        from sklearn.cluster import KMeans
+        from sklearn.preprocessing import normalize
+
+        matrix_norm = normalize(search_matrix, norm='l2')
+        kmeans = KMeans(
+            n_clusters=K,
+            init=_sklearn_kmeans_init(args),
+            n_init=10,
+            random_state=seed,
+            max_iter=300,
+            verbose=0
+        )
+        kmeans.fit(matrix_norm)
+        assignments_km = kmeans.labels_
+
+        best_sol = kmeans.cluster_centers_.flatten()
+        best_fit = float(kmeans.inertia_)
+        assignments = assignments_km
+    elif l_name == 'GAop':
+        best_sol, best_fit = run_memetic_hybrid(
+            algo_map[g_name], search_matrix, K, init,
+            total_epoch=global_epoch + local_epoch,
+            pop_size=opt_pop,
+            ga_inject_interval=10,
+            ga_crossover_rate=0.3,
+            ga_mutation_rate=0.1,
+            metric=cluster_metric,
+            cluster_objective=cluster_objective,
+            fitness_config=fitness_config,
+            problem=centroid_problem,
+        )
+    elif g_name == 'LF_HHO' or label == 'LF_HHO':
+        lf_hho = LevyHHO_Clustering(
+            n_agents=opt_pop,
+            n_iter=opt_epoch,
+            k=K,
+            levy_scale=1.0,
+            stagnation_tol=10,
+            seed=seed,
+        )
+        centers = lf_hho.optimize(
+            search_matrix, fitness_fn=flat_fitness_fn,
+        )
+        _ = lf_hho.assign(search_matrix, centers)
+        best_sol = centers.flatten()
+        if fitness_evaluator is not None:
+            best_fit, _, _ = fitness_evaluator.evaluate_solution(best_sol)
+        else:
+            best_fit, _ = compute_wcss_fast(
+                search_matrix, best_sol, K, metric=cluster_metric,
+            )
+    elif g_name == 'IWO_HHO' or label == 'IWO_HHO':
+        if args is not None and getattr(args, 'early_stop', False):
+            es_max = getattr(args, 'early_stop_max_epoch', EARLY_STOP_MAX_EPOCH)
+            best_sol, best_fit, actual_epochs, convergence_history = (
+                run_iwo_hho_with_early_stop(
+                    search_matrix, K, init, es_max, opt_pop, seed,
+                    metric=cluster_metric,
+                    patience=getattr(args, 'early_stop_patience', EARLY_STOP_PATIENCE),
+                    tolerance=getattr(args, 'early_stop_tolerance', EARLY_STOP_TOLERANCE),
+                    block_size=getattr(args, 'early_stop_block', EARLY_STOP_BLOCK_SIZE),
+                    cluster_objective=cluster_objective,
+                    fitness_config=fitness_config,
+                    problem=centroid_problem,
+                )
+            )
+            print(f"    Early-stop epoch: {actual_epochs}/{es_max}")
+        else:
+            from optimizers.iwo_hho import IWO_HHO_Clustering
+
+            problem = _resolve_problem(
+                search_matrix, K, problem=centroid_problem,
+                metric=cluster_metric, cluster_objective=cluster_objective,
+                fitness_config=fitness_config,
+            )
+            iwo_hho = IWO_HHO_Clustering(
+                epoch=opt_epoch,
+                pop_size=opt_pop,
+                seed=seed,
+            )
+            try:
+                best_sol, best_fit = iwo_hho.solve(
+                    problem, starting_solutions=init[:opt_pop],
+                )
+            except TypeError:
+                best_sol, best_fit = iwo_hho.solve(problem)
+    elif label in ('SFOA', 'SFOA_06') or g_name in ('SFOA', 'SFOA_06'):
+        gp_map = {'SFOA': 0.5, 'SFOA_06': 0.6}
+        sfoa_key = label if label in gp_map else g_name
+        sfoa = SFOA_Clustering(
+            n_agents=opt_pop,
+            n_iter=opt_epoch,
+            k=K,
+            Gp=gp_map[sfoa_key],
+            seed=seed,
+        )
+        centers = sfoa.optimize(search_matrix, fitness_fn=flat_fitness_fn)
+        _ = sfoa.assign(search_matrix, centers)
+        best_sol = centers.flatten()
+        if fitness_evaluator is not None:
+            best_fit, _, _ = fitness_evaluator.evaluate_solution(best_sol)
+        else:
+            best_fit, _ = compute_wcss_fast(
+                search_matrix, best_sol, K, metric=cluster_metric,
+            )
+    elif l_name is None:
+        if args is not None and getattr(args, 'early_stop', False):
+            es_max = getattr(args, 'early_stop_max_epoch', EARLY_STOP_MAX_EPOCH)
+            best_sol, best_fit, actual_epochs, convergence_history = (
+                run_single_with_early_stop(
+                    algo_map[g_name], search_matrix, K, init, es_max, opt_pop,
+                    metric=cluster_metric,
+                    patience=getattr(args, 'early_stop_patience', EARLY_STOP_PATIENCE),
+                    tolerance=getattr(args, 'early_stop_tolerance', EARLY_STOP_TOLERANCE),
+                    block_size=getattr(args, 'early_stop_block', EARLY_STOP_BLOCK_SIZE),
+                    cluster_objective=cluster_objective,
+                    fitness_config=fitness_config,
+                    problem=centroid_problem,
+                )
+            )
+            print(f"    Early-stop epoch: {actual_epochs}/{es_max}")
+        else:
+            best_sol, best_fit = run_single(
+                algo_map[g_name], search_matrix, K, init, opt_epoch, opt_pop,
                 metric=cluster_metric,
                 cluster_objective=cluster_objective,
+                fitness_config=fitness_config,
+                problem=centroid_problem,
             )
-
-    # === KMeans REFINEMENT (opsiyonel) ===
-    # Meta-sezgisel optimizer'ın bulduğu centroidleri sklearn KMeans ile rafine et.
-    # Boş/dejenere kümeleri Lloyd iterasyonuyla onarır; B0_KMEANS ve dahili KMEANS
-    # zaten KMeans olduğundan onlara dokunulmaz.
-    _refined_labels = None  # KMeans Lloyd çıktısı (boş küme garantili yok)
-    refine_enabled = bool(getattr(args, 'kmeans_refine', True))
-    is_kmeans_branch = (label == 'B0_KMEANS') or (g_name == 'KMEANS')
-    if refine_enabled and not is_kmeans_branch:
-        max_iter = int(getattr(args, 'kmeans_refine_iter', 300))
-        result = _refine_centroids_with_kmeans(
-            cluster_matrix, best_sol, K, max_iter=max_iter, seed=seed,
+    elif '||' in label:
+        best_sol, best_fit = run_parallel_hybrid(
+            algo_map[g_name], algo_map[l_name],
+            search_matrix, K, init, global_epoch, local_epoch, opt_pop,
+            metric=cluster_metric,
+            cluster_objective=cluster_objective,
+            fitness_config=fitness_config,
+            problem=centroid_problem,
         )
-        if result is not None:
-            refined_sol, refined_inertia, refined_labels, n_active = result
-            print(
-                f"    B0 KMeans refinement: aktif küme {n_active}/{K}, "
-                f"inertia={refined_inertia:.4f}"
-            )
-            best_sol = refined_sol
-            _refined_labels = refined_labels
-            # best_fit'i optimizer'ın raporladığı değerde bırak (algoritmalar arası
-            # adil karşılaştırma için). best_wcss aşağıda yine cluster_metric ile
-            # yeniden hesaplanıyor.
+    else:
+        best_sol, best_fit = run_hybrid(
+            algo_map[g_name], algo_map[l_name],
+            search_matrix, K, init, global_epoch, local_epoch, opt_pop,
+            metric=cluster_metric,
+            cluster_objective=cluster_objective,
+            fitness_config=fitness_config,
+            problem=centroid_problem,
+        )
 
+    if fitness_evaluator is not None and fitness_mode == 'knn_mae':
+        best_fit, _, _ = fitness_evaluator.evaluate_solution(
+            best_sol, use_full_train=True,
+        )
+        print(
+            f"    {fitness_evaluator.fitness_label()} (full train): {best_fit:.6f}",
+            flush=True,
+        )
+
+    # === ATAMA + BOŞ KÜME ONARIMI ===
+    # Varsayılan: meta-sezgisel optimizer'ın KENDİ atamaları korunur; yalnızca
+    # boş kümeler, atamaları topluca ezmeden onarılır (_repair_empty_clusters).
+    # --kmeans-refine-overwrite ile eski davranış: sklearn KMeans Lloyd ile
+    # rafine + atamaları ez (algoritmalar arası farkları homojenleştirir).
+    # B0_KMEANS ve dahili KMEANS zaten KMeans olduğundan onlara dokunulmaz.
+    refine_enabled = bool(getattr(args, 'kmeans_refine', True))
+    overwrite_mode = bool(getattr(args, 'kmeans_refine_overwrite', False))
+    is_kmeans_branch = (label == 'B0_KMEANS') or (g_name == 'KMEANS')
+
+    fcm_m = _fcm_m_from_args(args) if args is not None else 2.0
     memberships = None
-    if g_name != 'KMEANS' and label != 'B0_KMEANS':
-        if _refined_labels is not None:
-            # KMeans refinement yapıldıysa onun labels'ını kullan
-            # (Lloyd garantili: boş küme yok). cluster_metric ne olursa olsun
-            # geometrik olarak en doğru atama refinement'ın kendi labels'ı.
-            assignments = _refined_labels
+    if not is_kmeans_branch:
+        # 1) Meta-sezgiselin kendi atamaları (cluster_metric ile).
+        if cluster_metric == 'fuzzy':
+            _, assignments, memberships, best_sol = compute_fcm_objective(
+                cluster_matrix, best_sol, K, m=fcm_m,
+            )
         elif assignments is None:
             _, assignments = compute_wcss_fast(
                 cluster_matrix, best_sol, K, metric=cluster_metric,
             )
-        if cluster_metric == 'fuzzy':
-            _, fcm_assignments, memberships, _ = compute_fcm_objective(
-                cluster_matrix, best_sol, K, m=2.0,
+
+        # 2) Onarım / refinement.
+        if refine_enabled and overwrite_mode:
+            max_iter = int(getattr(args, 'kmeans_refine_iter', 300))
+            result = _refine_centroids_with_kmeans(
+                cluster_matrix, best_sol, K, max_iter=max_iter, seed=seed,
             )
-            if _refined_labels is None:
-                assignments = fcm_assignments
+            if result is not None:
+                refined_sol, refined_inertia, refined_labels, n_active = result
+                print(
+                    f"    KMeans refine (overwrite): aktif küme {n_active}/{K}, "
+                    f"inertia={refined_inertia:.4f}"
+                )
+                best_sol = refined_sol
+                assignments = refined_labels
+                if cluster_metric == 'fuzzy':
+                    _, _, memberships, _ = compute_fcm_objective(
+                        cluster_matrix, best_sol, K, m=fcm_m,
+                    )
+        elif refine_enabled:
+            assignments, repaired_centroids, n_moved = _repair_empty_clusters(
+                cluster_matrix, best_sol, assignments, K,
+            )
+            n_active = int(len(np.unique(assignments)))
+            if n_moved > 0:
+                best_sol = repaired_centroids.flatten().astype(
+                    np.asarray(best_sol).dtype, copy=False,
+                )
+                print(
+                    f"    Boş küme onarımı: {n_moved} nokta taşındı, "
+                    f"aktif küme {n_active}/{K} (atamalar korundu)"
+                )
+                if cluster_metric == 'fuzzy':
+                    _, _, memberships, _ = compute_fcm_objective(
+                        cluster_matrix, best_sol, K, m=fcm_m,
+                    )
+            else:
+                print(f"    Boş küme yok: onarım gerekmedi (aktif küme {n_active}/{K})")
     elif cluster_metric == 'fuzzy':
         _, assignments, memberships, _ = compute_fcm_objective(
-            cluster_matrix, best_sol, K, m=2.0,
+            cluster_matrix, best_sol, K, m=fcm_m,
         )
 
     # Meta-sezgisel sonrası FCM: başlangıç centroid = algo çıktısı, J_m minimize.
@@ -1475,7 +1694,7 @@ def _run_one_core(
             cluster_matrix,
             best_sol,
             K,
-            m=2.0,
+            m=fcm_m,
             max_iter=fcm_iters,
             tol=1e-6,
         )
@@ -1516,7 +1735,7 @@ def _run_one_core(
     # DB'de WCSS kolonu her zaman gerçek kümeleme hedefini taşısın;
     # optimizer'ın iç objective'i (kompozit vb.) ile karışmasın.
     best_wcss, _ = compute_wcss_fast(
-        cluster_matrix, best_sol, K, metric=cluster_metric,
+        cluster_matrix, best_sol, K, metric=cluster_metric, fcm_m=fcm_m,
     )
     if use_centroid_opt:
         fit_label = (
@@ -1644,20 +1863,97 @@ def run_one(label, g_name, l_name, matrix, K, seed, save_dir, algo_map,
 # TRAIN-ONLY VERİ YÜKLEME (wnmf_experiment eval split ile hizalı)
 # ============================================================
 
-def format_train_only_folder_suffix(train_only, eval_split, fold):
-    """Klasör out_suffix: train-only modunda eval protokolü etiketi."""
+def format_train_only_folder_suffix(train_only, eval_split, fold=None):
+    """Klasör out_suffix: train-only + eval protokolü; fold 1..5 → _f{N} (ayrı atama setleri)."""
     if not train_only:
         return ''
-    if eval_split == 'official':
-        if fold is None or fold == 1:
-            return '_trainonly_official'
-        return f'_trainonly_official_f{int(fold)}'
-    # random
-    if fold is None:
-        return '_trainonly_rand'
-    if fold == 1:
-        return '_trainonly_rand_f1'
-    return f'_trainonly_rand_f{int(fold)}'
+    base = '_trainonly_official' if eval_split == 'official' else '_trainonly_rand'
+    if fold is not None and 1 <= int(fold) <= 5:
+        return f'{base}_f{int(fold)}'
+    return base
+
+
+def format_assign_suffix_from_args(args, K: int, label: str = '', g_name: str = '') -> str:
+    """assign_suffix: preprocess (+ wnmf boyutu) + K (+ opsiyonel ekler)."""
+    if getattr(args, 'feature_extraction', None) == 'wnmf':
+        wdim = int(getattr(args, 'wnmf_features', None) or getattr(args, 'svd_components', 20))
+        assign_suffix = f'_{args.preprocess}_wnmf{wdim}_k{int(K)}'
+    else:
+        assign_suffix = f'_{args.preprocess}_k{int(K)}'
+    if getattr(args, 'cluster_objective', 'multi') == 'wcss':
+        assign_suffix += '_pwcss'
+    if getattr(args, 'fitness', 'wcss') == 'knn_mae':
+        assign_suffix += '_knnmae'
+    if (
+        getattr(args, 'kmeans_refine', True)
+        and getattr(args, 'kmeans_refine_overwrite', False)
+        and label != 'B0_KMEANS'
+    ):
+        assign_suffix += '_kmref'
+    if getattr(args, 'fcm', False) and label != 'B0_KMEANS' and g_name != 'KMEANS':
+        assign_suffix += '_fcm'
+    if (
+        getattr(args, 'fcm_m_suffix', False)
+        and getattr(args, 'cluster_metric', '') == 'fuzzy'
+    ):
+        assign_suffix += format_fcm_m_folder_suffix(_fcm_m_from_args(args))
+    if (
+        getattr(args, 'avoahgs_param_suffix', False)
+        and label == 'HA_AVOAHGS'
+    ):
+        assign_suffix += format_avoahgs_param_folder_suffix(
+            _avoahgs_p1_from_args(args),
+            _avoahgs_hgs_rate_from_args(args),
+        )
+    return assign_suffix
+
+
+def format_out_suffix_from_args(args) -> str:
+    """out_suffix: budama, metrik, init, gray sheep, train-only, wnmf epoch (dim yok)."""
+    prune_suffix = format_prune_folder_suffix(
+        args.min_user_ratings, args.min_item_ratings,
+    )
+    zscore_suffix = (
+        '_colzscore' if getattr(args, 'paper_style', False)
+        else ('_zscore' if args.zscore else '')
+    )
+    pca_suffix = (
+        f'_pca{int(round(args.pca_variance * 100))}pct'
+        if args.pca_variance is not None else ''
+    )
+    wnmf_suffix = (
+        f'_{args.wnmf_init}_trim{args.inmed_trim_low:g}_{args.inmed_trim_high:g}'
+        if args.wnmf_features is not None else ''
+    )
+    metric_suffix_map = {
+        'euclidean': '_euc',
+        'fuzzy': '_fuzzy',
+    }
+    metric_suffix = metric_suffix_map.get(args.cluster_metric, '')
+    init_suffix = format_init_mode_folder_suffix(args.init_mode)
+    paper_suffix = '_paper' if args.paper_mode else ''
+    no_gs_suffix = '_nogs' if args.disable_gray_sheep and not args.paper_mode else ''
+    train_only_suffix = format_train_only_folder_suffix(
+        args.train_only, args.eval_split, args.fold,
+    )
+    out_suffix = (
+        prune_suffix + zscore_suffix + pca_suffix + wnmf_suffix
+        + metric_suffix + init_suffix + paper_suffix + no_gs_suffix
+        + train_only_suffix
+    )
+    if (
+        getattr(args, 'feature_extraction', None) == 'wnmf'
+        and not getattr(args, 'legacy_wnmf_suffix', False)
+    ):
+        out_suffix += f'_wnmfep{args.wnmf_epochs}'
+    return out_suffix
+
+
+def build_folder_suffix(args, K: int, label: str = '', g_name: str = '') -> str:
+    """Label hariç tam klasör soneki: out_suffix + assign_suffix."""
+    return format_out_suffix_from_args(args) + format_assign_suffix_from_args(
+        args, K, label=label, g_name=g_name,
+    )
 
 
 def _import_wnmf_loaders():
@@ -1699,7 +1995,7 @@ def load_movielens_train_only_100k(
     ML-100K train rating'lerinden dense matris (test hücreleri 0).
     wnmf_experiment.py --eval-split / --fold ile aynı bölme.
     """
-    load_ratings_100k, load_ratings_100k_all, _ = _import_wnmf_loaders()
+    load_ratings_100k, load_ratings_100k_all, _, _, _ = _import_wnmf_loaders()
     ratings_path = ratings_path or DATA_100K
 
     if eval_split == 'random':
@@ -1708,7 +2004,7 @@ def load_movielens_train_only_100k(
         )
         split_label = (
             f'random KFold fold {fold}/5 (seed={random_seed})'
-            if fold is not None and fold != 1
+            if fold is not None
             else f'random %20 holdout (seed={random_seed})'
         )
     elif fold is None or fold == 1:
@@ -1733,7 +2029,7 @@ def load_movielens_train_only_100k(
 
 def load_movielens_train_only_1m(fold=None, random_seed=SEED, ratings_path=None):
     """ML-1M train rating'lerinden dense matris (test hücreleri 0)."""
-    _, _, load_ratings_1m = _import_wnmf_loaders()
+    _, _, load_ratings_1m, _, _ = _import_wnmf_loaders()
     ratings_path = ratings_path or DATA_1M
     train, test = load_ratings_1m(ratings_path, random_seed=random_seed, fold=fold)
     n_users = int(max(train[:, 0].max(), test[:, 0].max())) + 1
@@ -1816,6 +2112,47 @@ def format_init_mode_folder_suffix(init_mode: str) -> str:
     if mode != 'mkpp':
         raise ValueError(f"init_mode bilinmiyor: {init_mode!r} (mkpp | random)")
     return '_imkpp'
+
+
+def _fcm_m_from_args(args, default: float = 2.0) -> float:
+    if args is None:
+        return float(default)
+    return float(getattr(args, 'fcm_m', default) or default)
+
+
+def format_fcm_m_folder_suffix(fcm_m: float) -> str:
+    """FCM fuzzifier etiketi: m=1.5 -> _m15, m=2.0 -> _m20."""
+    return f'_m{int(round(float(fcm_m) * 10))}'
+
+
+HA_AVOAHGS_P1_DEFAULT = 0.4
+HA_AVOAHGS_HGS_DEFAULT = 0.7
+
+
+def _avoahgs_p1_from_args(args, default: float = HA_AVOAHGS_P1_DEFAULT) -> float:
+    if args is None:
+        return float(default)
+    return float(getattr(args, 'p1', default) or default)
+
+
+def _avoahgs_hgs_rate_from_args(args, default: float = HA_AVOAHGS_HGS_DEFAULT) -> float:
+    if args is None:
+        return float(default)
+    return float(getattr(args, 'hgs_rate', default) or default)
+
+
+def format_avoahgs_param_folder_suffix(p1: float, hgs_rate: float) -> str:
+    """HA_AVOAHGS hiperparam etiketi: p1=0.2 hgs=0.25 -> _p20_hgs25; varsayılan (0.4, 0.7) -> ''."""
+    p1 = float(p1)
+    hgs_rate = float(hgs_rate)
+    if (
+        abs(p1 - HA_AVOAHGS_P1_DEFAULT) < 1e-9
+        and abs(hgs_rate - HA_AVOAHGS_HGS_DEFAULT) < 1e-9
+    ):
+        return ''
+    p_tag = int(round(p1 * 100))
+    h_tag = int(round(hgs_rate * 100))
+    return f'_p{p_tag:02d}_hgs{h_tag:02d}'
 
 
 def prune_sparse_matrix(
@@ -2066,7 +2403,7 @@ def _fetch_100k_train_test_arrays(
     ratings_path=None,
 ):
     """ML-100K train/test rating triplets (wnmf_experiment ile aynı bölme)."""
-    load_ratings_100k, load_ratings_100k_all, _ = _import_wnmf_loaders()
+    load_ratings_100k, load_ratings_100k_all, _, _, _ = _import_wnmf_loaders()
     ratings_path = ratings_path or DATA_100K
     if eval_split == 'random':
         return load_ratings_100k_all(
@@ -2089,6 +2426,7 @@ def prepare_matrix_for_clustering(
     min_item_ratings=10,
     wnmf_init_method='inmed',
     inmed_trim=(5.0, 95.0),
+    wnmf_n_epochs=50,
     return_prune_indices=False,
     paper_style=False,
 ):
@@ -2163,6 +2501,7 @@ def prepare_matrix_for_clustering(
         X_cluster = wnmf_feature_extract(
             R_matrix,
             n_components=n_components,
+            n_epochs=wnmf_n_epochs,
             random_seed=42,
             init_method=wnmf_init_method,
             inmed_trim=inmed_trim,
@@ -2217,15 +2556,7 @@ def run_dataset(dataset_name, matrix, K, out_root, algo_filter=None,
         assign_suffix = ''
         k_suffix = ''
         if args is not None:
-            assign_suffix = (
-                f'_{args.preprocess}_{args.feature_extraction}{args.svd_components}_k{K}'
-            )
-            if getattr(args, 'cluster_objective', 'multi') == 'wcss':
-                assign_suffix += '_pwcss'
-            if getattr(args, 'kmeans_refine', True) and label != 'B0_KMEANS':
-                assign_suffix += '_kmref'
-            if getattr(args, 'fcm', False) and label != 'B0_KMEANS' and g_name != 'KMEANS':
-                assign_suffix += '_fcm'
+            assign_suffix = format_assign_suffix_from_args(args, K, label=label, g_name=g_name)
         else:
             k_suffix = '' if K == default_k else f'_k{K}'
         save_dir = os.path.join(out_root, dataset_name, f"{label}{k_suffix}{out_suffix}{assign_suffix}")
@@ -2390,6 +2721,27 @@ def parse_args():
         help='--fcm post-refine iterasyon sayısı (default: 50)',
     )
     p.add_argument(
+        '--fcm-m', type=float, default=2.0, metavar='M',
+        help='FCM fuzzifier m (--cluster-metric fuzzy). Varsayılan: 2.0; m<=1 hard assignment.',
+    )
+    p.add_argument(
+        '--fcm-m-suffix', action='store_true',
+        help='Klasör adına _m15 gibi FCM-m etiketi ekle (mevcut atamaları ezmez).',
+    )
+    p.add_argument(
+        '--p1', type=float, default=HA_AVOAHGS_P1_DEFAULT, metavar='P',
+        help=f'HA_AVOAHGS: AVOA faz-1 olasılığı (default: {HA_AVOAHGS_P1_DEFAULT})',
+    )
+    p.add_argument(
+        '--hgs-rate', type=float, default=HA_AVOAHGS_HGS_DEFAULT, metavar='R',
+        help=f'HA_AVOAHGS: HGS uygulanan en iyi birey oranı (default: {HA_AVOAHGS_HGS_DEFAULT})',
+    )
+    p.add_argument(
+        '--avoahgs-param-suffix', action='store_true',
+        help='Klasör adına _p40_hgs70 gibi HA_AVOAHGS parametre etiketi ekle '
+             '(varsayılan p1/hgs için etiket eklenmez; mevcut atamaları ezmez).',
+    )
+    p.add_argument(
         '--no-prune', action='store_true',
         help='Kullanıcı/film budamasını kapatır (min-user ve min-item 0). '
              'Klasör adında _pruneu... eklenmez. Eşdeğer: --min-user-ratings 0 --min-item-ratings 0.',
@@ -2414,6 +2766,14 @@ def parse_args():
         help='WNMF (--feature-extraction wnmf) başlangıcı: random veya inmed (default: inmed)',
     )
     p.add_argument(
+        '--wnmf-epochs', type=int, default=50, metavar='N',
+        help='WNMF (--feature-extraction wnmf) epoch sayısı (default: 50)',
+    )
+    p.add_argument(
+        '--legacy-wnmf-suffix', action='store_true',
+        help='Eski klasor adi: out_suffix icine _wnmfep{N} ekleme',
+    )
+    p.add_argument(
         '--inmed-trim-low', type=float, default=5.0, metavar='P',
         help='INMED trimmed mean alt yüzdelik (default: 5.0)',
     )
@@ -2425,7 +2785,7 @@ def parse_args():
         '--cluster-metric', choices=['auto', 'pearson', 'euclidean', 'fuzzy'],
         default='auto',
         help='Sürü kümeleme fitness: auto = WNMF kullanıldıysa euclidean, '
-             'aksi halde pearson (seyrek rating uzayı). fuzzy = FCM (m=2.0).',
+             'aksi halde pearson (seyrek rating uzayı). fuzzy = FCM (--fcm-m, varsayılan 2.0).',
     )
     p.add_argument(
         '--fitness',
@@ -2442,6 +2802,31 @@ def parse_args():
              '(saf WCSS, B0 ile aynı hedef).',
     )
     p.add_argument(
+        '--mo-weights',
+        type=str,
+        default=None,
+        metavar='PRESET|W,S,C',
+        help='multi-objective ağırlıkları: default (0.5/0.25/0.25), balanced, spread, '
+             'fair, wcss_heavy veya wcss,sil,ch virgülle. spread: 0.30/0.35/0.35 '
+             '(sıkışmayı azaltmak için önerilir).',
+    )
+    p.add_argument(
+        '--centroid-repulsion-lambda',
+        type=float,
+        default=0.0,
+        metavar='L',
+        help='Yakın centroid çiftlerini cezalandır (0=kapalı). Önerilen: 0.10–0.30 '
+             '(--mo-weights spread ile birlikte).',
+    )
+    p.add_argument(
+        '--centroid-repulsion-dmin',
+        type=float,
+        default=None,
+        metavar='D',
+        help='Repulsion hedef min centroid mesafesi; verilmezse otomatik '
+             '(medyan_kullanıcı_mesafesi/sqrt(K)).',
+    )
+    p.add_argument(
         '--wnmf-model-path', type=str, default=None, metavar='PATH',
         help='--fitness latent_dev: WNMF model/W matrisi kaynağı — .pkl/.joblib '
              '(model.U / model.W / user_factors), .npy, .npz veya assignment dizini '
@@ -2451,8 +2836,9 @@ def parse_args():
         '--centroid-algo',
         choices=['MFO', 'IWO', 'HA'],
         default='MFO',
-        help='--fitness latent_dev: CentroidOptimizer meta-algoritması '
-             '(MFO, IWO, HA=HHO; varsayılan: MFO).',
+        help='Yalnızca doğrudan CentroidOptimizer.optimize() testleri için (MFO/IWO/HA). '
+             'generate_assignments --fitness knn_mae/latent_dev ile centroid aramasını '
+             '--algo etiketi yürütür (HA_AVOAHGS, B1_HHO, …); ardından kmref uygulanır.',
     )
     p.add_argument(
         '--centroid-agents', type=int, default=None, metavar='N',
@@ -2569,13 +2955,20 @@ def parse_args():
         help='SVD/PCA/NMF bileşen sayısı')
     p.add_argument(
         '--kmeans-refine', action=argparse.BooleanOptionalAction, default=True,
-        help='Centroid bulunduktan sonra sklearn KMeans Lloyd refinement (B0 adımı): '
-             'init=meta-sezgisel centroidler, n_init=1. WCSS/inertia yerel optimumuna '
-             'sürükler, boş kümeleri onarır. Varsayılan: açık. B0_KMEANS atlanır.',
+        help='Centroid bulunduktan sonra boş küme onarımı. Varsayılan (açık): '
+             'meta-sezgiselin kendi atamaları korunur, yalnızca boş kümeler '
+             'taşıma ile onarılır (atamalar ezilmez). B0_KMEANS atlanır.',
+    )
+    p.add_argument(
+        '--kmeans-refine-overwrite', action=argparse.BooleanOptionalAction,
+        default=False,
+        help='Eski davranış: sklearn KMeans Lloyd ile rafine + atamaları topluca '
+             'ez (init=meta centroidler, n_init=1). Algoritmalar arası farkları '
+             'homojenleştirir; karşılaştırma için varsayılan KAPALI.',
     )
     p.add_argument(
         '--kmeans-refine-iter', type=int, default=300, metavar='N',
-        help='KMeans refinement için max_iter (default: 300; önerilen 100-500).'
+        help='KMeans refine-overwrite için max_iter (default: 300; önerilen 100-500).'
     )
     p.add_argument(
         '--out-root', type=str, default=None, metavar='DIR',
@@ -2742,7 +3135,8 @@ def parse_args():
 
 def _multi_start_init(matrix, K, pop_size, seed, n_restarts=10,
                       metric: str = 'pearson', init_mode: str = 'mkpp',
-                      cluster_objective: str = 'multi'):
+                      cluster_objective: str = 'multi',
+                      fitness_config: dict | None = None):
     """
     n_restarts farklı seed ile MkMeans++ / random aday üret.
     Sıralama optimizasyondaki obj_func ile yapılır (boş küme cezası dahil).
@@ -2752,9 +3146,9 @@ def _multi_start_init(matrix, K, pop_size, seed, n_restarts=10,
     candidates = []
     rng = np.random.default_rng(seed=seed)
     lb, ub = _centroid_search_bounds(matrix, K)
-    obj_fn = make_fitness_function(
-        matrix, K, metric=metric, objective=cluster_objective,
-    )
+    fc = dict(fitness_config or {'objective': cluster_objective})
+    fc.setdefault('objective', cluster_objective)
+    obj_fn = make_fitness_function(matrix, K, metric=metric, **fc)
     empty_penalty = 1e6
     n_candidates = max(n_restarts * 3, pop_size + 10)
     for i in range(n_candidates):
@@ -2908,11 +3302,13 @@ if __name__ == '__main__':
                 f"min_tol={args.ha_adaptive_min_tol})"
             )
     print(f"Pop size    : {pop_size}  |  Seed: {SEED}")
-    if args.kmeans_refine:
+    if args.kmeans_refine and getattr(args, 'kmeans_refine_overwrite', False):
         print(
-            f"KMeans ref  : Açık (B0 Lloyd, max_iter={args.kmeans_refine_iter}; "
-            f"B0_KMEANS hariç)"
+            f"KMeans ref  : OVERWRITE (Lloyd, max_iter={args.kmeans_refine_iter}; "
+            f"atamalar ezilir; B0_KMEANS hariç)"
         )
+    elif args.kmeans_refine:
+        print("KMeans ref  : Boş küme onarımı (atamalar korunur; B0_KMEANS hariç)")
     else:
         print("KMeans ref  : Kapalı (--no-kmeans-refine)")
     if getattr(args, 'fcm', False):
@@ -2946,6 +3342,19 @@ if __name__ == '__main__':
     ))
     if args.fitness == 'wcss':
         print(f"Cluster obj : {args.cluster_objective} (meta-sezgisel hedef)")
+        if args.cluster_objective == 'multi':
+            mw = _parse_mo_weights_arg(args.mo_weights)
+            print(
+                f"MO weights  : wcss={mw[0]:g}, sil={mw[1]:g}, ch={mw[2]:g} "
+                f"(preset={args.mo_weights or 'default'})"
+            )
+            if float(args.centroid_repulsion_lambda or 0.0) > 0.0:
+                dmin = args.centroid_repulsion_dmin
+                dtxt = f"{dmin:g}" if dmin is not None else 'auto'
+                print(
+                    f"Repulsion   : lambda={args.centroid_repulsion_lambda:g}, "
+                    f"d_min={dtxt}"
+                )
     if args.fitness in ('knn_mae', 'knn_mae_legacy'):
         print(
             f"Centroid MAE: train_sample={args.centroid_train_sample}, "
@@ -2983,35 +3392,7 @@ if __name__ == '__main__':
     prune_suffix = format_prune_folder_suffix(
         args.min_user_ratings, args.min_item_ratings,
     )
-    zscore_suffix = '_colzscore' if getattr(args, 'paper_style', False) else ('_zscore' if args.zscore else '')
-    pca_suffix = (
-        f'_pca{int(round(args.pca_variance * 100))}pct'
-        if args.pca_variance is not None else ''
-    )
-    # WNMF init / trim parametre etiketi. Latent boyut zaten assign_suffix'in
-    # `_wnmf{svd_components}` kısmında bir kez yazılıyor; burada tekrar etmiyoruz.
-    # Eski API köprüsü (parse_args içinde) sayesinde --wnmf-features verildiğinde
-    # feature-extraction='wnmf' ve svd_components otomatik senkronlanmıştır.
-    wnmf_suffix = (
-        f'_{args.wnmf_init}_trim{args.inmed_trim_low:g}_{args.inmed_trim_high:g}'
-        if args.wnmf_features is not None else ''
-    )
-    metric_suffix_map = {
-        'euclidean': '_euc',
-        'fuzzy': '_fuzzy',
-    }
-    metric_suffix = metric_suffix_map.get(args.cluster_metric, '')
-    init_suffix = format_init_mode_folder_suffix(args.init_mode)
-    paper_suffix = '_paper' if args.paper_mode else ''
-    no_gs_suffix = '_nogs' if args.disable_gray_sheep and not args.paper_mode else ''
-    train_only_suffix = format_train_only_folder_suffix(
-        args.train_only, args.eval_split, args.fold,
-    )
-    out_suffix = (
-        prune_suffix + zscore_suffix + pca_suffix + wnmf_suffix
-        + metric_suffix + init_suffix + paper_suffix + no_gs_suffix
-        + train_only_suffix
-    )
+    out_suffix = format_out_suffix_from_args(args)
 
     try:
         if args.dataset in ('100k', 'both'):
@@ -3046,6 +3427,7 @@ if __name__ == '__main__':
                 min_item_ratings=args.min_item_ratings,
                 wnmf_init_method=args.wnmf_init,
                 inmed_trim=(args.inmed_trim_low, args.inmed_trim_high),
+                wnmf_n_epochs=args.wnmf_epochs,
                 return_prune_indices=(args.fitness in ('knn_mae', 'knn_mae_legacy')),
                 paper_style=getattr(args, 'paper_style', False),
             )
@@ -3123,6 +3505,7 @@ if __name__ == '__main__':
                 min_item_ratings=args.min_item_ratings,
                 wnmf_init_method=args.wnmf_init,
                 inmed_trim=(args.inmed_trim_low, args.inmed_trim_high),
+                wnmf_n_epochs=args.wnmf_epochs,
                 paper_style=getattr(args, 'paper_style', False),
             )
             if args.save_wnmf_u and args.feature_extraction == 'wnmf':
@@ -3196,6 +3579,7 @@ if __name__ == '__main__':
                     min_item_ratings=args.min_item_ratings,
                     wnmf_init_method=args.wnmf_init,
                     inmed_trim=(args.inmed_trim_low, args.inmed_trim_high),
+                    wnmf_n_epochs=args.wnmf_epochs,
                     paper_style=getattr(args, 'paper_style', False),
                 )
                 matrix_ft = prep_ft

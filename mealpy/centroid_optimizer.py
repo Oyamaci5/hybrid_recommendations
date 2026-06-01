@@ -7,6 +7,9 @@ Fitness modları:
   knn_mae       — ClusterPredictor (küme bias SGD + küme-içi cosine/pearson kNN) val MAE
   knn_mae_legacy — eski hızlı Pearson kNN (örneklemeli)
   latent_dev    — WNMF latent uzayında ortalama sapma (proxy)
+
+generate_assignments._run_one_core içinde --algo etiketi (HA_AVOAHGS, B1_HHO, …)
+centroid aramasını yürütür; ardından opsiyonel KMeans Lloyd (kmref) uygulanır.
 """
 
 from __future__ import annotations
@@ -29,7 +32,7 @@ from mealpy_comparison_v2 import get_special_params
 
 _EMPTY_CLUSTER_PENALTY = 1e6
 
-# generate_assignments.py ALGO_CONFIG ile uyumlu kısa adlar
+# Geriye dönük: doğrudan CentroidOptimizer.optimize() çağrıları için
 CENTROID_ALGO_MAP = {
     'MFO': 'MFO.OriginalMFO',
     'IWO': 'IWO.OriginalIWO',
@@ -157,11 +160,7 @@ def fast_knn_mae(
     k: int = 20,
     min_common: int = 3,
 ) -> float:
-    """
-    Örneklenmiş val triplets üzerinde küme-içi kNN MAE.
-    train_sample: kNN komşuluk indeksi (500 rating yeterli).
-    val_sample  : fitness değerlendirmesi (200-300 rating yeterli).
-    """
+    """Örneklenmiş val triplets üzerinde küme-içi kNN MAE."""
     val_sample = np.asarray(val_sample, dtype=np.float64)
     if val_sample.size == 0:
         return float(_EMPTY_CLUSTER_PENALTY)
@@ -203,10 +202,7 @@ def cluster_predictor_mae(
     bias_lr: float = 0.005,
     bias_reg: float = 0.02,
 ) -> float:
-    """
-    Küme ataması için ClusterPredictor fit + val örneklemesi üzerinde MAE.
-    Meta centroid aramada: pred(u,i) = mu + b_u[c] + b_i[c] + kNN sapması.
-    """
+    """Küme ataması için ClusterPredictor fit + val örneklemesi üzerinde MAE."""
     val_sample = np.asarray(val_sample, dtype=np.float64)
     if val_sample.size == 0:
         return float(_EMPTY_CLUSTER_PENALTY)
@@ -250,7 +246,6 @@ def _as_w_matrix(arr, source: str) -> np.ndarray:
 
 
 def _extract_w_from_model_obj(obj, source: str = 'model') -> np.ndarray:
-    """WNMFModel, MFModel veya dict içinden kullanıcı latent matrisini çıkar."""
     if isinstance(obj, dict):
         for key in _W_NPZ_KEYS:
             if key in obj and obj[key] is not None:
@@ -279,15 +274,7 @@ def _load_pickle_object(path: str):
 
 
 def load_wnmf_w_matrix(path: str) -> np.ndarray:
-    """
-    WNMF kullanıcı latent matrisini (W / U / user_factors) yükle.
-
-    Desteklenen kaynaklar:
-      - .npy dosyası (doğrudan W matrisi)
-      - .npz (W, U, user_factors anahtarları)
-      - .pkl / .joblib (model.W, model.U, model.user_factors)
-      - dizin: user_features.npy, model.pkl, …
-    """
+    """WNMF kullanıcı latent matrisini (W / U / user_factors) yükle."""
     if not path:
         raise ValueError('--fitness latent_dev için --wnmf-model-path zorunlu')
 
@@ -366,8 +353,207 @@ def _resolve_centroid_algo_class(algo: str):
     raise ImportError(f"mealpy sınıfı bulunamadı: {full_name}")
 
 
+class CentroidFitnessEvaluator:
+    """
+    WNMF U uzayında centroid → assignment → downstream fitness (knn_mae / latent_dev).
+    generate_assignments içindeki meta-algoritmalar bu obj_func ile mealpy problem'i çözer.
+    """
+
+    def __init__(
+        self,
+        W_matrix: np.ndarray,
+        K: int,
+        *,
+        train_ratings: Optional[np.ndarray] = None,
+        val_ratings: Optional[np.ndarray] = None,
+        n_train_sample: int = 500,
+        n_val_sample: int = 200,
+        knn_k: int = 20,
+        fitness_mode: str = 'knn_mae',
+        knn_sim_metric: str = 'cosine',
+        min_common: int = 3,
+        bias_epochs: int = 5,
+        use_native_predictor: bool = True,
+        seed: int = 42,
+    ):
+        self.W = np.asarray(W_matrix, dtype=np.float64)
+        self.K = int(K)
+        self.n_users, self.n_features = self.W.shape
+        self.fitness_mode = (fitness_mode or 'knn_mae').strip().lower()
+        self.knn_k = max(1, int(knn_k))
+        self.knn_sim_metric = (knn_sim_metric or 'cosine').strip().lower()
+        self.min_common = max(1, int(min_common))
+        self.bias_epochs = max(1, int(bias_epochs))
+        self.use_native_predictor = bool(use_native_predictor)
+        self.rng = np.random.default_rng(int(seed))
+
+        self.train_full: Optional[np.ndarray] = None
+        self.train_search: Optional[np.ndarray] = None
+        self.val_sample: Optional[np.ndarray] = None
+        self.n_items_fit = 0
+
+        if self.fitness_mode in ('knn_mae', 'knn_mae_legacy'):
+            train_ratings = (
+                np.asarray(train_ratings, dtype=np.float64)
+                if train_ratings is not None
+                else np.zeros((0, 3), dtype=np.float64)
+            )
+            val_ratings = (
+                np.asarray(val_ratings, dtype=np.float64)
+                if val_ratings is not None
+                else np.zeros((0, 3), dtype=np.float64)
+            )
+            self.train_full = train_ratings
+            _, self.n_items_fit = _rating_bounds(train_ratings)
+            self.val_sample = sample_ratings(val_ratings, int(n_val_sample), self.rng)
+
+            if self.use_native_predictor and self.fitness_mode == 'knn_mae':
+                # Arama sırasında örneklemeli train → fitness hızlanır
+                self.train_search = sample_ratings(
+                    train_ratings, int(n_train_sample), self.rng,
+                )
+                print(
+                    f"  CentroidFitness knn_mae (ClusterPredictor): "
+                    f"train_search={len(self.train_search):,}, "
+                    f"train_full={len(self.train_full):,}, "
+                    f"val_sample={len(self.val_sample)}, "
+                    f"k={self.knn_k}, sim={self.knn_sim_metric}, "
+                    f"bias_ep={self.bias_epochs}",
+                    flush=True,
+                )
+            else:
+                self.train_search = sample_ratings(
+                    train_ratings, int(n_train_sample), self.rng,
+                )
+                print(
+                    f"  CentroidFitness knn_mae_legacy: "
+                    f"train_sample={len(self.train_search)}, "
+                    f"val_sample={len(self.val_sample)}, k={self.knn_k}",
+                    flush=True,
+                )
+
+        col_min = self.W.min(axis=0)
+        col_max = self.W.max(axis=0)
+        self.lb = np.tile(col_min, self.K).tolist()
+        self.ub = np.tile(col_max, self.K).tolist()
+
+    def fitness_label(self) -> str:
+        if self.fitness_mode == 'knn_mae':
+            return 'cluster_predictor_mae'
+        if self.fitness_mode == 'knn_mae_legacy':
+            return 'sample_mae'
+        return 'latent_dev'
+
+    def make_problem(self) -> dict:
+        """mealpy model.solve() için problem sözlüğü."""
+        return {
+            'obj_func': self.fitness,
+            'bounds': FloatVar(lb=self.lb, ub=self.ub, name='centroids'),
+            'minmax': 'min',
+            'log_to': None,
+            'save_population': False,
+        }
+
+    def make_flat_fitness_fn(self):
+        """LF-HHO / SFOA gibi düz vektör fitness bekleyen optimizörler için."""
+        return self.fitness
+
+    def assign(self, centroids: np.ndarray) -> np.ndarray:
+        return assign_nearest(self.W, centroids)
+
+    def _latent_dev_fitness(self, centroids: np.ndarray, assignments: np.ndarray) -> float:
+        for cid in range(self.K):
+            if not np.any(assignments == cid):
+                return float(_EMPTY_CLUSTER_PENALTY)
+
+        total = 0.0
+        for cid in range(self.K):
+            members = self.W[assignments == cid]
+            total += float(np.linalg.norm(members - centroids[cid], axis=1).sum())
+        return float(total / self.n_users)
+
+    def _knn_mae_for_assignments(
+        self,
+        assignments: np.ndarray,
+        *,
+        use_full_train: bool = False,
+    ) -> float:
+        if self.val_sample is None or self.val_sample.size == 0:
+            return float(_EMPTY_CLUSTER_PENALTY)
+
+        if self.fitness_mode == 'knn_mae' and self.use_native_predictor:
+            train_use = (
+                self.train_full
+                if use_full_train and self.train_full is not None
+                else self.train_search
+            )
+            if train_use is None or len(train_use) == 0:
+                return float(_EMPTY_CLUSTER_PENALTY)
+            return cluster_predictor_mae(
+                train_use,
+                self.val_sample,
+                assignments,
+                self.n_users,
+                max(self.n_items_fit, 1),
+                k_neighbors=self.knn_k,
+                sim_metric=self.knn_sim_metric,
+                min_support=self.min_common,
+                bias_epochs=self.bias_epochs,
+            )
+
+        train_use = self.train_search
+        if train_use is None or len(train_use) == 0:
+            return float(_EMPTY_CLUSTER_PENALTY)
+        return fast_knn_mae(
+            train_use,
+            self.val_sample,
+            assignments,
+            k=self.knn_k,
+            min_common=self.min_common,
+        )
+
+    def fitness(self, individual) -> float:
+        centroids = np.asarray(individual, dtype=np.float64).reshape(
+            self.K, self.n_features,
+        )
+        assignments = self.assign(centroids)
+
+        for cid in range(self.K):
+            if not np.any(assignments == cid):
+                return float(_EMPTY_CLUSTER_PENALTY)
+
+        if self.fitness_mode in ('knn_mae', 'knn_mae_legacy'):
+            return self._knn_mae_for_assignments(assignments, use_full_train=False)
+
+        return self._latent_dev_fitness(centroids, assignments)
+
+    def evaluate_solution(
+        self,
+        flat_solution: np.ndarray,
+        *,
+        use_full_train: bool = False,
+    ) -> Tuple[float, np.ndarray, np.ndarray]:
+        """Çözüm vektörü için fitness + centroid + assignment."""
+        centroids = np.asarray(flat_solution, dtype=np.float64).reshape(
+            self.K, self.n_features,
+        )
+        assignments = self.assign(centroids)
+
+        if self.fitness_mode in ('knn_mae', 'knn_mae_legacy'):
+            fit = self._knn_mae_for_assignments(
+                assignments, use_full_train=use_full_train,
+            )
+        else:
+            fit = self._latent_dev_fitness(centroids, assignments)
+
+        return float(fit), centroids, assignments
+
+
 class CentroidOptimizer:
-    """WNMF W uzayında centroid araması (kNN MAE veya latent deviation fitness)."""
+    """
+    Geriye dönük uyumluluk: yalnızca MFO/IWO/HA ile doğrudan centroid araması.
+    Yeni kod: generate_assignments --algo + CentroidFitnessEvaluator kullanır.
+    """
 
     def __init__(
         self,
@@ -388,109 +574,26 @@ class CentroidOptimizer:
         bias_epochs: int = 5,
         use_native_predictor: bool = True,
     ):
-        self.W = np.asarray(W_matrix, dtype=np.float64)
-        self.K = int(K)
-        self.n_users, self.n_features = self.W.shape
+        self.evaluator = CentroidFitnessEvaluator(
+            W_matrix,
+            K,
+            train_ratings=train_ratings,
+            val_ratings=val_ratings,
+            n_train_sample=n_train_sample,
+            n_val_sample=n_val_sample,
+            knn_k=knn_k,
+            fitness_mode=fitness_mode,
+            knn_sim_metric=knn_sim_metric,
+            min_common=min_common,
+            bias_epochs=bias_epochs,
+            use_native_predictor=use_native_predictor,
+            seed=seed,
+        )
         self.n_agents = max(5, int(n_agents))
         self.n_iter = max(1, int(n_iter))
         self.algo = (algo or 'MFO').strip().upper()
         self.seed = int(seed)
-        self.fitness_mode = (fitness_mode or 'knn_mae').strip().lower()
-        self.knn_k = max(1, int(knn_k))
-        self.knn_sim_metric = (knn_sim_metric or 'cosine').strip().lower()
-        self.min_common = max(1, int(min_common))
-        self.bias_epochs = max(1, int(bias_epochs))
-        self.use_native_predictor = bool(use_native_predictor)
-        self.rng = np.random.default_rng(self.seed)
-
-        self.train_sample = None
-        self.val_sample = None
-        self.train_full = None
-        self.n_items_fit = 0
-        if self.fitness_mode in ('knn_mae', 'knn_mae_legacy'):
-            train_ratings = np.asarray(train_ratings, dtype=np.float64) if train_ratings is not None else np.zeros((0, 3))
-            val_ratings = np.asarray(val_ratings, dtype=np.float64) if val_ratings is not None else np.zeros((0, 3))
-            self.train_full = train_ratings
-            _, self.n_items_fit = _rating_bounds(train_ratings)
-            if self.use_native_predictor and self.fitness_mode == 'knn_mae':
-                self.train_sample = train_ratings
-                self.val_sample = sample_ratings(val_ratings, int(n_val_sample), self.rng)
-                print(
-                    f"  CentroidOptimizer knn_mae (ClusterPredictor): "
-                    f"train={len(self.train_full):,}, val_sample={len(self.val_sample)}, "
-                    f"k={self.knn_k}, sim={self.knn_sim_metric}, bias_ep={self.bias_epochs}",
-                    flush=True,
-                )
-            else:
-                self.train_sample = sample_ratings(train_ratings, int(n_train_sample), self.rng)
-                self.val_sample = sample_ratings(val_ratings, int(n_val_sample), self.rng)
-                print(
-                    f"  CentroidOptimizer knn_mae_legacy: "
-                    f"train_sample={len(self.train_sample)}, "
-                    f"val_sample={len(self.val_sample)}, k={self.knn_k}",
-                    flush=True,
-                )
-
-        col_min = self.W.min(axis=0)
-        col_max = self.W.max(axis=0)
-        self.lb = np.tile(col_min, self.K).tolist()
-        self.ub = np.tile(col_max, self.K).tolist()
-
-    def _assign(self, centroids: np.ndarray) -> np.ndarray:
-        return assign_nearest(self.W, centroids)
-
-    def _latent_dev_fitness(self, centroids: np.ndarray, assignments: np.ndarray) -> float:
-        for cid in range(self.K):
-            if not np.any(assignments == cid):
-                return float(_EMPTY_CLUSTER_PENALTY)
-
-        total = 0.0
-        for cid in range(self.K):
-            members = self.W[assignments == cid]
-            total += float(np.linalg.norm(members - centroids[cid], axis=1).sum())
-        return float(total / self.n_users)
-
-    def fitness(self, individual) -> float:
-        centroids = np.asarray(individual, dtype=np.float64).reshape(
-            self.K, self.n_features,
-        )
-        assignments = self._assign(centroids)
-
-        for cid in range(self.K):
-            if not np.any(assignments == cid):
-                return float(_EMPTY_CLUSTER_PENALTY)
-
-        if self.fitness_mode == 'knn_mae' and self.val_sample is not None:
-            if self.use_native_predictor and self.train_full is not None:
-                return cluster_predictor_mae(
-                    self.train_full,
-                    self.val_sample,
-                    assignments,
-                    self.n_users,
-                    max(self.n_items_fit, 1),
-                    k_neighbors=self.knn_k,
-                    sim_metric=self.knn_sim_metric,
-                    min_support=self.min_common,
-                    bias_epochs=self.bias_epochs,
-                )
-            return fast_knn_mae(
-                self.train_sample,
-                self.val_sample,
-                assignments,
-                k=self.knn_k,
-                min_common=self.min_common,
-            )
-
-        if self.fitness_mode == 'knn_mae_legacy' and self.val_sample is not None:
-            return fast_knn_mae(
-                self.train_sample,
-                self.val_sample,
-                assignments,
-                k=self.knn_k,
-                min_common=self.min_common,
-            )
-
-        return self._latent_dev_fitness(centroids, assignments)
+        self.fitness_mode = self.evaluator.fitness_mode
 
     def optimize(self) -> Dict[str, Any]:
         full_name, algo_cls = _resolve_centroid_algo_class(self.algo)
@@ -503,31 +606,19 @@ class CentroidOptimizer:
         if full_name == 'IWO.OriginalIWO':
             sp['seed_max'] = max(4, min(int(sp.get('seed_max', 5)), pop_size // 2))
 
-        problem = {
-            'obj_func': self.fitness,
-            'bounds': FloatVar(lb=self.lb, ub=self.ub),
-            'minmax': 'min',
-            'log_to': None,
-            'save_population': False,
-        }
-
+        problem = self.evaluator.make_problem()
         model = algo_cls(**sp)
         try:
             model.solve(problem, seed=self.seed)
         except TypeError:
             model.solve(problem)
 
-        best_fit = float(model.g_best.target.fitness)
-        individual = np.asarray(model.g_best.solution, dtype=np.float64)
-        centroids = individual.reshape(self.K, self.n_features)
-        assignments = self._assign(centroids)
+        best_fit, centroids, assignments = self.evaluator.evaluate_solution(
+            model.g_best.solution,
+            use_full_train=(self.fitness_mode == 'knn_mae'),
+        )
 
-        if self.fitness_mode == 'knn_mae':
-            fit_label = 'cluster_predictor_mae'
-        elif self.fitness_mode == 'knn_mae_legacy':
-            fit_label = 'sample_mae'
-        else:
-            fit_label = 'latent_dev'
+        fit_label = self.evaluator.fitness_label()
         print(
             f"    CentroidOptimizer ({self.algo}/{full_name}): "
             f"{fit_label}={best_fit:.6f}",

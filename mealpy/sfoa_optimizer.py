@@ -73,20 +73,28 @@ class SFOA_Clustering:
         decay = np.exp(-t * self.n_agents / self.n_iter)
         return decay * xi
 
-    def optimize(self, X):
+    def optimize(self, X, fitness_fn=None):
         np.random.seed(self.seed)
         _, dim = X.shape
         self.dim = dim
         sol_dim = self.k * dim
-        lb = X.min(axis=0).repeat(self.k)
-        ub = X.max(axis=0).repeat(self.k)
+        # Çözüm centroid-major (reshape(k, dim)); bounds da tile ile aynı düzende
+        # olmalı. .repeat(k) feature-major üretir ve yanlış boyuta clip yapar.
+        lb = np.tile(X.min(axis=0), self.k)
+        ub = np.tile(X.max(axis=0), self.k)
+        metric_tag = 'fitness' if fitness_fn is not None else 'WCSS'
+
+        def _eval(ind):
+            if fitness_fn is not None:
+                return float(fitness_fn(ind))
+            return float(_wcss(X, self._decode(ind)))
 
         self.pop = self._init_population(X)
-        fitness = np.array([_wcss(X, self._decode(p)) for p in self.pop])
+        fitness = np.array([_eval(p) for p in self.pop])
         best_idx = np.argmin(fitness)
         best_pos = self.pop[best_idx].copy()
         best_fit = fitness[best_idx]
-        print(f"[SFOA] Initial WCSS: {best_fit:.4f}")
+        print(f"[SFOA] Initial {metric_tag}: {best_fit:.4f}")
 
         for t in range(1, self.n_iter + 1):
             worst_idx = np.argmax(fitness)
@@ -104,7 +112,7 @@ class SFOA_Clustering:
                         x_new = self._preying(xi, best_pos)
 
                 x_new = self._clip(x_new, lb, ub)
-                f_new = _wcss(X, self._decode(x_new))
+                f_new = _eval(x_new)
                 if f_new < fitness[i]:
                     new_pop[i] = x_new
                     new_fitness[i] = f_new
@@ -117,9 +125,9 @@ class SFOA_Clustering:
                 best_pos = self.pop[best_idx_new].copy()
 
             if t % 10 == 0 or t == 1:
-                print(f"[SFOA] iter {t:4d}/{self.n_iter} WCSS: {best_fit:.4f}")
+                print(f"[SFOA] iter {t:4d}/{self.n_iter} {metric_tag}: {best_fit:.4f}")
 
-        print(f"[SFOA] Final WCSS: {best_fit:.4f}")
+        print(f"[SFOA] Final {metric_tag}: {best_fit:.4f}")
         return self._decode(best_pos)
 
     def assign(self, X, centers):

@@ -131,8 +131,9 @@ class DOA_Clustering:
     def optimize(self, X):
         n_users, dim = X.shape
         self.dim = dim
-        lb = X.min(axis=0).repeat(self.k)
-        ub = X.max(axis=0).repeat(self.k)
+        # Bounds centroid-major olmalı (_decode = reshape(k, dim)). .repeat yanlış.
+        lb = np.tile(X.min(axis=0), self.k)
+        ub = np.tile(X.max(axis=0), self.k)
 
         pop = self._init_population(X)
         fitness = np.asarray([self._wcss(X, self._decode(p)) for p in pop])

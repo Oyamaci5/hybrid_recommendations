@@ -63,22 +63,34 @@ class LevyHHO_Clustering:
             pop.append(X[idx].flatten().copy())
         return np.array(pop)
 
-    def optimize(self, X):
+    def _eval(self, X, ind, fitness_fn=None):
+        clipped = ind
+        if fitness_fn is not None:
+            return float(fitness_fn(clipped))
+        return float(self._wcss(X, self._decode(clipped)))
+
+    def optimize(self, X, fitness_fn=None):
         n, dim = X.shape
         self.dim = dim
         sol_dim = self.k * dim
-        lb = X.min(axis=0).repeat(self.k)
-        ub = X.max(axis=0).repeat(self.k)
+        # Çözüm vektörü centroid-major: [c0_f0..c0_f(dim-1), c1_f0..]. Bounds da
+        # aynı düzende olmalı → np.tile (her centroid için tüm feature bound'ları).
+        # .repeat(k) feature-major sıralar ve yanlış boyuta clip yapar.
+        lb = np.tile(X.min(axis=0), self.k)
+        ub = np.tile(X.max(axis=0), self.k)
+        metric_tag = 'fitness' if fitness_fn is not None else 'WCSS'
 
         pop = self._init_population(X)
-        fitness = np.array([self._wcss(X, self._decode(p)) for p in pop])
+        fitness = np.array([
+            self._eval(X, self._clip(p, lb, ub), fitness_fn=fitness_fn) for p in pop
+        ])
         best_idx = np.argmin(fitness)
         rabbit_pos = pop[best_idx].copy()
         rabbit_fit = fitness[best_idx]
 
         stag_count = 0
         prev_best_fit = rabbit_fit
-        print(f"[LF-HHO] Baslangic WCSS: {rabbit_fit:.4f}")
+        print(f"[LF-HHO] Baslangic {metric_tag}: {rabbit_fit:.4f}")
 
         for t in range(1, self.n_iter + 1):
             E0 = 2 * np.random.random() - 1
@@ -118,20 +130,22 @@ class LevyHHO_Clustering:
                         lf = levy_flight(sol_dim, self.beta)
                         y = rabbit_pos - E * np.abs(J * rabbit_pos - x)
                         z = y + self.levy_scale * lf
-                        f_y = self._wcss(X, self._decode(self._clip(y, lb, ub)))
-                        f_z = self._wcss(X, self._decode(self._clip(z, lb, ub)))
+                        f_y = self._eval(X, self._clip(y, lb, ub), fitness_fn=fitness_fn)
+                        f_z = self._eval(X, self._clip(z, lb, ub), fitness_fn=fitness_fn)
                         x_new = y if f_y < f_z else z
                     else:
                         lf = levy_flight(sol_dim, self.beta)
                         y = rabbit_pos - E * np.abs(J * rabbit_pos - pop.mean(axis=0))
                         z = y + self.levy_scale * lf
-                        f_y = self._wcss(X, self._decode(self._clip(y, lb, ub)))
-                        f_z = self._wcss(X, self._decode(self._clip(z, lb, ub)))
+                        f_y = self._eval(X, self._clip(y, lb, ub), fitness_fn=fitness_fn)
+                        f_z = self._eval(X, self._clip(z, lb, ub), fitness_fn=fitness_fn)
                         x_new = y if f_y < f_z else z
 
                 new_pop[i] = self._clip(x_new, lb, ub)
 
-            new_fitness = np.array([self._wcss(X, self._decode(p)) for p in new_pop])
+            new_fitness = np.array([
+                self._eval(X, self._clip(p, lb, ub), fitness_fn=fitness_fn) for p in new_pop
+            ])
             improved = new_fitness < fitness
             pop[improved] = new_pop[improved]
             fitness[improved] = new_fitness[improved]
@@ -150,17 +164,23 @@ class LevyHHO_Clustering:
             if stag_count >= self.stagnation_tol:
                 lf = levy_flight(sol_dim, self.beta)
                 perturbed = self._clip(rabbit_pos + self.levy_scale * 2 * lf, lb, ub)
-                f_perturbed = self._wcss(X, self._decode(perturbed))
+                f_perturbed = self._eval(X, perturbed, fitness_fn=fitness_fn)
                 if f_perturbed < rabbit_fit:
                     rabbit_fit = f_perturbed
                     rabbit_pos = perturbed.copy()
-                    print(f"[LF-HHO] iter {t:4d} stagnation jump iyilestirdi: {rabbit_fit:.4f}")
+                    print(
+                        f"[LF-HHO] iter {t:4d} stagnation jump iyilestirdi: "
+                        f"{rabbit_fit:.4f}"
+                    )
                 stag_count = 0
 
             if t % 10 == 0 or t == 1:
-                print(f"[LF-HHO] iter {t:4d}/{self.n_iter} WCSS: {rabbit_fit:.4f} |E|={abs(E):.3f}")
+                print(
+                    f"[LF-HHO] iter {t:4d}/{self.n_iter} {metric_tag}: "
+                    f"{rabbit_fit:.4f} |E|={abs(E):.3f}"
+                )
 
-        print(f"[LF-HHO] Final WCSS: {rabbit_fit:.4f}")
+        print(f"[LF-HHO] Final {metric_tag}: {rabbit_fit:.4f}")
         return self._decode(rabbit_pos)
 
     def assign(self, X, centers):

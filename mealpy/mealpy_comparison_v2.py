@@ -22,6 +22,10 @@ mkmeans_plus_plus_init = _mod.mkmeans_plus_plus_init
 compute_wcss_fast = _mod.compute_wcss_fast
 detect_gray_sheep = _mod.detect_gray_sheep
 make_fitness_function = _mod.make_fitness_function
+MO_WEIGHT_PRESETS = _mod.MO_WEIGHT_PRESETS
+_normalize_mo_weights = _mod._normalize_mo_weights
+compute_centroid_repulsion_penalty = _mod.compute_centroid_repulsion_penalty
+auto_repulsion_dmin = _mod.auto_repulsion_dmin
 compute_fcm_objective = _mod.compute_fcm_objective
 pearson_distance_batch = _mod.pearson_distance_batch
 euclidean_distance_batch = _mod.euclidean_distance_batch
@@ -37,6 +41,10 @@ __all__ = [
     "compute_wcss_fast",
     "detect_gray_sheep",
     "make_fitness_function",
+    "MO_WEIGHT_PRESETS",
+    "_normalize_mo_weights",
+    "compute_centroid_repulsion_penalty",
+    "auto_repulsion_dmin",
     "compute_fcm_objective",
     "pearson_distance_batch",
     "euclidean_distance_batch",

@@ -157,8 +157,9 @@ class IWO_HHO_Clustering:
         """LF-HHO / SFOA ile uyumlu: euclidean WCSS ile merkez optimizasyonu."""
         n, dim = X.shape
         sol_dim = k * dim
-        lb = X.min(axis=0).repeat(k)
-        ub = X.max(axis=0).repeat(k)
+        # Bounds centroid-major olmalı (sol = reshape(k, dim)). .repeat yanlış.
+        lb = np.tile(X.min(axis=0), k)
+        ub = np.tile(X.max(axis=0), k)
 
         def _wcss(ind: np.ndarray) -> float:
             centers = ind.reshape(k, dim)

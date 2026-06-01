@@ -172,12 +172,19 @@ def _fcm_memberships_from_dist(dist_matrix, m: float = 2.0, eps: float = 1e-12):
     """
     FCM üyelikleri: u_ij = 1 / sum_k (d_ij / d_ik)^(2/(m-1)).
     dist_matrix shape: (n_users, K), değerler d_ij (non-negative).
+    m <= 1 için hard assignment (en yakın küme = 1, diğerleri 0).
     """
     dist = np.asarray(dist_matrix, dtype=np.float64)
     if dist.ndim != 2:
         raise ValueError(f"dist_matrix 2D olmalı, gelen shape={dist.shape}")
 
     n_users, n_clusters = dist.shape
+    if float(m) <= 1.001:
+        memberships = np.zeros((n_users, n_clusters), dtype=np.float64)
+        nearest = np.argmin(np.maximum(dist, 0.0), axis=1)
+        memberships[np.arange(n_users), nearest] = 1.0
+        return memberships
+
     memberships = np.zeros((n_users, n_clusters), dtype=np.float64)
     power = 2.0 / (float(m) - 1.0)
 
@@ -237,14 +244,16 @@ def compute_fcm_objective(matrix, solution, K, m: float = 2.0,
 
     return j_val, hard_assignments, memberships.astype(np.float32), centroids_flat
 
-def compute_wcss_fast(matrix, solution, K, metric='pearson'):
+def compute_wcss_fast(matrix, solution, K, metric='pearson', fcm_m: float = 2.0):
     """
     metric='pearson' : rating/latent için Pearson mesafesi (1-corr) toplamı.
     metric='euclidean' : k-means tarzı SSE — atanan merkeze squared L2 toplamı.
     """
     centroids = solution.reshape(K, matrix.shape[1])
     if metric == 'fuzzy':
-        j_val, hard_assignments, _, _ = compute_fcm_objective(matrix, solution, K, m=2.0)
+        j_val, hard_assignments, _, _ = compute_fcm_objective(
+            matrix, solution, K, m=float(fcm_m),
+        )
         return float(j_val), hard_assignments
     if metric == 'euclidean':
         dist_matrix = euclidean_distance_batch(matrix, centroids)
@@ -257,19 +266,120 @@ def compute_wcss_fast(matrix, solution, K, metric='pearson'):
     return float(min_distances.sum()), assignments
 
 
-def make_fitness_function(matrix, K, metric='pearson', objective='multi'):
+MO_WEIGHT_PRESETS = {
+    'default': (0.50, 0.25, 0.25),
+    'balanced': (0.40, 0.30, 0.30),
+    'spread': (0.30, 0.35, 0.35),
+    'fair': (0.33, 0.34, 0.33),
+    'wcss_heavy': (0.60, 0.20, 0.20),
+}
+
+
+def _normalize_mo_weights(mo_weights):
+    if mo_weights is None:
+        return MO_WEIGHT_PRESETS['default']
+    if isinstance(mo_weights, str):
+        key = mo_weights.strip().lower()
+        if key in MO_WEIGHT_PRESETS:
+            return MO_WEIGHT_PRESETS[key]
+        parts = [float(x.strip()) for x in key.split(',')]
+        if len(parts) != 3:
+            raise ValueError(
+                f"mo_weights: 3 bileşen bekleniyor (wcss,sil,ch), alınan: {mo_weights!r}"
+            )
+        total = float(sum(parts))
+        if total <= 0.0:
+            raise ValueError(f"mo_weights toplamı pozitif olmalı: {mo_weights!r}")
+        return tuple(float(p / total) for p in parts)
+    seq = tuple(float(x) for x in mo_weights)
+    if len(seq) != 3:
+        raise ValueError(f"mo_weights uzunluğu 3 olmalı, alınan: {seq!r}")
+    total = float(sum(seq))
+    if total <= 0.0:
+        raise ValueError(f"mo_weights toplamı pozitif olmalı: {seq!r}")
+    return tuple(float(p / total) for p in seq)
+
+
+def auto_repulsion_dmin(matrix: np.ndarray, K: int, *, sample_n: int = 200) -> float:
+    """Centroid'ler arası hedef minimum mesafe (medyan kullanıcı aralığı / sqrt(K))."""
+    n_rows = len(matrix)
+    if n_rows < 2:
+        return 0.1
+    n = min(int(sample_n), n_rows)
+    idx = np.random.choice(n_rows, size=n, replace=False)
+    sub = np.asarray(matrix[idx], dtype=np.float64)
+    from scipy.spatial.distance import pdist
+    dists = pdist(sub, metric='euclidean')
+    if dists.size == 0:
+        return 0.1
+    med = float(np.median(dists))
+    return max(med / max(float(np.sqrt(max(K, 1))), 1.0), 1e-6)
+
+
+def compute_centroid_repulsion_penalty(
+    centroids: np.ndarray,
+    d_min: float,
+) -> float:
+    """
+    Yakın centroid çiftlerini cezalandır: pair i,j için max(0, (d_min-d)/d_min)^2.
+    Çıktı [0,1] aralığında normalize (tüm çiftler üzerinden ortalama ihlal).
+    """
+    C = np.asarray(centroids, dtype=np.float64).reshape(-1, centroids.shape[-1])
+    K = C.shape[0]
+    if K < 2 or d_min <= 0.0:
+        return 0.0
+    penalty = 0.0
+    n_pairs = 0
+    for i in range(K):
+        for j in range(i + 1, K):
+            d = float(np.linalg.norm(C[i] - C[j]))
+            if d < d_min:
+                gap = (d_min - d) / d_min
+                penalty += gap * gap
+            n_pairs += 1
+    return float(penalty / max(n_pairs, 1))
+
+
+def make_fitness_function(
+    matrix,
+    K,
+    metric='pearson',
+    objective='multi',
+    mo_weights=None,
+    repulsion_lambda: float = 0.0,
+    repulsion_dmin=None,
+    fcm_m: float = 2.0,
+):
     """Meta-sezgisel fitness. objective='wcss': saf WCSS (+ boş küme cezası)."""
     objective = (objective or 'multi').strip().lower()
     empty_penalty = 1e6
+    w_wcss, w_sil, w_ch = _normalize_mo_weights(mo_weights)
+    repulsion_lambda = float(repulsion_lambda or 0.0)
+    repulsion_dmin_fixed = (
+        None if repulsion_dmin is None else float(repulsion_dmin)
+    )
+
+    def _repulsion_term(solution) -> float:
+        if repulsion_lambda <= 0.0:
+            return 0.0
+        centroids = np.asarray(solution, dtype=np.float64).reshape(K, matrix.shape[1])
+        d_min = (
+            repulsion_dmin_fixed
+            if repulsion_dmin_fixed is not None and repulsion_dmin_fixed > 0.0
+            else auto_repulsion_dmin(matrix, K)
+        )
+        return repulsion_lambda * compute_centroid_repulsion_penalty(centroids, d_min)
 
     if objective == 'wcss':
 
         def fitness(solution):
-            wcss, assignments = compute_wcss_fast(matrix, solution, K, metric=metric)
+            wcss, assignments = compute_wcss_fast(
+                matrix, solution, K, metric=metric, fcm_m=fcm_m,
+            )
             for cid in range(K):
                 if not np.any(assignments == cid):
                     return float(empty_penalty)
-            return float(wcss)
+            return float(wcss + _repulsion_term(solution))
 
         return fitness
 
@@ -283,7 +393,9 @@ def make_fitness_function(matrix, K, metric='pearson', objective='multi'):
 
     def _multiobjective_score(solution):
         nonlocal baseline
-        wcss, assignments = compute_wcss_fast(matrix, solution, K, metric=metric)
+        wcss, assignments = compute_wcss_fast(
+            matrix, solution, K, metric=metric, fcm_m=fcm_m,
+        )
 
         # === YENİ CEZA SİSTEMİ ===
         # min_cluster_size: ortalama küme boyutunun ~%20'si, ama en az 3.
@@ -330,7 +442,9 @@ def make_fitness_function(matrix, K, metric='pearson', objective='multi'):
         norm_wcss = obj_wcss / baseline['wcss']
         norm_sil = obj_sil / baseline['sil']
         norm_ch = obj_ch / baseline['ch']
-        fitness_base = float(0.50 * norm_wcss + 0.25 * norm_sil + 0.25 * norm_ch)
+        fitness_base = float(
+            w_wcss * norm_wcss + w_sil * norm_sil + w_ch * norm_ch
+        )
 
         # === SABİT + ORANSAL KARMA CEZA ===
         penalty = 0.0
@@ -338,6 +452,7 @@ def make_fitness_function(matrix, K, metric='pearson', objective='multi'):
         penalty += n_tiny  * 0.3                              # küçük küme başına sabit ceza
         penalty += n_huge  * 0.2                              # devasa küme başına sabit ceza
         penalty += fitness_base * (n_empty + n_tiny) * 0.5    # oransal ek ceza
+        penalty += _repulsion_term(solution)
 
         return float(fitness_base + penalty)
 

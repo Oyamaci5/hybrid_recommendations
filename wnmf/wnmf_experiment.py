@@ -424,6 +424,7 @@ def _assignment_k_for_dataset(
 # generate_assignments: B0_KMEANS hariç eklenen klasör sonekleri
 _ASSIGN_KMREF_SUFFIX = '_kmref'
 _ASSIGN_FCM_SUFFIX = '_fcm'
+_ASSIGN_KNNMAE_SUFFIX = '_knnmae'
 
 
 def _assign_suffix_strip_trailing_kmref(assign_suffix: str) -> Optional[str]:
@@ -468,12 +469,14 @@ def _assign_suffix_b0_alternatives(assign_suffix: str) -> List[str]:
 def _assign_suffix_trailing_cluster_k(assign_suffix: str) -> Optional[int]:
     """
     generate_assignments yeni klasör adının sonundaki küme K'sı:
-    ..._k{K}, ..._k{K}_pwcss, ..._k{K}_kmref veya ..._k{K}_pwcss_kmref.
+    ..._k{K}, ..._k{K}_pwcss, ..._k{K}_kmref, ..._k{K}_knnmae veya ..._k{K}_pwcss_kmref.
     _wnmf30 gibi latent etiketleri ile karışmaz (_wnmf{digits} ortada kalır).
     """
     if not assign_suffix:
         return None
     base = assign_suffix
+    if base.endswith(_ASSIGN_KNNMAE_SUFFIX):
+        base = base[: -len(_ASSIGN_KNNMAE_SUFFIX)]
     if base.endswith(_ASSIGN_FCM_SUFFIX):
         base = base[: -len(_ASSIGN_FCM_SUFFIX)]
     if base.endswith(_ASSIGN_KMREF_SUFFIX):
@@ -2166,6 +2169,15 @@ def _compute_topn_jaccard(
     return float(np.mean(jaccards))
 
 
+def _soft_membership_threshold_from_args(args, default: float = SOFT_MEMBERSHIP_THRESHOLD) -> float:
+    if args is None:
+        return float(default)
+    val = getattr(args, 'soft_membership_threshold', None)
+    if val is None:
+        return float(default)
+    return float(val)
+
+
 def _cluster_avg_predict_kwargs(args) -> dict:
     """run_cluster_average için benzerlik / komşu hiperparametreleri."""
     if args is None:
@@ -2176,6 +2188,7 @@ def _cluster_avg_predict_kwargs(args) -> dict:
             'sim_amp': 1.0,
             'cluster_avg_k_neighbors': 0,
             'cluster_avg_base': 'user',
+            'soft_membership_threshold': SOFT_MEMBERSHIP_THRESHOLD,
         }
     # 0 = kümedeki tüm uygun rater'lar (literatür formülü); >0 ise üst sınır.
     knn_cap = int(getattr(args, 'cluster_avg_k_neighbors', 0) or 0)
@@ -2186,6 +2199,7 @@ def _cluster_avg_predict_kwargs(args) -> dict:
         'sim_amp': float(getattr(args, 'sim_amp', 1.0) or 1.0),
         'cluster_avg_k_neighbors': knn_cap,
         'cluster_avg_base': str(getattr(args, 'cluster_avg_base', 'user') or 'user'),
+        'soft_membership_threshold': _soft_membership_threshold_from_args(args),
     }
 
 
@@ -2280,7 +2294,8 @@ def run_cluster_average(train, test, assignments, gray_mask,
                         cluster_avg_k_neighbors: int = 0,
                         cluster_avg_base: str = 'user',
                         cluster_predict_centroid: bool = False,
-                        assign_dir: Optional[str] = None):
+                        assign_dir: Optional[str] = None,
+                        soft_membership_threshold: float = SOFT_MEMBERSHIP_THRESHOLD):
     t0 = time.time()
     cluster_avg_base = (cluster_avg_base or 'user').strip().lower()
     use_centroid_predict = bool(cluster_predict_centroid)
@@ -2358,6 +2373,16 @@ def run_cluster_average(train, test, assignments, gray_mask,
         user_means_arr = np.where(
             user_counts > 0, user_sums / np.maximum(user_counts, 1), global_mean,
         ).astype(np.float32)
+        _shrink_cluster_users: dict = {}
+        for _u in range(n_users):
+            _cid = int(assignments[_u])
+            _shrink_cluster_users.setdefault(_cid, []).append(_u)
+
+        lambda_shrink = 25.0   # hiperparametre — gerekirse CLI'dan alınabilir
+        mu_eff = compute_cluster_mu_shrinkage(
+            mean_rows, _shrink_cluster_users, global_mean,
+            lambda_shrink=lambda_shrink,
+        )
         for cid in range(n_clusters):
             mask = cluster_item_counts[cid] > 0
             cluster_item_means[cid, mask] /= cluster_item_counts[cid, mask]
@@ -2473,7 +2498,7 @@ def run_cluster_average(train, test, assignments, gray_mask,
                     src_counts['centroid_fallback_global'] += 1
         elif use_soft:
             w = np.asarray(memberships[u], dtype=np.float64)
-            active = w >= SOFT_MEMBERSHIP_THRESHOLD
+            active = w >= soft_membership_threshold
             if not np.any(active) or float(w[active].sum()) < 1e-8:
                 if use_weighted_cluster_avg:
                     cid_fb = int(np.argmax(w))
@@ -2528,7 +2553,13 @@ def run_cluster_average(train, test, assignments, gray_mask,
                             k_neighbors=cluster_avg_k_neighbors,
                         )
                 else:
-                    pred = float(np.clip(np.dot(w_use, cluster_item_means[:, i]), 1.0, 5.0))
+                    shrunk = np.array([
+                        float(cluster_item_means[c, i])
+                        if cluster_item_counts[c, i] > 0
+                        else float(mu_eff.get(c, global_mean))
+                        for c in range(n_clusters)
+                    ], dtype=np.float64)
+                    pred = float(np.clip(np.dot(w_use, shrunk), 1.0, 5.0))
         elif use_weighted_cluster_avg:
             cid = int(test_cluster_ids[u])
             pred = _predict_weighted_cluster_avg(
@@ -2598,29 +2629,13 @@ def run_cluster_average(train, test, assignments, gray_mask,
         all_true, all_pred, threshold=relevance_threshold,
         eval_rows=eval_rows_arr, train=train, assignments=assignments,
     )
-    precision, recall, f1, ndcg = _compute_topn_metrics(
+    precision, recall, f1, ndcg, jaccard, coverage_at_10 = _cluster_topn_metrics(
         eval_rows_arr,
+        n_items,
         top_n=top_n,
         threshold=relevance_threshold,
-        train=train, assignments=assignments,
-    )
-    jaccard = _compute_topn_jaccard(
-        eval_rows_arr,
-        top_n=top_n,
-        threshold=relevance_threshold,
-        train=train, assignments=assignments,
-    )
-    jaccard = _compute_topn_jaccard(
-        eval_rows_arr,
-        top_n=top_n,
-        threshold=relevance_threshold,
-        train=train, assignments=assignments,
-    )
-    jaccard = _compute_topn_jaccard(
-        eval_rows_arr,
-        top_n=top_n,
-        threshold=relevance_threshold,
-        train=train, assignments=assignments,
+        train=train,
+        assignments=assignments,
     )
 
     gray_mae, gray_rmse = float('nan'), float('nan')
@@ -2657,7 +2672,8 @@ def run_cluster_average(train, test, assignments, gray_mask,
     print(
         f"  [{algo_label} | {tag}{'+NC' if use_nc else ''}{leak_note}] "
         f"MAE={mae:.4f} RMSE={rmse:.4f} | "
-        f"P@10={precision:.4f} R@10={recall:.4f} NDCG@10={ndcg:.4f} J@10={jaccard:.4f} | "
+        f"P@10={precision:.4f} R@10={recall:.4f} NDCG@10={ndcg:.4f} "
+        f"Cov@10={coverage_at_10:.4f} J@10={jaccard:.4f} | "
         f"Gray MAE={gray_mae:.4f} ({elapsed:.1f}s)",
     )
     if cluster_avg_hard:
@@ -2701,6 +2717,7 @@ def run_cluster_average(train, test, assignments, gray_mask,
         'f1_at_10'        : f1,
         'ndcg_at_10'      : ndcg,
         'jaccard_at_10'   : jaccard,
+        'coverage_at_10'  : coverage_at_10,
     }
 
 
@@ -3484,7 +3501,8 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
                     lambda_shrink: float = LAMBDA_SHRINK_DEFAULT,
                     lambda_shrink_mode: str = 'fixed',
                     knn_args=None,
-                    return_eval_rows: bool = False):
+                    return_eval_rows: bool = False,
+                    soft_membership_threshold: float = SOFT_MEMBERSHIP_THRESHOLD):
     t0 = time.time()
     k_neighbors = max(1, int(k_neighbors))
 
@@ -3786,17 +3804,13 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
                 gray_rmse = float(np.sqrt(np.mean(gray_errors ** 2)))
 
             white_mae, white_rmse = _compute_metrics(true_vals, pred_vals)
-            precision, recall, f1, ndcg = _compute_topn_metrics(
+            precision, recall, f1, ndcg, jaccard, coverage_at_10 = _cluster_topn_metrics(
                 eval_rows_arr,
+                n_items,
                 top_n=top_n,
                 threshold=relevance_threshold,
-                train=train, assignments=assignments,
-            )
-            jaccard = _compute_topn_jaccard(
-                eval_rows_arr,
-                top_n=top_n,
-                threshold=relevance_threshold,
-                train=train, assignments=assignments,
+                train=train,
+                assignments=assignments,
             )
 
             elapsed = time.time() - t0
@@ -3809,7 +3823,8 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
             print(
                 f"  [{algo_label} | {_knn_tag}|latent|k={k_neighbors}] "
                 f"MAE={mae:.4f} RMSE={rmse:.4f} | "
-                f"P@10={precision:.4f} R@10={recall:.4f} NDCG@10={ndcg:.4f} J@10={jaccard:.4f} | "
+                f"P@10={precision:.4f} R@10={recall:.4f} NDCG@10={ndcg:.4f} "
+                f"Cov@10={coverage_at_10:.4f} J@10={jaccard:.4f} | "
                 f"Gray MAE={gray_mae:.4f} ({elapsed:.1f}s)",
             )
 
@@ -3836,6 +3851,7 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
                 'f1_at_10': f1,
                 'ndcg_at_10': ndcg,
                 'jaccard_at_10': jaccard,
+                'coverage_at_10': coverage_at_10,
                 'similarity': 'latent',
                 'k_neighbors': k_neighbors,
                 'knn_mode': _knn_mode_out,
@@ -3927,17 +3943,13 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
             gray_rmse = float(np.sqrt(np.mean(gray_errors ** 2)))
 
         white_mae, white_rmse = _compute_metrics(true_vals, pred_vals)
-        precision, recall, f1, ndcg = _compute_topn_metrics(
+        precision, recall, f1, ndcg, jaccard, coverage_at_10 = _cluster_topn_metrics(
             eval_rows_arr,
+            n_items,
             top_n=top_n,
             threshold=relevance_threshold,
-            train=train, assignments=assignments,
-        )
-        jaccard = _compute_topn_jaccard(
-            eval_rows_arr,
-            top_n=top_n,
-            threshold=relevance_threshold,
-            train=train, assignments=assignments,
+            train=train,
+            assignments=assignments,
         )
 
         elapsed = time.time() - t0
@@ -3950,7 +3962,8 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
         print(
             f"  [{algo_label} | {_knn_tag}|{native_sim}|k={k_neighbors}] "
             f"MAE={mae:.4f} RMSE={rmse:.4f} | "
-            f"P@10={precision:.4f} R@10={recall:.4f} NDCG@10={ndcg:.4f} J@10={jaccard:.4f} | "
+            f"P@10={precision:.4f} R@10={recall:.4f} NDCG@10={ndcg:.4f} "
+            f"Cov@10={coverage_at_10:.4f} J@10={jaccard:.4f} | "
             f"Gray MAE={gray_mae:.4f} ({elapsed:.1f}s)",
         )
 
@@ -3977,6 +3990,7 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
             'f1_at_10': f1,
             'ndcg_at_10': ndcg,
             'jaccard_at_10': jaccard,
+            'coverage_at_10': coverage_at_10,
             'similarity': native_sim,
             'k_neighbors': k_neighbors,
             'knn_mode': _knn_mode_out,
@@ -4111,7 +4125,7 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
                 active = [
                     (cid, float(w))
                     for cid, w in enumerate(weights)
-                    if w >= SOFT_MEMBERSHIP_THRESHOLD
+                    if w >= soft_membership_threshold
                 ]
                 if not active:
                     cid = int(test_cluster_ids[u])
@@ -4166,7 +4180,7 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
         active = [
             (cid, float(w))
             for cid, w in enumerate(weights)
-            if w >= SOFT_MEMBERSHIP_THRESHOLD
+            if w >= soft_membership_threshold
         ]
 
         if not active:
@@ -4218,17 +4232,13 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
         gray_rmse = float(np.sqrt(np.mean(gray_errors**2)))
 
     white_mae, white_rmse = _compute_metrics(true_vals, pred_vals)
-    precision, recall, f1, ndcg = _compute_topn_metrics(
+    precision, recall, f1, ndcg, jaccard, coverage_at_10 = _cluster_topn_metrics(
         eval_rows_arr,
+        n_items,
         top_n=top_n,
         threshold=relevance_threshold,
-        train=train, assignments=assignments,
-    )
-    jaccard = _compute_topn_jaccard(
-        eval_rows_arr,
-        top_n=top_n,
-        threshold=relevance_threshold,
-        train=train, assignments=assignments,
+        train=train,
+        assignments=assignments,
     )
 
     elapsed = time.time() - t0
@@ -4283,7 +4293,8 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
     print(
         f"  [{algo_label} | {_knn_tag}|{similarity}|k={k_neighbors}] "
         f"MAE={mae:.4f} RMSE={rmse:.4f} | "
-        f"P@10={precision:.4f} R@10={recall:.4f} NDCG@10={ndcg:.4f} J@10={jaccard:.4f} | "
+        f"P@10={precision:.4f} R@10={recall:.4f} NDCG@10={ndcg:.4f} "
+        f"Cov@10={coverage_at_10:.4f} J@10={jaccard:.4f} | "
         f"Gray MAE={gray_mae:.4f} ({elapsed:.1f}s)",
     )
 
@@ -4310,6 +4321,7 @@ def run_cluster_knn(train, test, assignments, gray_mask, memberships,
         'f1_at_10'        : f1,
         'ndcg_at_10'      : ndcg,
         'jaccard_at_10'   : jaccard,
+        'coverage_at_10'  : coverage_at_10,
         'similarity'      : similarity,
         'k_neighbors'     : k_neighbors,
         'knn_mode'        : _knn_mode_out,
@@ -4698,6 +4710,37 @@ def _compute_topn_metrics_with_recs(
     )
 
 
+def _cluster_topn_metrics(
+    eval_rows: np.ndarray,
+    n_items: int,
+    top_n: int = 10,
+    threshold: RelevanceThreshold = 4.0,
+    train: Optional[np.ndarray] = None,
+    assignments: Optional[np.ndarray] = None,
+) -> Tuple[float, float, float, float, float, float]:
+    """P/R/F1/NDCG@N, Jaccard@N, Coverage@N (katalogdaki benzersiz öğe oranı)."""
+    precision, recall, f1, ndcg, user_recs = _compute_topn_metrics_with_recs(
+        eval_rows,
+        top_n=top_n,
+        threshold=threshold,
+        train=train,
+        assignments=assignments,
+    )
+    jaccard = _compute_topn_jaccard(
+        eval_rows,
+        top_n=top_n,
+        threshold=threshold,
+        train=train,
+        assignments=assignments,
+    )
+    coverage_at_n = (
+        compute_coverage(user_recs, n_items)
+        if user_recs and n_items > 0
+        else float('nan')
+    )
+    return precision, recall, f1, ndcg, jaccard, coverage_at_n
+
+
 def run_cluster_knn_fusion(
     train,
     test,
@@ -4861,26 +4904,21 @@ def run_cluster_knn_fusion(
 
     white_mae, white_rmse = _compute_metrics(true_vals, pred_vals)
 
-    if compute_cov or compute_div:
-        precision, recall, f1, ndcg, user_recs = _compute_topn_metrics_with_recs(
-            eval_rows_arr, top_n=top_n, threshold=relevance_threshold,
-            train=train, assignments=user_assignments,
-        )
-    else:
-        precision, recall, f1, ndcg = _compute_topn_metrics(
-            eval_rows_arr, top_n=top_n, threshold=relevance_threshold,
-            train=train, assignments=user_assignments,
-        )
-        user_recs = {}
+    precision, recall, f1, ndcg, user_recs = _compute_topn_metrics_with_recs(
+        eval_rows_arr, top_n=top_n, threshold=relevance_threshold,
+        train=train, assignments=user_assignments,
+    )
     jaccard = _compute_topn_jaccard(
         eval_rows_arr, top_n=top_n, threshold=relevance_threshold,
         train=train, assignments=user_assignments,
     )
 
-    coverage_val = float('nan')
+    coverage_val = (
+        compute_coverage(user_recs, n_items)
+        if user_recs and n_items > 0
+        else float('nan')
+    )
     diversity_val = float('nan')
-    if compute_cov and user_recs:
-        coverage_val = compute_coverage(user_recs, n_items)
     if compute_div and user_recs:
         def _div_sim(a: int, b: int) -> float:
             return pearson_sim_items(
@@ -4926,6 +4964,7 @@ def run_cluster_knn_fusion(
         'f1_at_10'        : f1,
         'ndcg_at_10'      : ndcg,
         'jaccard_at_10'   : jaccard,
+        'coverage_at_10'  : coverage_val,
         'similarity'      : similarity,
         'k_neighbors'     : k_user,
         'k_neighbors_item': k_item,
@@ -6613,6 +6652,11 @@ def parse_args():
     p.add_argument(
         '--sim-amp', type=float, default=1.0,
         help='Similarity amplification üssü (1.0=kapalı, önerilen=1.5)',
+    )
+    p.add_argument(
+        '--soft-membership-threshold', type=float,
+        default=SOFT_MEMBERSHIP_THRESHOLD, metavar='T',
+        help='FCM soft blend eşiği: altındaki küme üyelikleri atlanır (varsayılan: 0.10)',
     )
     p.add_argument(
         '--hybrid-alpha', type=float, default=None,
