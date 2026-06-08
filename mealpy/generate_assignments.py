@@ -1413,7 +1413,8 @@ def _run_one_core(
         from sklearn.cluster import KMeans
 
         user_matrix = matrix
-        km = KMeans(n_clusters=K, n_init=10, max_iter=500, random_state=42)
+        b0_n_init = int(getattr(args, 'b0_n_init', 10) or 10) if args is not None else 10
+        km = KMeans(n_clusters=K, n_init=b0_n_init, max_iter=500, random_state=42)
         km.fit(user_matrix)
         best_sol = km.cluster_centers_.flatten()
         best_fit = float(km.inertia_)
@@ -1884,12 +1885,21 @@ def format_assign_suffix_from_args(args, K: int, label: str = '', g_name: str = 
         assign_suffix += '_pwcss'
     if getattr(args, 'fitness', 'wcss') == 'knn_mae':
         assign_suffix += '_knnmae'
+    if getattr(args, 'l2_normalize', False):
+        assign_suffix += '_l2'
     if (
         getattr(args, 'kmeans_refine', True)
         and getattr(args, 'kmeans_refine_overwrite', False)
         and label != 'B0_KMEANS'
     ):
         assign_suffix += '_kmref'
+        kmi = int(getattr(args, 'kmeans_refine_iter', 300) or 300)
+        if kmi != 300:
+            assign_suffix += f'cap{kmi}'
+    if label == 'B0_KMEANS':
+        b0_ninit = int(getattr(args, 'b0_n_init', 10) or 10)
+        if b0_ninit != 10:
+            assign_suffix += f'_ninit{b0_ninit}'
     if getattr(args, 'fcm', False) and label != 'B0_KMEANS' and g_name != 'KMEANS':
         assign_suffix += '_fcm'
     if (
@@ -2429,8 +2439,9 @@ def prepare_matrix_for_clustering(
     wnmf_n_epochs=50,
     return_prune_indices=False,
     paper_style=False,
+    l2_normalize=False,
 ):
-    """Sıra: prune → z-score → PCA → WNMF (--pca ile DEPRECATED --wnmf-features birlikte CLI’de yasak)."""
+    """Sıra: prune → z-score → PCA → WNMF (→ opsiyonel L2-normalize, cosine için)."""
     from sklearn.preprocessing import MinMaxScaler, normalize
 
     prune_out = prune_sparse_matrix(
@@ -2508,6 +2519,12 @@ def prepare_matrix_for_clustering(
         )
     else:
         X_cluster = R_matrix
+
+    if l2_normalize:
+        # Satır-bazlı L2 normalize → euclidean mesafe = cosine mesafe.
+        # Düşük-boyut WNMF'te küme ayrışmasını belirgin artırır.
+        X_cluster = normalize(X_cluster)
+        print(f"  L2-normalize uygulandı (cosine-eşdeğer kümeleme)")
 
     matrix = X_cluster.astype(np.float32, copy=False)
     if return_prune_indices:
@@ -2855,6 +2872,17 @@ def parse_args():
     p.add_argument(
         '--pop-size', type=int, default=None, metavar='N',
         help=f'Meta-algoritma popülasyon boyutu (varsayılan: POP_SIZE={POP_SIZE}).',
+    )
+    p.add_argument(
+        '--l2-normalize', action=argparse.BooleanOptionalAction, default=False,
+        help='Kümeleme öncesi özellik matrisini satır-bazlı L2-normalize et '
+             '(euclidean=cosine). Düşük-boyut WNMF için küme ayrışmasını artırır.',
+    )
+    p.add_argument(
+        '--b0-n-init', type=int, default=10, metavar='N',
+        help='B0_KMEANS sklearn KMeans n_init (varsayılan: 10). n_init=1 ile '
+             'baseline zayıflatılır → meta-sezgiselin "başlatma kalitesi" '
+             'avantajı ölçülebilir (makale hipotezi).',
     )
     p.add_argument(
         '--centroid-train-sample', type=int, default=500, metavar='N',
@@ -3430,6 +3458,7 @@ if __name__ == '__main__':
                 wnmf_n_epochs=args.wnmf_epochs,
                 return_prune_indices=(args.fitness in ('knn_mae', 'knn_mae_legacy')),
                 paper_style=getattr(args, 'paper_style', False),
+                l2_normalize=getattr(args, 'l2_normalize', False),
             )
             if args.fitness in ('knn_mae', 'knn_mae_legacy'):
                 matrix_100k, kept_u, kept_i = prep_100k
@@ -3507,6 +3536,7 @@ if __name__ == '__main__':
                 inmed_trim=(args.inmed_trim_low, args.inmed_trim_high),
                 wnmf_n_epochs=args.wnmf_epochs,
                 paper_style=getattr(args, 'paper_style', False),
+                l2_normalize=getattr(args, 'l2_normalize', False),
             )
             if args.save_wnmf_u and args.feature_extraction == 'wnmf':
                 os.makedirs(args.save_wnmf_u, exist_ok=True)
@@ -3581,6 +3611,7 @@ if __name__ == '__main__':
                     inmed_trim=(args.inmed_trim_low, args.inmed_trim_high),
                     wnmf_n_epochs=args.wnmf_epochs,
                     paper_style=getattr(args, 'paper_style', False),
+                l2_normalize=getattr(args, 'l2_normalize', False),
                 )
                 matrix_ft = prep_ft
                 if args.save_wnmf_u and args.feature_extraction == 'wnmf':

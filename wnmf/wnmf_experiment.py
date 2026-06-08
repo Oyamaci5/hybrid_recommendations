@@ -2283,6 +2283,7 @@ def run_cluster_average(train, test, assignments, gray_mask,
                         nearest_centroid: bool = False,
                         centroid_metric: str = 'euclidean',
                         cluster_avg_hard: bool = False,
+                        cluster_avg_global_fallback: bool = False,
                         cluster_avg_leaky: bool = False,
                         cluster_mean_impute_train: bool = False,
                         debug_cluster_avg_hard: bool = False,
@@ -2295,7 +2296,8 @@ def run_cluster_average(train, test, assignments, gray_mask,
                         cluster_avg_base: str = 'user',
                         cluster_predict_centroid: bool = False,
                         assign_dir: Optional[str] = None,
-                        soft_membership_threshold: float = SOFT_MEMBERSHIP_THRESHOLD):
+                        soft_membership_threshold: float = SOFT_MEMBERSHIP_THRESHOLD,
+                        return_eval_rows: bool = False):
     t0 = time.time()
     cluster_avg_base = (cluster_avg_base or 'user').strip().lower()
     use_centroid_predict = bool(cluster_predict_centroid)
@@ -2587,12 +2589,12 @@ def run_cluster_average(train, test, assignments, gray_mask,
             val = cluster_item_means[cid, i]
             source = 'cluster_mean'
             if cluster_avg_hard and (np.isnan(val) or cluster_item_counts[cid, i] == 0):
-                if user_counts[u] > 0:
-                    pred = float(user_means_arr[u])
-                    source = 'user_mean'
-                else:
+                if cluster_avg_global_fallback or user_counts[u] <= 0:
                     pred = global_mean
                     source = 'global_mean'
+                else:
+                    pred = float(user_means_arr[u])
+                    source = 'user_mean'
             else:
                 pred = float(val if not np.isnan(val) else global_mean)
                 if np.isnan(val):
@@ -2694,7 +2696,7 @@ def run_cluster_average(train, test, assignments, gray_mask,
             flush=True,
         )
 
-    return {
+    out = {
         'scenario'    : scenario,
         'algo_label'  : algo_label,
         'mae'         : mae,
@@ -2719,6 +2721,9 @@ def run_cluster_average(train, test, assignments, gray_mask,
         'jaccard_at_10'   : jaccard,
         'coverage_at_10'  : coverage_at_10,
     }
+    if return_eval_rows:
+        out['eval_rows'] = eval_rows_arr
+    return out
 
 
 def _sample_train_holdout(
@@ -6881,11 +6886,12 @@ def parse_args():
     if getattr(args, 'paper_mode', False):
         args.no_cluster_knn = True
         args.cluster_avg_hard = True
+        args.cluster_avg_global_fallback = True
         if args.no_cluster_avg:
             p.error('--paper-mode ile --no-cluster-avg birlikte kullanılamaz')
         print(
-            'Not: --paper-mode aktif → yalnızca CalcAvgRating (cluster_avg_hard), '
-            'ClusterKNN kapalı.',
+            'Not: --paper-mode aktif → CalcAvgRating (cluster_avg_hard), '
+            'eksik küme-item için global ortalama (Thakrar Alg.6), ClusterKNN kapalı.',
             file=sys.stderr,
         )
     if getattr(args, 'meta_eval', False):
